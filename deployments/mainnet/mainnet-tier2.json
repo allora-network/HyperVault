@@ -1,0 +1,17 @@
+{
+  "chainId": 999,
+  "vault": "0xdc5196C7d841b2C3C6E935dE04383Fb40b8534aE",
+  "timelock": "0x11BfF9278097f31448f3F9973FEbec61eEf6E27A",
+  "registry": "0xA430c24f63BB3245723242c7843b2E07BA220ba8",
+  "asset": "0xb88339CB7199b77E23DB6E890353E22632Ba630f",
+  "operator": "0x200342145Ae3A0c1da9AdE8571EC0ff23c2b753A",
+  "feeRecipient": "0x200342145Ae3A0c1da9AdE8571EC0ff23c2b753A",
+  "name": "Allora Mainnet Tier2",
+  "symbol": "amt2",
+  "deployBlock": 35428174,
+  "leverageCapBps": 30000,
+  "perfFeeBps": 1500,
+  "mgmtFeeAnnualBps": 200,
+  "whitelistPerps": [0],
+  "whitelistSpots": []
+}

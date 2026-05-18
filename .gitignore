@@ -1,0 +1,56 @@
+# ─── Secrets / env (NEVER commit) ──────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ─── Foundry build / state ─────────────────────────────────────────────────
+out/
+cache/
+cache_forge/
+broadcast/
+
+# Foundry dependencies (root-level only — frontend/src/lib/ MUST stay tracked)
+/lib/
+
+# Foundry "sensitive values" cache (private keys / signed payloads)
+cache/**/run-*.json
+
+# ─── Per-developer deploy artifacts ────────────────────────────────────────
+deployments/local/
+
+# ─── Node / frontend ───────────────────────────────────────────────────────
+node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.parcel-cache/
+*.tsbuildinfo
+
+# Frontend convenience symlink (recreate locally with `ln -s ../deployments deployments`)
+frontend/deployments
+
+# ─── Python ────────────────────────────────────────────────────────────────
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.python-version
+
+# ─── Editor / OS ───────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# ─── Logs ──────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ─── Coverage ──────────────────────────────────────────────────────────────
+coverage/
+lcov.info

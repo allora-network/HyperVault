@@ -1,0 +1,17 @@
+{
+  "name": "Allora Momentum BTC",
+  "symbol": "amBTC",
+  "operator": "0x0000000000000000000000000000000000000001",
+  "emergencyAdmin": "0x0000000000000000000000000000000000000002",
+  "feeRecipient": "0x0000000000000000000000000000000000000003",
+  "usdcAddress": "0x0000000000000000000000000000000000000000",
+  "timelockMinDelaySec": 86400,
+  "leverageCapBps": 30000,
+  "slippageBandBps": 100,
+  "perfFeeBps": 1500,
+  "mgmtFeeAnnualBps": 200,
+  "depositCap": "10000000000000",
+  "maxDepositPerAddress": "1000000000000",
+  "whitelistPerps": [0, 1, 2],
+  "whitelistSpots": []
+}

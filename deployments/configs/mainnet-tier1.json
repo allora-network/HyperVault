@@ -1,0 +1,17 @@
+{
+  "name": "Allora Mainnet Tier1",
+  "symbol": "amt1",
+  "operator": "0x200342145Ae3A0c1da9AdE8571EC0ff23c2b753A",
+  "emergencyAdmin": "0x200342145Ae3A0c1da9AdE8571EC0ff23c2b753A",
+  "feeRecipient": "0x200342145Ae3A0c1da9AdE8571EC0ff23c2b753A",
+  "usdcAddress": "0xb88339CB7199b77E23DB6E890353E22632Ba630f",
+  "timelockMinDelaySec": 0,
+  "leverageCapBps": 30000,
+  "slippageBandBps": 200,
+  "perfFeeBps": 1500,
+  "mgmtFeeAnnualBps": 200,
+  "depositCap": "100000000",
+  "maxDepositPerAddress": "100000000",
+  "whitelistPerps": [0],
+  "whitelistSpots": []
+}

@@ -1,0 +1,17 @@
+{
+  "name": "Testnet Smoke Vault",
+  "symbol": "tsmoke",
+  "operator": "0x0000000000000000000000000000000000000000",
+  "emergencyAdmin": "0x0000000000000000000000000000000000000000",
+  "feeRecipient": "0x0000000000000000000000000000000000000000",
+  "usdcAddress": "0x0000000000000000000000000000000000000000",
+  "timelockMinDelaySec": 0,
+  "leverageCapBps": 30000,
+  "slippageBandBps": 200,
+  "perfFeeBps": 1500,
+  "mgmtFeeAnnualBps": 200,
+  "depositCap": "100000000000",
+  "maxDepositPerAddress": "10000000000",
+  "whitelistPerps": [0],
+  "whitelistSpots": []
+}
