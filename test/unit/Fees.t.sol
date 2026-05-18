@@ -41,29 +41,37 @@ contract FeesTest is VaultBaseTest {
         // Simulate gain by minting extra USDC into vault (50% gain → 50k extra)
         usdc.mint(address(vault), 50_000 * 1e6);
 
-        uint256 feeBefore = vault.balanceOf(feeWallet);
+        // Post-audit C-3: perf fee is paid in `asset()` directly to feeRecipient
+        // (no share mint, no dilution). Assert on USDC balance, not share balance.
+        uint256 feeUsdcBefore = usdc.balanceOf(feeWallet);
         uint256 sharesAlice = vault.balanceOf(alice);
 
         vm.startPrank(alice);
         uint256 assetsOut = vault.redeem(sharesAlice, alice, alice);
         vm.stopPrank();
 
-        uint256 feeShares = vault.balanceOf(feeWallet) - feeBefore;
-        assertGt(feeShares, 0);
+        uint256 feeUsdcGained = usdc.balanceOf(feeWallet) - feeUsdcBefore;
+        assertGt(feeUsdcGained, 0, "fee recipient received USDC");
         // Gain was 50k USDC. Perf fee at 15% on gain = 7500 USDC. Alice should
         // receive approximately 150k - 7500 = 142500 USDC.
         assertApproxEqRel(assetsOut, 142_500 * 1e6, 0.02e18);
+        // Fee paid should be ~7500 USDC (15% of 50k gain).
+        assertApproxEqRel(feeUsdcGained, 7_500 * 1e6, 0.02e18);
+        // No fee shares minted (audit C-3 fix).
+        assertEq(vault.balanceOf(feeWallet), 0, "no fee shares minted");
     }
 
     function test_perfFee_noChargeWithoutGain() public {
         _depositAs(alice, 100_000 * 1e6);
-        uint256 feeBefore = vault.balanceOf(feeWallet);
+        uint256 feeUsdcBefore = usdc.balanceOf(feeWallet);
         uint256 sharesAlice = vault.balanceOf(alice);
 
         vm.startPrank(alice);
         vault.redeem(sharesAlice, alice, alice);
         vm.stopPrank();
 
-        assertEq(vault.balanceOf(feeWallet), feeBefore);
+        // Neither USDC nor shares accrue to feeRecipient when there's no gain.
+        assertEq(usdc.balanceOf(feeWallet), feeUsdcBefore);
+        assertEq(vault.balanceOf(feeWallet), 0);
     }
 }

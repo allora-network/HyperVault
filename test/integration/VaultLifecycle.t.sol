@@ -75,12 +75,14 @@ vault.placeLimitOrder(BTC_PERP, true, 50_000_000, 1, false, Constants.TIF_GTC);
 
         // 7. Alice redeems → gets ~55k (her half) minus perf fee on gain
         uint256 aliceSharesBefore = vault.balanceOf(alice);
+        uint256 feeUsdcBefore = usdc.balanceOf(feeWallet);
         vm.prank(alice);
         uint256 aliceOut = vault.redeem(aliceSharesBefore, alice, alice);
 
         // She put in 50k, NAV grew 10%, perf fee = 15% on the 10% gain
         // Expected ≈ 55,000 - (5,000 * 0.15) = 54,250
         assertApproxEqRel(aliceOut, 54_250 * 1e6, 0.02e18);
-        assertGt(vault.balanceOf(feeWallet), 0);
+        // Post-audit C-3: perf fee paid in USDC (no share dilution).
+        assertGt(usdc.balanceOf(feeWallet) - feeUsdcBefore, 0);
     }
 }

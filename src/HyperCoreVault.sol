@@ -93,6 +93,29 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     mapping(address => WithdrawalRequest) private _pendingWithdrawal;
 
     // -------------------------------------------------------------------------
+    // Audit-mitigation state (v1.3)
+    // -------------------------------------------------------------------------
+
+    /// @notice Admin-managed allowlist of destinations for
+    ///         `operatorRecoverSpot`. Mitigates audit finding C-2 — a
+    ///         compromised OPERATOR key would otherwise be able to drain all
+    ///         Core spot funds to any address.
+    mapping(address => bool) public spotRecoverDest;
+
+    /// @notice When true, NAV-component reads (`coreSpotUsdc`,
+    ///         `perpWithdrawable`) use strict precompile wrappers that revert
+    ///         on failure rather than silently returning zero. Mitigates audit
+    ///         finding H-1. Default false to preserve fresh-vault behaviour
+    ///         (where precompile rows may not yet exist); admin should enable
+    ///         after the first successful cross-chain action.
+    bool public strictNavReads;
+
+    /// @notice Per-spot-asset slippage band in bps. Mitigates audit finding
+    ///         H-3 (spot orders previously had no slippage protection). 0 =
+    ///         no band (legacy / opt-out). Compared against `spotPx`.
+    mapping(uint32 => uint16) public spotSlippageBandBps;
+
+    // -------------------------------------------------------------------------
     // Constructor
     // -------------------------------------------------------------------------
 
@@ -200,27 +223,48 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     /// @dev Bypasses `super.withdraw` to avoid OZ's `maxWithdraw` check, which
     ///      tightens as our fee accrual mints dilutive shares. We enforce the
     ///      idle-USDC cap here directly.
+    ///
+    ///      Audit C-3: perf fee is paid in `asset()` directly to feeRecipient
+    ///      out of the user's payout (shares are over-burned to cover both the
+    ///      net payout and the fee). No fee shares are minted, so non-exiting
+    ///      LPs are no longer diluted.
     function withdraw(uint256 assets, address receiver, address owner)
         public
         override(ERC4626, IERC4626)
         nonReentrant
         returns (uint256 shares)
     {
-        uint256 idle = idleUsdc();
-        if (assets > idle) revert WithdrawExceedsIdleBalance(assets, idle);
-
         _accrueMgmtFee();
-        shares = previewWithdraw(assets);
-        if (shares > balanceOf(owner)) revert WithdrawExceedsIdleBalance(assets, idle);
 
-        _crystallizePerfFee(owner, shares);
+        // Compute fee on the un-adjusted share count, then over-burn to cover
+        // both user payout and fee. Single-pass estimate; tiny under-collection
+        // of the order of (feeBps * feeBps * gainBps) is accepted in exchange
+        // for the simpler accounting.
+        uint256 cb = _costBasisPerShare[owner];
+        uint256 sharesForNet = previewWithdraw(assets);
+        uint256 feeAssets = _perfFeeAssetsWithCb(sharesForNet, cb);
+        uint256 totalOut = assets + feeAssets;
+
+        uint256 idle = idleUsdc();
+        if (totalOut > idle) revert WithdrawExceedsIdleBalance(totalOut, idle);
+
+        shares = previewWithdraw(totalOut);
+        if (shares > balanceOf(owner)) revert WithdrawExceedsIdleBalance(totalOut, idle);
+
         if (msg.sender != owner) _spendAllowance(owner, msg.sender, shares);
 
         _burn(owner, shares);
+        if (feeAssets > 0) {
+            IERC20(asset()).safeTransfer(feeRecipient, feeAssets);
+            emit PerfFeePaid(owner, feeAssets);
+        }
         IERC20(asset()).safeTransfer(receiver, assets);
         emit Withdraw(msg.sender, receiver, owner, assets, shares);
     }
 
+    /// @dev Audit C-3: perf fee is deducted from the user's gross payout and
+    ///      transferred to feeRecipient in `asset()` terms (no share mint, no
+    ///      dilution of other LPs).
     function redeem(uint256 shares, address receiver, address owner)
         public
         override(ERC4626, IERC4626)
@@ -230,20 +274,27 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         if (shares > balanceOf(owner)) shares = balanceOf(owner);
 
         _accrueMgmtFee();
-        _crystallizePerfFee(owner, shares);
 
-        assets = previewRedeem(shares);
+        uint256 grossAssets = previewRedeem(shares);
         uint256 idle = idleUsdc();
-        if (assets > idle) {
+        if (grossAssets > idle) {
             // Partial payout: scale down both legs proportionally
-            assets = idle;
-            uint256 scaled = previewWithdraw(assets);
+            grossAssets = idle;
+            uint256 scaled = previewWithdraw(grossAssets);
             if (scaled < shares) shares = scaled;
         }
+
+        uint256 feeAssets = _perfFeeAssetsWithCb(shares, _costBasisPerShare[owner]);
+        if (feeAssets >= grossAssets) feeAssets = 0; // sanity — should not happen for valid fee/gain
+        assets = grossAssets - feeAssets;
 
         if (msg.sender != owner) _spendAllowance(owner, msg.sender, shares);
 
         _burn(owner, shares);
+        if (feeAssets > 0) {
+            IERC20(asset()).safeTransfer(feeRecipient, feeAssets);
+            emit PerfFeePaid(owner, feeAssets);
+        }
         if (assets > 0) IERC20(asset()).safeTransfer(receiver, assets);
         emit Withdraw(msg.sender, receiver, owner, assets, shares);
     }
@@ -288,12 +339,19 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     }
 
     function coreSpotUsdc() public view returns (uint256) {
-        uint64 totalCore = PrecompileLib.spotBalance(address(this), Constants.USDC_CORE_INDEX).total;
+        // Audit H-1: when strictNavReads is enabled, surface precompile
+        // failures instead of silently returning zero.
+        uint64 totalCore = strictNavReads
+            ? PrecompileLib.spotBalanceStrict(address(this), Constants.USDC_CORE_INDEX).total
+            : PrecompileLib.spotBalance(address(this), Constants.USDC_CORE_INDEX).total;
         return _coreToEvm(totalCore);
     }
 
     function perpWithdrawable() public view returns (uint256) {
-        return uint256(PrecompileLib.withdrawable(address(this)).withdrawable);
+        // Audit H-1: see {coreSpotUsdc}.
+        return strictNavReads
+            ? uint256(PrecompileLib.withdrawableStrict(address(this)).withdrawable)
+            : uint256(PrecompileLib.withdrawable(address(this)).withdrawable);
     }
 
     function nav() external view returns (uint256) {
@@ -362,20 +420,36 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
             if (!_whitelistedSpots.contains(asset_)) revert AssetNotWhitelisted(asset_);
         }
 
-        // 2. Slippage band — perps only.
-        //    Scale mismatch: the `oraclePx` precompile returns price in
+        // 2. Slippage band — perps use oraclePx, spots use spotPx (audit H-3, H-4).
+        //    Scale mismatch (perp): the `oraclePx` precompile returns price in
         //    `human * 10^(6-szDecimals)` scale, while `placeLimitOrder`'s
         //    `limitPx` arg is in `human * 10^(8-szDecimals)` scale (per the
         //    `limit_order` action encoding). Ratio is always 100×, regardless
         //    of szDecimals. Normalize oraclePx up by 100 before comparing.
+        //    Audit H-4: oraclePx read is strict — a zero / reverting oracle is
+        //    treated as failure, not as "skip the check."
         if (AssetId.isPerp(asset_) && slippageBandBps > 0) {
-            uint64 oraclePxRaw = PrecompileLib.oraclePx(asset_);
-            if (oraclePxRaw > 0) {
-                uint256 oracleNorm = uint256(oraclePxRaw) * 100;
+            uint64 oraclePxRaw = PrecompileLib.oraclePxStrict(asset_);
+            uint256 oracleNorm = uint256(oraclePxRaw) * 100;
+            uint256 limitPxU = uint256(limitPx);
+            uint256 diff = limitPxU > oracleNorm ? limitPxU - oracleNorm : oracleNorm - limitPxU;
+            uint256 maxDiff = (oracleNorm * slippageBandBps) / Constants.BPS;
+            if (diff > maxDiff) revert SlippageBandExceeded(limitPx, oraclePxRaw, slippageBandBps);
+        } else if (AssetId.isSpot(asset_)) {
+            // Audit H-3: per-spot-asset slippage band. Off by default for
+            //            backwards compatibility; admin must opt in per asset.
+            //            Scale relationship between `spotPx` and the
+            //            `limit_order` action's `limitPx` for spot is HL-defined
+            //            and asset-specific; admin must verify on a test order
+            //            before tightening the band.
+            uint16 spotBand = spotSlippageBandBps[asset_];
+            if (spotBand > 0) {
+                uint64 spotPxRaw = PrecompileLib.spotPxStrict(AssetId.indexOf(asset_));
                 uint256 limitPxU = uint256(limitPx);
-                uint256 diff = limitPxU > oracleNorm ? limitPxU - oracleNorm : oracleNorm - limitPxU;
-                uint256 maxDiff = (oracleNorm * slippageBandBps) / Constants.BPS;
-                if (diff > maxDiff) revert SlippageBandExceeded(limitPx, oraclePxRaw, slippageBandBps);
+                uint256 oracleU  = uint256(spotPxRaw);
+                uint256 diff = limitPxU > oracleU ? limitPxU - oracleU : oracleU - limitPxU;
+                uint256 maxDiff = (oracleU * spotBand) / Constants.BPS;
+                if (diff > maxDiff) revert SlippageBandExceeded(limitPx, spotPxRaw, spotBand);
             }
         }
 
@@ -423,6 +497,10 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///         `pullFromCore` is preferred and this can be considered an
     ///         emergency-only path — operators should restrict their key
     ///         accordingly (e.g., via a multisig).
+    /// @dev   Audit C-2: `to` must be on the admin-managed `spotRecoverDest`
+    ///        allowlist. A compromised OPERATOR key can no longer drain Core
+    ///        spot funds to an arbitrary address — destinations must be
+    ///        pre-approved via timelock.
     function operatorRecoverSpot(address to, uint64 token, uint64 amountWei)
         external
         onlyRole(OPERATOR_ROLE)
@@ -430,6 +508,7 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         nonReentrant
     {
         if (to == address(0)) revert ZeroAddress();
+        if (!spotRecoverDest[to]) revert SpotRecoverDestinationNotAllowed(to);
         CoreWriterLib.spotSend(to, token, amountWei);
         emit OperatorSpotRecovered(to, token, amountWei);
     }
@@ -566,11 +645,47 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         maxDepositPerAddress = newCap;
     }
 
-    /// @notice Recover non-asset tokens that landed at the vault. Cannot sweep `asset()`.
+    /// @notice Recover non-asset tokens that landed at the vault. Cannot sweep
+    ///         `asset()` nor the vault's own share token.
+    /// @dev    Audit C-1: also blocks `address(this)` — the vault holds its own
+    ///         shares in escrow during the withdrawal queue, and a sweep of
+    ///         those would brick LP withdrawals (fulfillWithdraw / cancel
+    ///         would revert at the ERC-20 transfer).
     function sweep(IERC20 token, address to) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (address(token) == asset()) revert SweepingAsset();
+        if (address(token) == asset() || address(token) == address(this)) revert SweepingAsset();
         if (to == address(0)) revert ZeroAddress();
         token.safeTransfer(to, token.balanceOf(address(this)));
+    }
+
+    // -------------------------------------------------------------------------
+    // Admin (timelock) — audit-mitigation surface (v1.3)
+    // -------------------------------------------------------------------------
+
+    /// @notice Audit C-2: allowlist (or remove) a destination for
+    ///         `operatorRecoverSpot`.
+    function setSpotRecoverDest(address dest, bool allowed) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (dest == address(0)) revert ZeroAddress();
+        spotRecoverDest[dest] = allowed;
+        emit SpotRecoverDestUpdated(dest, allowed);
+    }
+
+    /// @notice Audit H-1: toggle strict NAV reads. Enable once the vault's
+    ///         Core account has had its first successful cross-chain
+    ///         interaction (so precompile rows exist) — after that point,
+    ///         any precompile revert indicates a system failure and NAV
+    ///         should fail closed rather than silently zeroing.
+    function setStrictNavReads(bool enabled) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        strictNavReads = enabled;
+        emit StrictNavReadsUpdated(enabled);
+    }
+
+    /// @notice Audit H-3: set per-spot-asset slippage band in bps. 0 disables
+    ///         the band for that asset (legacy default). Admin must verify
+    ///         the `spotPx` ↔ `limitPx` scale relationship for the asset
+    ///         before tightening.
+    function setSpotSlippageBand(uint32 asset_, uint16 bps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        spotSlippageBandBps[asset_] = bps;
+        emit SpotSlippageBandUpdated(asset_, bps);
     }
 
     // -------------------------------------------------------------------------
@@ -606,28 +721,33 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
 
     /// @notice Anyone may call (keeper-friendly). Pays out as much of the request
     ///         as idle USDC allows, partial fills supported.
+    /// @dev    Audit C-3: perf fee comes out of the LP's gross payout and is
+    ///         transferred to feeRecipient in `asset()` terms — no fee shares
+    ///         are minted, so non-exiting LPs are not diluted.
     function fulfillWithdraw(address lp) external nonReentrant {
         WithdrawalRequest memory req = _pendingWithdrawal[lp];
         if (req.shares == 0) return;
 
         _accrueMgmtFee();
 
-        uint256 assetsPossible = previewRedeem(req.shares);
+        uint256 grossPossible = previewRedeem(req.shares);
         uint256 idle = idleUsdc();
-        uint256 outAssets;
+        uint256 grossOut;
         uint256 outShares;
 
-        if (assetsPossible <= idle) {
-            outAssets = assetsPossible;
+        if (grossPossible <= idle) {
+            grossOut = grossPossible;
             outShares = req.shares;
         } else {
-            outAssets = idle;
+            grossOut = idle;
             outShares = previewWithdraw(idle);
             if (outShares > req.shares) outShares = req.shares;
         }
-        if (outShares == 0 || outAssets == 0) return;
+        if (outShares == 0 || grossOut == 0) return;
 
-        _crystallizePerfFeeWithCb(lp, outShares, req.costBasisAtRequest);
+        uint256 feeAssets = _perfFeeAssetsWithCb(outShares, req.costBasisAtRequest);
+        if (feeAssets >= grossOut) feeAssets = 0;
+        uint256 userPayout = grossOut - feeAssets;
 
         if (outShares == req.shares) {
             delete _pendingWithdrawal[lp];
@@ -636,10 +756,14 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         }
 
         _burn(address(this), outShares);
-        IERC20(asset()).safeTransfer(lp, outAssets);
+        if (feeAssets > 0) {
+            IERC20(asset()).safeTransfer(feeRecipient, feeAssets);
+            emit PerfFeePaid(lp, feeAssets);
+        }
+        if (userPayout > 0) IERC20(asset()).safeTransfer(lp, userPayout);
 
-        emit Withdraw(msg.sender, lp, lp, outAssets, outShares);
-        emit WithdrawalFulfilled(lp, outAssets);
+        emit Withdraw(msg.sender, lp, lp, userPayout, outShares);
+        emit WithdrawalFulfilled(lp, userPayout);
     }
 
     // -------------------------------------------------------------------------
@@ -672,28 +796,19 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         emit NavSnapshot(navNow, totalSupply(), idleUsdc(), coreSpotUsdc(), perpWithdrawable(), block.timestamp);
     }
 
-    function _crystallizePerfFee(address lp, uint256 shares) internal {
-        _crystallizePerfFeeWithCb(lp, shares, _costBasisPerShare[lp]);
-    }
-
-    function _crystallizePerfFeeWithCb(address lp, uint256 shares, uint256 cb) internal {
-        if (perfFeeBps == 0 || shares == 0) return;
+    /// @dev Audit C-3: perf fee computed in `asset()` units. Caller deducts
+    ///      `feeAssets` from the exiting LP's payout and transfers it to
+    ///      `feeRecipient`. NO share mint, NO dilution of other LPs.
+    ///
+    ///      Returns 0 if perfFeeBps is 0, shares is 0, current PPS is at or
+    ///      below the LP's cost basis, or the computed fee rounds to 0.
+    function _perfFeeAssetsWithCb(uint256 shares, uint256 cb) internal view returns (uint256) {
+        if (perfFeeBps == 0 || shares == 0) return 0;
         uint256 cur = pricePerShare();
-        if (cur <= cb) return;
+        if (cur <= cb) return 0;
         uint256 gainPerShare = cur - cb;
         uint256 gainAssets = Math.mulDiv(gainPerShare, shares, Constants.WAD);
-        uint256 feeAssets = (gainAssets * perfFeeBps) / Constants.BPS;
-        if (feeAssets == 0) return;
-
-        uint256 navNow = totalAssets();
-        uint256 supply = totalSupply();
-        if (feeAssets >= navNow) return; // safety
-        uint256 feeShares = (feeAssets * supply) / (navNow - feeAssets);
-        if (feeShares > 0) {
-            _mint(feeRecipient, feeShares);
-            _absorbCostBasis(feeRecipient, feeShares, feeAssets);
-            emit PerfFeeCrystallized(lp, feeShares, gainAssets);
-        }
+        return (gainAssets * perfFeeBps) / Constants.BPS;
     }
 
     /// @dev   Sets the LP's cost basis from the effective entry price
@@ -724,14 +839,18 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///          product        = human_sz * human_px * 10^6 = direct 6dp USD
     ///        (no divisor needed). Different scale than `_orderNotional6dp`
     ///        which takes `limitPx` in the limit-order-action 8-decimal scale.
+    ///
+    ///        Audit H-2: markPx read is strict — a position with a missing /
+    ///        zero markPx reverts the trade rather than silently dropping that
+    ///        position from the gross-notional sum (which previously allowed
+    ///        the leverage cap to be bypassed).
     function _grossOpenPerpNotional6dp() internal view returns (uint256 total) {
         uint256[] memory perps = _whitelistedPerps.values();
         for (uint256 i; i < perps.length; ++i) {
             uint32 a = uint32(perps[i]);
             int64 szi = PrecompileLib.position(address(this), a).szi;
             if (szi == 0) continue;
-            uint64 markPx = PrecompileLib.markPx(a);
-            if (markPx == 0) continue;
+            uint64 markPx = PrecompileLib.markPxStrict(a);
             uint64 absSz = szi < 0 ? uint64(-szi) : uint64(szi);
             total += uint256(absSz) * uint256(markPx);
         }

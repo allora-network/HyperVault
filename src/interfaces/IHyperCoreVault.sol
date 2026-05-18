@@ -23,6 +23,8 @@ interface IHyperCoreVault is IERC4626 {
     error InvalidFeeConfig(uint16 mgmtBps, uint16 perfBps);
     error SweepingAsset();
     error StrandedSweepRequiresZeroSupply();
+    /// @notice `operatorRecoverSpot` destination is not on the admin allowlist (audit C-2).
+    error SpotRecoverDestinationNotAllowed(address dest);
 
     // -------------------------------------------------------------------------
     // CoreWriter submission events — these mirror what the legacy SDK response
@@ -63,7 +65,11 @@ interface IHyperCoreVault is IERC4626 {
     );
 
     event MgmtFeeAccrued(uint256 shares, uint256 navAtAccrual);
-    event PerfFeeCrystallized(address indexed lp, uint256 shares, uint256 gainAssets);
+    /// @notice Performance fee paid directly to `feeRecipient` in `asset()` terms,
+    ///         deducted from the exiting LP's payout. Replaces the v1.x
+    ///         `PerfFeeCrystallized` (which minted fee shares and silently
+    ///         diluted other LPs — audit finding C-3).
+    event PerfFeePaid(address indexed lp, uint256 feeAssets);
 
     event WithdrawalRequested(address indexed lp, uint256 shares);
     event WithdrawalFulfilled(address indexed lp, uint256 assets);
@@ -75,6 +81,12 @@ interface IHyperCoreVault is IERC4626 {
     event DepositCapUpdated(uint256 oldCap, uint256 newCap);
     event PerAddressCapUpdated(uint256 oldCap, uint256 newCap);
     event EmergencyShutdownTriggered(address indexed by);
+    /// @notice Admin (un)allowlisted a destination for `operatorRecoverSpot` (audit C-2).
+    event SpotRecoverDestUpdated(address indexed dest, bool allowed);
+    /// @notice Admin toggled strict NAV reads (audit H-1).
+    event StrictNavReadsUpdated(bool enabled);
+    /// @notice Admin set the spot slippage band for `asset` (audit H-3).
+    event SpotSlippageBandUpdated(uint32 indexed asset, uint16 bps);
 
     // -------------------------------------------------------------------------
     // Operator surface
@@ -100,6 +112,26 @@ interface IHyperCoreVault is IERC4626 {
     function usdPerpToSpot(uint64 ntl) external;
 
     function nextCloid() external view returns (uint128);
+
+    // -------------------------------------------------------------------------
+    // Admin (timelock) — audit-mitigation surface
+    // -------------------------------------------------------------------------
+
+    /// @notice Allowlist `dest` as a permitted `operatorRecoverSpot` recipient (audit C-2).
+    function setSpotRecoverDest(address dest, bool allowed) external;
+    function spotRecoverDest(address dest) external view returns (bool);
+
+    /// @notice Enable strict NAV-precompile reads (audit H-1). Once enabled, any
+    ///         revert from `spotBalance` / `withdrawable` bubbles up rather than
+    ///         silently zeroing NAV. Admin should enable after the vault's Core
+    ///         account is initialised (any successful cross-chain action).
+    function setStrictNavReads(bool enabled) external;
+    function strictNavReads() external view returns (bool);
+
+    /// @notice Per-spot-asset slippage band in bps (audit H-3). 0 = no band
+    ///         (legacy / opt-out). Compared against `spotPx` from the precompile.
+    function setSpotSlippageBand(uint32 asset_, uint16 bps) external;
+    function spotSlippageBandBps(uint32 asset_) external view returns (uint16);
 
     // -------------------------------------------------------------------------
     // Emergency surface
