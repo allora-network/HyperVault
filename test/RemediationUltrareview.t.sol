@@ -133,4 +133,55 @@ contract RemediationUltrareviewTest is Test {
         assertApproxEqAbs(feeCollected, 7.5e6, 0.25e6, "perf fee evaded or mis-charged");
         assertGt(feeCollected, 7e6, "perf fee was evaded (regression of bug_010)");
     }
+
+    // ======================================================================
+    // bug_009 — emergencyClosePositions fed position.szi (szDecimals lots)
+    // straight into the limit_order action `sz` (human * 10^8 scale). For a
+    // 0.5 BTC position (szDecimals 5) it closed 0.0005 BTC and left the rest
+    // open. Post-fix it scales by 10^(8 - szDecimals) so the emergency order
+    // matches the real position size.
+    // ======================================================================
+    function test_bug009_emergencyCloseUsesCorrectScale() public {
+        uint32 perp = 0;
+        int64 sziLots = 50_000; // 0.5 BTC at szDecimals = 5  (0.5 * 10^5)
+        uint8 szDecimals = 5;
+        uint64 limitPx = 6_000_000_000_000; // ~$60k in the 10^8 action scale
+
+        // Mock the two precompile reads the close performs for this perp.
+        PrecompileLib.Position memory pos = PrecompileLib.Position({
+            szi: sziLots,
+            entryNtl: 0,
+            isolatedRawUsd: 0,
+            leverage: 0,
+            isIsolated: false
+        });
+        vm.mockCall(Constants.POSITION_PRECOMPILE, abi.encode(address(vault), perp), abi.encode(pos));
+
+        PrecompileLib.PerpAssetInfo memory info = PrecompileLib.PerpAssetInfo({
+            coin: "BTC",
+            marginTableId: 0,
+            szDecimals: szDecimals,
+            maxLeverage: 50,
+            onlyIsolated: false
+        });
+        vm.mockCall(Constants.PERP_ASSET_INFO_PRECOMPILE, abi.encode(perp), abi.encode(info));
+
+        // Correct action size: 50_000 * 10^(8-5) = 50_000_000 (= 0.5 * 10^8).
+        // Pre-fix this was 50_000 (0.0005 BTC) — a 1000x under-size.
+        uint64 expectedSz = 50_000_000;
+
+        uint32[] memory perps = new uint32[](1);
+        perps[0] = perp;
+        uint64[] memory pxs = new uint64[](1);
+        pxs[0] = limitPx;
+
+        // asset (topic1) + cloid (topic2) indexed; full data checked.
+        // close a long -> sell (isBuy=false); reduceOnly=true; tif=IOC; cloid=1;
+        // navSnapshot=0 (fresh vault, no deposits / NAV reads mocked).
+        vm.expectEmit(true, true, false, true);
+        emit LimitOrderSubmitted(perp, false, limitPx, expectedSz, true, Constants.TIF_IOC, 1, 0);
+
+        vm.prank(emergency);
+        vault.emergencyClosePositions(perps, pxs);
+    }
 }

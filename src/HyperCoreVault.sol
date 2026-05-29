@@ -589,10 +589,19 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
             int64 szi = PrecompileLib.position(address(this), a).szi;
             if (szi == 0) continue;
             uint64 absSz = szi < 0 ? uint64(-szi) : uint64(szi);
-            bool isBuy = szi < 0; // long if currently short, vice versa
+            // Ultrareview bug_009: `position().szi` is in szDecimals lots
+            // (human_sz * 10^szDecimals), but the limit_order action `sz` is the
+            // uniform human_sz * 10^8 scale (see CoreWriterLib.placeLimitOrder and
+            // _orderNotional6dp). Without converting, the emergency close fires at
+            // ~1/10^(8 - szDecimals) of the real size (1000x too small for BTC),
+            // leaving the position essentially open. szDecimals is read strictly so
+            // a failed asset-info read fails the close closed (consistent with H-4).
+            uint8 szDec = PrecompileLib.perpAssetInfoStrict(a).szDecimals;
+            uint64 sz = uint64(uint256(absSz) * (10 ** (8 - szDec)));
+            bool isBuy = szi < 0; // close: sell if currently long, buy if currently short
             uint128 cloid = _cloidCounter++;
-            CoreWriterLib.placeLimitOrder(a, isBuy, limitPxs[i], absSz, true, Constants.TIF_IOC, cloid);
-            emit LimitOrderSubmitted(a, isBuy, limitPxs[i], absSz, true, Constants.TIF_IOC, cloid, totalAssets());
+            CoreWriterLib.placeLimitOrder(a, isBuy, limitPxs[i], sz, true, Constants.TIF_IOC, cloid);
+            emit LimitOrderSubmitted(a, isBuy, limitPxs[i], sz, true, Constants.TIF_IOC, cloid, totalAssets());
         }
     }
 
