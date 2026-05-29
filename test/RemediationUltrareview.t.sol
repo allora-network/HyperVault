@@ -184,4 +184,48 @@ contract RemediationUltrareviewTest is Test {
         vm.prank(emergency);
         vault.emergencyClosePositions(perps, pxs);
     }
+
+    // ======================================================================
+    // merged_bug_002 — the C-3 fix made `withdraw` treat `assets` as NET and
+    // over-burn previewWithdraw(assets + fee) shares, breaking three ERC-4626
+    // invariants. Post-fix `assets` is GROSS (mirrors redeem): burn exactly
+    // previewWithdraw(assets), pay fee out of it, send the remainder.
+    //   (1) burned shares == previewWithdraw(assets)
+    //   (2) withdraw(maxWithdraw(owner)) does not revert for an LP with a gain
+    //   (3) a router approved previewWithdraw(assets) shares is sufficient
+    // ======================================================================
+    function test_mergedBug002_withdrawIsErc4626Compliant() public {
+        _deposit(alice, 100e6); // PPS 1.0, cost basis 1.0
+        _simulateGain(50e6); // PPS 1.5; alice has a 50 USDC unrealized gain
+
+        // ---- (1) + (3): router allowance + preview/burn parity on a partial ----
+        uint256 part = 30e6;
+        uint256 sharesForPart = vault.previewWithdraw(part); // GROSS preview
+
+        vm.prank(alice);
+        vault.approve(router, sharesForPart); // approve EXACTLY the preview (router pattern)
+
+        uint256 feeRecip0 = usdc.balanceOf(feeRecipient);
+        uint256 aliceSharesBefore = vault.balanceOf(alice);
+
+        vm.prank(router);
+        vault.withdraw(part, router, alice); // pre-fix: reverts (allowance/over-burn)
+
+        // (1) exactly previewWithdraw(assets) shares burned
+        uint256 burned = aliceSharesBefore - vault.balanceOf(alice);
+        assertEq(burned, sharesForPart, "burned != previewWithdraw(assets) (over-burn)");
+        // (3) the approved allowance was exactly sufficient and fully consumed
+        assertEq(vault.allowance(alice, router), 0, "allowance not consumed exactly");
+
+        // receiver gets gross - fee; fee was actually charged on the gain
+        uint256 feePaid = usdc.balanceOf(feeRecipient) - feeRecip0;
+        assertGt(feePaid, 0, "perf fee should be charged on the gain");
+        assertEq(usdc.balanceOf(router), part - feePaid, "receiver should get assets - fee");
+
+        // ---- (2) withdraw(maxWithdraw(owner)) must not revert ----
+        uint256 mw = vault.maxWithdraw(alice);
+        vm.prank(alice);
+        vault.withdraw(mw, alice, alice); // pre-fix: reverts for an LP with a gain
+        assertLt(vault.balanceOf(alice), 1e9, "maxWithdraw should drain ~all shares");
+    }
 }

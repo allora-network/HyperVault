@@ -224,10 +224,23 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///      tightens as our fee accrual mints dilutive shares. We enforce the
     ///      idle-USDC cap here directly.
     ///
-    ///      Audit C-3: perf fee is paid in `asset()` directly to feeRecipient
-    ///      out of the user's payout (shares are over-burned to cover both the
-    ///      net payout and the fee). No fee shares are minted, so non-exiting
-    ///      LPs are no longer diluted.
+    ///      Audit C-3: the performance fee is paid in `asset()` directly to
+    ///      feeRecipient out of the exiting LP's payout — no fee shares are
+    ///      minted, so non-exiting LPs are not diluted.
+    ///
+    ///      Ultrareview merged_bug_002: `assets` is the GROSS amount (mirrors
+    ///      `redeem`). Exactly `previewWithdraw(assets)` shares are burned and
+    ///      the receiver gets `assets - feeAssets`. The previous version
+    ///      over-burned `previewWithdraw(assets + feeAssets)` shares, which broke
+    ///      the ERC-4626 invariants for `previewWithdraw` (under-reported the
+    ///      burn), `maxWithdraw` (`withdraw(maxWithdraw(owner))` reverted for any
+    ///      LP with a gain), and the allowance flow (a standard router approving
+    ///      `previewWithdraw(assets)` reverted with insufficient allowance).
+    ///
+    ///      NOTE: `previewWithdraw` / `previewRedeem` are fee-EXCLUSIVE (gross).
+    ///      The per-LP performance fee depends on the owner's cost basis and so
+    ///      cannot be reflected in the owner-agnostic ERC-4626 preview functions;
+    ///      the actual asset delta is `previewRedeem(shares) - perfFee(owner)`.
     function withdraw(uint256 assets, address receiver, address owner)
         public
         override(ERC4626, IERC4626)
@@ -236,20 +249,17 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     {
         _accrueMgmtFee();
 
-        // Compute fee on the un-adjusted share count, then over-burn to cover
-        // both user payout and fee. Single-pass estimate; tiny under-collection
-        // of the order of (feeBps * feeBps * gainBps) is accepted in exchange
-        // for the simpler accounting.
-        uint256 cb = _costBasisPerShare[owner];
-        uint256 sharesForNet = previewWithdraw(assets);
-        uint256 feeAssets = _perfFeeAssetsWithCb(sharesForNet, cb);
-        uint256 totalOut = assets + feeAssets;
-
         uint256 idle = idleUsdc();
-        if (totalOut > idle) revert WithdrawExceedsIdleBalance(totalOut, idle);
+        if (assets > idle) revert WithdrawExceedsIdleBalance(assets, idle);
 
-        shares = previewWithdraw(totalOut);
-        if (shares > balanceOf(owner)) revert WithdrawExceedsIdleBalance(totalOut, idle);
+        // `assets` is gross: burn exactly the shares it converts to, then pay the
+        // perf fee out of it and send the remainder to the receiver.
+        shares = previewWithdraw(assets);
+        if (shares > balanceOf(owner)) revert WithdrawExceedsIdleBalance(assets, idle);
+
+        uint256 feeAssets = _perfFeeAssetsWithCb(shares, _costBasisPerShare[owner]);
+        if (feeAssets >= assets) feeAssets = 0; // sanity — should not happen for valid fee/gain
+        uint256 net = assets - feeAssets;
 
         if (msg.sender != owner) _spendAllowance(owner, msg.sender, shares);
 
@@ -258,8 +268,8 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
             IERC20(asset()).safeTransfer(feeRecipient, feeAssets);
             emit PerfFeePaid(owner, feeAssets);
         }
-        IERC20(asset()).safeTransfer(receiver, assets);
-        emit Withdraw(msg.sender, receiver, owner, assets, shares);
+        IERC20(asset()).safeTransfer(receiver, net);
+        emit Withdraw(msg.sender, receiver, owner, net, shares);
     }
 
     /// @dev Audit C-3: perf fee is deducted from the user's gross payout and
