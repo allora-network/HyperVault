@@ -820,7 +820,15 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     function _absorbCostBasis(address lp, uint256 newShares, uint256 newAssets) internal {
         if (newShares == 0) return;
         uint256 entryPps = Math.mulDiv(newAssets, Constants.WAD, newShares);
-        uint256 totalShares = balanceOf(lp);
+        // Ultrareview bug_010: include shares escrowed for a pending withdrawal.
+        // They live at address(this), so balanceOf(lp) excludes them — without
+        // this, a deposit made while a withdrawal request is open hits the
+        // `oldShares == 0` branch and OVERWRITES the LP's cost basis to the
+        // current (elevated) PPS, wiping the unrealized gain and evading the
+        // performance fee entirely (requestWithdraw -> deposit -> cancel ->
+        // redeem). Counting the escrow weighted-averages the new deposit against
+        // the escrowed shares' real basis instead.
+        uint256 totalShares = balanceOf(lp) + _pendingWithdrawal[lp].shares;
         uint256 oldShares = totalShares - newShares;
         if (oldShares == 0) {
             _costBasisPerShare[lp] = entryPps;
