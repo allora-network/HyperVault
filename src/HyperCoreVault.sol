@@ -421,16 +421,18 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         }
 
         // 2. Slippage band — perps use oraclePx, spots use spotPx (audit H-3, H-4).
-        //    Scale mismatch (perp): the `oraclePx` precompile returns price in
-        //    `human * 10^(6-szDecimals)` scale, while `placeLimitOrder`'s
-        //    `limitPx` arg is in `human * 10^(8-szDecimals)` scale (per the
-        //    `limit_order` action encoding). Ratio is always 100×, regardless
-        //    of szDecimals. Normalize oraclePx up by 100 before comparing.
-        //    Audit H-4: oraclePx read is strict — a zero / reverting oracle is
-        //    treated as failure, not as "skip the check."
+        //    Scale reconciliation (verified on HyperEVM mainnet):
+        //      oraclePx precompile        = human * 10^(6 - szDecimals)
+        //      limit_order action limitPx = human * 10^8   (UNIFORM; NOT szDecimals-based)
+        //    Normalize oraclePx UP to the 10^8 action scale before comparing:
+        //      factor = 10^(8 - (6 - szDecimals)) = 10^(2 + szDecimals).
+        //    Audit H-4: oraclePx AND szDecimals are read strictly — a zero /
+        //    reverting oracle, or a failed asset-info read, fails the trade
+        //    closed rather than silently mis-scaling or skipping the check.
         if (AssetId.isPerp(asset_) && slippageBandBps > 0) {
             uint64 oraclePxRaw = PrecompileLib.oraclePxStrict(asset_);
-            uint256 oracleNorm = uint256(oraclePxRaw) * 100;
+            uint256 szDec = uint256(PrecompileLib.perpAssetInfoStrict(asset_).szDecimals);
+            uint256 oracleNorm = uint256(oraclePxRaw) * (10 ** (szDec + 2));
             uint256 limitPxU = uint256(limitPx);
             uint256 diff = limitPxU > oracleNorm ? limitPxU - oracleNorm : oracleNorm - limitPxU;
             uint256 maxDiff = (oracleNorm * slippageBandBps) / Constants.BPS;
@@ -837,8 +839,8 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///          sz raw         = human_sz * 10^szDec
     ///          markPx precomp = human_px * 10^(6 - szDec)
     ///          product        = human_sz * human_px * 10^6 = direct 6dp USD
-    ///        (no divisor needed). Different scale than `_orderNotional6dp`
-    ///        which takes `limitPx` in the limit-order-action 8-decimal scale.
+    ///        (no divisor needed). Different scale than `_orderNotional6dp`,
+    ///        which takes `sz` and `limitPx` in the limit-order-action 10^8 scale.
     ///
     ///        Audit H-2: markPx read is strict — a position with a missing /
     ///        zero markPx reverts the trade rather than silently dropping that
@@ -856,8 +858,12 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         }
     }
 
+    /// @dev   Order notional in 6dp USD. Both `sz` and `limitPx` are in the
+    ///        limit-order-action 10^8 scale (human * 10^8), so
+    ///          sz * limitPx = human_sz * human_px * 10^16,
+    ///        and dividing by 1e10 yields human_sz * human_px * 10^6 = 6dp USD.
     function _orderNotional6dp(uint64 sz, uint64 limitPx) internal pure returns (uint256) {
-        return (uint256(sz) * uint256(limitPx)) / 100;
+        return (uint256(sz) * uint256(limitPx)) / 1e10;
     }
 
     // -------------------------------------------------------------------------

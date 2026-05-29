@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""End-to-end testnet runner for HyperCoreVault.
+"""Live mainnet test harness for HyperCoreVault.
 
-Drives the vault through a full lifecycle on Hyperliquid testnet and cross-
-checks each step against the HL info endpoint. Designed for confidence-building
-before mainnet, not for unit testing — for that, use `forge test`.
+This is the project's automated integration coverage: it drives a vault through
+the full lifecycle on HyperEVM **mainnet** and asserts each step against both
+the vault's on-chain state and the HL info endpoint. (Mock-based forge tests
+were retired — real CoreWriter / precompile behaviour is what matters here.)
 
 Default flow:
-    preflight → deposit → push → spot→perp → place → cancel → perp→spot → pull → redeem
+    preflight → deposit → push → spot→perp → place → cancel → fill → perp→spot → pull → redeem
 
-Each step verifies vault on-chain state AND the corresponding HL API view.
+`place` rests a post-only order; `fill` crosses the book with a marketable IOC,
+confirms the fill via HL `userFills`, then flattens reduce-only. `fill` and the
+bridge steps move real funds / pay fees — scope with `--steps` as needed.
 
 Usage:
-    ARTIFACT=deployments/testnet/<strategy>.json \\
-    HYPEREVM_RPC_TESTNET=https://rpc.hyperliquid-testnet.xyz/evm \\
+    ARTIFACT=deployments/mainnet/<strategy>.json \\
+    HYPEREVM_RPC_MAINNET=https://rpc.hyperliquid.xyz/evm \\
     ALICE_PRIVATE_KEY=0x... \\
     OPERATOR_PRIVATE_KEY=0x... \\
-    python e2e_runner.py [--deposit-usdc 10] [--asset 0] [--steps deposit,push,...]
+    python e2e_runner.py [--deposit-usdc 10] [--asset 0] [--steps deposit,place,...]
 """
 from __future__ import annotations
 
@@ -71,7 +74,7 @@ def build_ctx(args: argparse.Namespace) -> Ctx:
     vault_addr = Web3.to_checksum_address(artifact["vault"])
     usdc_addr = Web3.to_checksum_address(artifact["asset"])
 
-    rpc = args.rpc_url or os.environ["HYPEREVM_RPC_TESTNET"]
+    rpc = args.rpc_url or os.environ["HYPEREVM_RPC_MAINNET"]
     w3 = Web3(Web3.HTTPProvider(rpc))
     assert w3.is_connected(), f"RPC not reachable: {rpc}"
 
@@ -140,6 +143,12 @@ def usdc_units(human: float) -> int:
 def core_wei_usdc(human: float) -> int:
     """USDC on Core has 8 decimals."""
     return int(round(human * 1e8))
+
+
+def _order_size(ctx: "Ctx", mark: float, target_usd: float = 12.0) -> float:
+    """Smallest size (respecting szDecimals) whose notional clears HL's ~$10 min."""
+    step = 10 ** (-ctx.asset_meta.sz_decimals)
+    return max(step, round((target_usd / mark) / step) * step)
 
 
 # -----------------------------------------------------------------------------
@@ -304,13 +313,13 @@ def step_place(ctx: Ctx) -> tuple[bool, Optional[int]]:
     mark = hl.perp_mark_px(ctx.info, ctx.asset_idx)
     # 1% below mark, post-only — should rest, not cross
     human_px = ctx.asset_meta.round_to_tick(mark * 0.99)
-    human_sz = 0.0001  # tiny — well under leverage cap
+    human_sz = _order_size(ctx, mark)  # ~$12 notional — clears HL's $10 minimum, under the leverage cap
     enc_px = ctx.asset_meta.encode_px(human_px)
     enc_sz = ctx.asset_meta.encode_sz(human_sz)
     ctx.console.print(f"oracle: {oracle}  mark: {mark}  limit: {human_px} (enc {enc_px})")
     ctx.console.print(f"size: {human_sz} {ctx.asset_meta.name} (enc {enc_sz})")
 
-    TIF_ALO = 0
+    TIF_ALO = 1  # HL CoreWriter tif: 1=Alo (post-only), 2=Gtc, 3=Ioc. 0 is invalid → silently dropped.
     receipt = send_tx(ctx, ctx.operator,
                       ctx.vault.functions.placeLimitOrder(
                           ctx.asset_idx, True, enc_px, enc_sz, False, TIF_ALO),
@@ -347,6 +356,52 @@ def step_cancel(ctx: Ctx, cloid: int) -> bool:
     if not ok:
         ctx.failures.append(f"cloid {cloid} still on book after cancel timeout")
     return ok
+
+
+def step_fill(ctx: Ctx) -> bool:
+    """Confirm an order actually FILLS (not just rests): a marketable IOC buy
+    that crosses the book, verified via HL `userFills`, then flattened with a
+    reduce-only IOC. Opens a real position briefly and pays taker fees."""
+    TIF_IOC = 3
+    ctx.console.rule(f"[bold]fill-confirmation ({ctx.asset_meta.name})")
+    mark = hl.perp_mark_px(ctx.info, ctx.asset_idx)
+    human_sz = _order_size(ctx, mark)
+    buy_px = ctx.asset_meta.round_to_tick(mark * 1.005)  # 0.5% through the ask — crosses
+    fills_before = len(hl.user_fills(ctx.info, ctx.vault_addr))
+
+    receipt = send_tx(ctx, ctx.operator,
+                      ctx.vault.functions.placeLimitOrder(
+                          ctx.asset_idx, True,
+                          ctx.asset_meta.encode_px(buy_px), ctx.asset_meta.encode_sz(human_sz),
+                          False, TIF_IOC),
+                      gas=1_500_000)
+    parse_event(ctx, receipt, "LimitOrderSubmitted")
+    filled = wait_for(
+        lambda: len(hl.user_fills(ctx.info, ctx.vault_addr)) > fills_before,
+        timeout_s=20, label="taker fill on HL",
+    )
+    ctx.console.print(f"filled: {filled}")
+    if not filled:
+        ctx.failures.append("marketable IOC did not fill")
+
+    # Flatten: reduce-only IOC on the opposite side, sized to the open position.
+    szi = hl.perp_position_szi(ctx.info, ctx.vault_addr, ctx.asset_meta.name)
+    if abs(szi) > 0:
+        close_px = ctx.asset_meta.round_to_tick(mark * (0.995 if szi > 0 else 1.005))
+        send_tx(ctx, ctx.operator,
+                ctx.vault.functions.placeLimitOrder(
+                    ctx.asset_idx, szi < 0,
+                    ctx.asset_meta.encode_px(close_px), ctx.asset_meta.encode_sz(abs(szi)),
+                    True, TIF_IOC),
+                gas=1_500_000)
+        flat = wait_for(
+            lambda: abs(hl.perp_position_szi(ctx.info, ctx.vault_addr, ctx.asset_meta.name)) < abs(szi),
+            timeout_s=20, label="position flattened",
+        )
+        ctx.console.print(f"flattened: {flat}")
+        if not flat:
+            ctx.failures.append("position not flattened after fill test")
+    return filled
 
 
 def step_perp_to_spot(ctx: Ctx) -> bool:
@@ -418,7 +473,7 @@ def step_redeem(ctx: Ctx) -> bool:
 # -----------------------------------------------------------------------------
 
 ALL_STEPS = ["preflight", "deposit", "core_status", "push", "spot_to_perp",
-             "place", "cancel", "perp_to_spot", "pull", "redeem"]
+             "place", "cancel", "fill", "perp_to_spot", "pull", "redeem"]
 
 # Steps that require a real EVM-side USDC ↔ Core bridge. Skipped automatically
 # when the asset has no linked bridge (testnet MockUSDC case).
@@ -429,12 +484,12 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact", default=os.environ.get("ARTIFACT"),
                         help="path to deployments/<chain>/<strategy>.json")
-    parser.add_argument("--rpc-url", default=os.environ.get("HYPEREVM_RPC_TESTNET"))
+    parser.add_argument("--rpc-url", default=os.environ.get("HYPEREVM_RPC_MAINNET"))
     parser.add_argument("--operator-key", default=os.environ.get("OPERATOR_PRIVATE_KEY"))
     parser.add_argument("--alice-key", default=os.environ.get("ALICE_PRIVATE_KEY"))
     parser.add_argument("--deposit-usdc", type=float, default=10.0)
     parser.add_argument("--asset", type=int, default=0, help="perp asset id (default BTC=0)")
-    parser.add_argument("--network", default="testnet", choices=["testnet", "mainnet"])
+    parser.add_argument("--network", default="mainnet", choices=["mainnet", "testnet"])
     parser.add_argument("--steps", default=",".join(ALL_STEPS),
                         help="comma-separated step names or 'all'")
     parser.add_argument("--skip-bridge", action="store_true",
@@ -451,7 +506,7 @@ def main() -> int:
         steps = [s for s in steps if s not in BRIDGE_STEPS]
 
     ctx.console.print(Panel.fit(
-        f"HyperCoreVault testnet e2e\nvault={ctx.vault_addr}\nsteps={steps}",
+        f"HyperCoreVault {ctx.network} e2e\nvault={ctx.vault_addr}\nsteps={steps}",
         title="setup"))
 
     cloid: Optional[int] = None
@@ -476,6 +531,8 @@ def main() -> int:
                     ctx.console.print("[yellow]no cloid from place step — skipping cancel[/yellow]")
                 else:
                     step_cancel(ctx, cloid)
+            elif step == "fill":
+                step_fill(ctx)
             elif step == "perp_to_spot":
                 step_perp_to_spot(ctx)
             elif step == "pull":

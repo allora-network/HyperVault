@@ -227,6 +227,16 @@ library PrecompileLib {
         if (ok) info = abi.decode(ret, (PerpAssetInfo));
     }
 
+    /// @notice Strict variant of {perpAssetInfo}: reverts on precompile failure
+    ///         or empty return. Used by the perp slippage band, which needs a
+    ///         trustworthy `szDecimals` to normalize the oracle price into the
+    ///         limit-order action's 10^8 scale (a wrong/zero szDecimals would
+    ///         silently mis-scale the band — fail closed instead, per audit H-4).
+    function perpAssetInfoStrict(uint32 perpIndex) internal view returns (PerpAssetInfo memory info) {
+        bytes memory ret = _readStrict(Constants.PERP_ASSET_INFO_PRECOMPILE, abi.encode(perpIndex));
+        info = abi.decode(ret, (PerpAssetInfo));
+    }
+
     function spotInfo(uint32 spotIndex) internal view returns (SpotInfo memory info) {
         (bool ok, bytes memory ret) = _read(Constants.SPOT_INFO_PRECOMPILE, abi.encode(spotIndex));
         if (ok) info = abi.decode(ret, (SpotInfo));

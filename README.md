@@ -2,7 +2,7 @@
 
 **EIP-4626 vault template for HyperEVM**, with on-chain NAV via HyperCore precompiles and trade execution via the CoreWriter system contract. Replaces Hyperliquid's legacy native vaults (10,000 USDC creation fee, perps-only) with a gas-only Solidity contract that supports spot, perps, and HIP-3 markets in any quote.
 
-Validated end-to-end on **HyperEVM mainnet** (chain 999) — see [the mainnet findings](#real-mainnet-findings) below for what worked, what didn't, and the v1.2 fixes that shipped from that exercise.
+Validated end-to-end on **HyperEVM mainnet** (chain 999) — see [the mainnet findings](#real-mainnet-findings) below for what worked, what didn't, and the v1.3 fixes that shipped from that exercise.
 
 ---
 
@@ -11,8 +11,7 @@ Validated end-to-end on **HyperEVM mainnet** (chain 999) — see [the mainnet fi
 - **Audit-ready ERC-4626 vault** (`src/HyperCoreVault.sol`) — operator/emergency/admin roles, asset whitelist, leverage cap, slippage band, management + performance fees, withdrawal queue, cost-basis tracking
 - **Per-strategy deploy pipeline** — JSON config in, on-chain vault + per-vault `TimelockController` + auto-registered entry out
 - **Discovery frontend** — Vite + React + viem; auto-discovers every vault from `deployments/<chain>/*.json` artifacts at build time
-- **Python e2e runner** — drives `deposit → push → spot→perp → place → cancel → perp→spot → pull → redeem` against the live HL API
-- **51 forge tests** — unit, integration (against mocked precompiles + CoreWriter), CoreWriter encoding bit-exactness, fee math, withdrawal queue, leverage/slippage gates
+- **Live mainnet test harness** (`scripts/python/e2e_runner.py`) — exercises the full lifecycle against real HyperCore (`deposit → spot↔perp → limit order place / cancel / fill-confirm → withdraw / redeem`) with HL-API assertions at each step. Mock-based forge tests were retired in favour of live verification — see [the mainnet findings](#real-mainnet-findings).
 
 ## Why HyperEVM (not legacy HyperCore vaults)
 
@@ -85,30 +84,25 @@ src/                          Solidity sources
 
 script/                       Foundry deploy scripts
   DeployRegistry.s.sol        One-time per chain
-  DeployMockUSDC.s.sol        For testnet / fork where real USDC isn't available
   Deploy.s.sol                Per-strategy from JSON config; deploys timelock + vault + seeds whitelist
+  DeployTifTestVault.s.sol    Throwaway test vault for live mainnet verification (admin=operator)
 
-test/                         51 tests across 8 suites
-  unit/                       Vault, fees, withdrawal queue, CoreWriter encoding bit-exactness, etc.
-  integration/                Full lifecycle via mocked precompiles + CoreWriter (CoreSimulator-style)
-  mocks/                      MockCoreWriter, MockPrecompiles, MockUSDC
-
-scripts/python/               Python orchestration (HL SDK + web3.py)
-  e2e_runner.py               Drives full lifecycle on testnet/mainnet with HL API cross-checks
+scripts/python/               Python orchestration + live mainnet test harness (HL SDK + web3.py)
+  e2e_runner.py               Full-lifecycle live mainnet test harness; HL API cross-checks per step
+  live_contract_path.py       Focused live test: whitelist → fund → place (rests) → cancel → recover
+  hl_helpers.py               HL reads + px/sz (×10^8) / tif encoding used by the harness
   optin_big_blocks.py         Toggles HyperEVM big-blocks via HL API (needed for vault deploy)
   seed_vault_core.py          Sends Core USDC from your account to a vault's Core address
   seed_whitelist.py           Post-deploy whitelist updates through the timelock
 
 deployments/                  Strategy configs (input) + deploy artifacts (output)
-  configs/                    Per-strategy JSON parameter files
+  configs/                    Per-strategy JSON parameter files (mainnet-tier1/2/2b, example)
   mainnet/                    Per-strategy deploy artifacts written by Deploy.s.sol
-  testnet/
 
-docs/                         Architecture, integration, security, testnet runbook
+docs/                         Architecture, integration, security
   ARCHITECTURE.md             Design rationale + diagrams
   INTEGRATION.md              Live runner integration guide (event → SDK field mapping, runbook)
   SECURITY.md                 Threat model, role/permission matrix, audit checklist, mainnet findings
-  TESTNET.md                  Step-by-step testnet walkthrough
 
 frontend/                     Vite + React + viem discovery UI
   src/
@@ -144,7 +138,7 @@ frontend/                     Vite + React + viem discovery UI
 
 ### Libraries
 
-**`CoreWriterLib`** — wraps the CoreWriter system contract (`0x3333…3333`). Each typed function packs `abi.encodePacked(uint8(1), uint24(actionId), abi.encode(args))` and calls `sendRawAction`. The action set: `limit_order`, `cancel_order_by_oid`, `cancel_order_by_cloid`, `spot_send`, `usd_class_transfer`, `vault_transfer`. Bit-exact encoding is verified by golden-vector tests in `test/unit/CoreWriterLib.t.sol`.
+**`CoreWriterLib`** — wraps the CoreWriter system contract (`0x3333…3333`). Each typed function packs `abi.encodePacked(uint8(1), uint24(actionId), abi.encode(args))` and calls `sendRawAction`. The action set: `limit_order`, `cancel_order_by_oid`, `cancel_order_by_cloid`, `spot_send`, `usd_class_transfer`, `vault_transfer`. Encoding follows the HL CoreWriter spec — `px`/`sz` as `human × 10^8` and `tif` as `1=ALO / 2=GTC / 3=IOC` — verified live by the mainnet test harness.
 
 **`PrecompileLib`** — typed `staticcall` wrappers for every L1 read precompile (`0x0800–0x0810`). Returns the protocol's struct; falls back to zero-initialised struct if the precompile errors (e.g., the account has never touched that market). Used by the vault for `totalAssets` (NAV = idle + coreSpot + perpWithdrawable) and by the operator gates (oraclePx for slippage, position/markPx for leverage).
 
@@ -158,7 +152,7 @@ frontend/                     Vite + React + viem discovery UI
 
 ### Python helpers
 
-`scripts/python/e2e_runner.py` — drives the full vault lifecycle on testnet/mainnet with HL API cross-checks at every step. Step-selectable via `--steps`, `--skip-bridge` mode for environments without a working EVM↔Core USDC bridge.
+`scripts/python/e2e_runner.py` — the live mainnet test harness: drives the full vault lifecycle on HyperEVM mainnet with HL API assertions at every step (deposit, spot↔perp, limit order place/cancel/fill, withdraw/redeem). Step-selectable via `--steps`; `--skip-bridge` for assets without a linked EVM↔Core USDC bridge (fund Core via `seed_vault_core.py` instead).
 
 `scripts/python/optin_big_blocks.py` — toggles HyperEVM big-blocks via the HL API (required because the vault deploy is ~8M gas, over the 2M small-block limit).
 
@@ -186,12 +180,16 @@ npm run dev          # http://localhost:5173
 - Node 20+ and npm
 - Python 3.11+ (for the e2e runner)
 
-### Install + test
+### Install + build
 ```bash
 forge install OpenZeppelin/openzeppelin-contracts@v5.1.0 --shallow --no-git
 forge install foundry-rs/forge-std --shallow --no-git
 forge build
-forge test                 # 51 tests
+
+# Automated coverage is the live mainnet harness (mock forge tests were retired):
+#   python3 -m pip install --user -r scripts/python/requirements.txt
+#   ARTIFACT=deployments/mainnet/<strategy>.json OPERATOR_PRIVATE_KEY=0x... \
+#   python3 scripts/python/e2e_runner.py --network mainnet
 ```
 
 ### Deploy a strategy
@@ -230,42 +228,60 @@ ln -sf ../deployments deployments
 npm run dev
 ```
 
-Full step-by-step (including faucets, big-blocks toggle, e2e runner) lives in [`docs/TESTNET.md`](docs/TESTNET.md).
+Live mainnet verification (deposit / order / fill / cancel / withdraw) runs through `scripts/python/e2e_runner.py` — see [`scripts/python/README.md`](scripts/python/README.md).
 
 ---
 
 ## Real mainnet findings
 
-The vault was validated end-to-end on HyperEVM mainnet. Three concrete bugs were found and fixed by running against real precompiles and CoreWriter (which our anvil-fork verification had hidden). One issue remains open and worth flagging before production use.
+The vault was validated end-to-end on HyperEVM mainnet. Several bugs were found and fixed by running against real precompiles and CoreWriter (which mock/fork verification had hidden) — most importantly the px/sz action scale, confirmed by placing a **resting BTC order from the contract path**. No findings remain open.
 
 **Fixed:**
-1. **`oraclePx` / `markPx` precompiles use `human × 10^(6−szDecimals)` scale**, not the `10^(8−szDecimals)` scale that the `limit_order` CoreWriter action uses. A 100× mismatch in the slippage and leverage gates was breaking every realistic order. Fixed by normalizing oraclePx by 100 in the slippage band check and adjusting the leverage notional formula. Test mocks updated for the corrected scale.
+1. **`limit_order` px/sz action scale is `human × 10^8` (uniform), NOT `10^(8−szDecimals)` / `10^szDecimals`** — confirmed on mainnet (an order at the szDecimals-based scale is silently dropped; a `10^8` order rests). The `oraclePx`/`markPx` precompiles return `human × 10^(6−szDecimals)`, so the perp slippage band normalizes oraclePx by `10^(2+szDecimals)` (per-asset `szDecimals` via `perpAssetInfoStrict`), the leverage-cap notional divides by `1e10`, and `hl_helpers.encode_px/encode_sz` use `× 10^8`. (v1.2's "×100" normalization was wrong and dropped every realistic order.)
 2. **EIP-170 contract-size limit on the factory.** Inlining `type(HyperCoreVault).creationCode` pushed the factory over 24KB. Worked around by deploying the vault directly from `Deploy.s.sol` via CREATE; the factory remains in the repo for a future EIP-1167 refactor.
 3. **`operatorRecoverSpot(to, token, amountWei)` added** so the operator can move Core spot funds out of the vault when the EVM↔Core bridge for the chosen asset isn't deployed (the current mainnet state for USDC). `operatorSweepStranded(to)` added for recovering EVM `asset()` balance after `totalSupply` returns to zero.
 
-**Open finding:**
-- **HL Core does not appear to process `limit_order` actions submitted via CoreWriter from a contract account.** Other actions (`spot_send`, `usd_class_transfer`, `send_asset`) work correctly for vault contracts — funds move, ledger entries appear. But `placeLimitOrder` produces zero entries in HL's `historicalOrders`, regardless of TIF (0/1/2/3 all tested) or order size (`$0.76` and `$12+` both attempted). The CoreWriter event fires on EVM, but HL Core is silent. Possible causes: requires `setLeverage` initialization (no CoreWriter wrapper exists for it), requires `add_api_wallet` delegation, or requires `user_set_abstraction` mode setup. Needs HL team input or further protocol research.
+**Resolved (v1.3) — was "HL Core does not process `limit_order` from contracts":**
+- **Root cause was the px/sz SCALE (item 1 above), confirmed on mainnet** — not an HL/contract limitation, and not (primarily) TIF. Decisive test, all `tif=1` via raw `CoreWriter.sendRawAction`: a `10^8`-scale BTC order **rested on the book** (`limitPx 72596.0, sz 0.0002`); the same order at the repo's `10^(8−szDecimals)`/`10^szDecimals` scale was **silently dropped**; and a perfectly-`tif=1`-encoded but wrong-scale order also dropped. The TIF enum was *also* off by one (`TIF_ALO=0…`; correct `1/2/3`) and is fixed — real but secondary (tif=0 still drops once scale is right). **Deployed v1.2 vaults bake in BOTH the wrong scale (band/cap math) and the wrong TIF, so they cannot place orders and must be redeployed** (this also fixes `emergencyClosePositions`, which encoded IOC as GTC).
 
 Documented in full in [`docs/SECURITY.md`](docs/SECURITY.md) under "Lessons from mainnet testing (v1.2)".
 
-### Deployed addresses (mainnet, for reference)
+### Vault tiers
 
-| What | Address |
-|---|---|
-| HyperCoreVaultRegistry | [`0xA430c24f63BB3245723242c7843b2E07BA220ba8`](https://hyperevmscan.io/address/0xA430c24f63BB3245723242c7843b2E07BA220ba8) |
-| Tier 1 vault (v1.0) | [`0x1DDC8A2478157da455D7AafE7486CD674f7E5B1a`](https://hyperevmscan.io/address/0x1DDC8A2478157da455D7AafE7486CD674f7E5B1a) |
-| Tier 2 vault (v1.1, +recoverSpot) | [`0xdc5196C7d841b2C3C6E935dE04383Fb40b8534aE`](https://hyperevmscan.io/address/0xdc5196C7d841b2C3C6E935dE04383Fb40b8534aE) |
-| Tier 2b vault (v1.2, +slippage scale fix) | [`0xC43997299722A3896ddBA28730a7ff2A6A6B02f5`](https://hyperevmscan.io/address/0xC43997299722A3896ddBA28730a7ff2A6A6B02f5) |
-| Mainnet USDC (Circle, bridged from Arbitrum) | `0xb88339CB7199b77E23DB6E890353E22632Ba630f` |
+The repo ships three strategy configs — `tier1`, `tier2`, `tier2b` (`deployments/configs/mainnet-tier*.json`). **They are currently identical in every risk parameter** and differ only by name/symbol and deployed instance (separate vault + timelock addresses). Tiering is scaffolding for future differentiation — not yet differentiated.
 
-Total mainnet spend across the full validation exercise: ~0.011 HYPE (~$0.50) in gas + 1 USDC HL transfer fee + 1.5 USDC stranded in the Tier 2b vault (donation-trap demonstration, recoverable via `operatorSweepStranded` if redeployed).
+| Parameter | tier1 | tier2 | tier2b |
+|---|---|---|---|
+| Name / symbol | Allora Mainnet Tier1 / `amt1` | Allora Mainnet Tier2 / `amt2` | Allora Mainnet Tier2b / `amt2b` |
+| Leverage cap | 3× (30000 bps) | 3× | 3× |
+| Slippage band | 2% (200 bps) | 2% | 2% |
+| Perf / mgmt fee | 15% / 2%-yr | 15% / 2%-yr | 15% / 2%-yr |
+| Deposit cap / per-address | $100 / $100 | $100 / $100 | $100 / $100 |
+| Whitelisted markets | BTC perp (id 0) | BTC perp (id 0) | BTC perp (id 0) |
+| Quote (USDC) | `0xb883…630f` | `0xb883…630f` | `0xb883…630f` |
+| Timelock min delay | 0s | 0s | 0s |
+
+> To make the tiers mean something different, edit the per-tier config and redeploy. A natural scheme: **tier1** conservative (lower cap, BTC only), **tier2** standard, **tier2b** higher cap / more markets.
+
+### Deployed instances (pre-v1.3 — superseded, pending redeploy)
+
+Deployed before the v1.3 px/sz-scale + TIF fixes, so they **cannot place orders** (wrong action scale + TIF inlined in bytecode). Redeploy with the current code via `Deploy.s.sol`, then refresh these addresses.
+
+| | Vault (pre-v1.3) | Timelock |
+|---|---|---|
+| tier1 | [`0x1DDC…5B1a`](https://hyperevmscan.io/address/0x1DDC8A2478157da455D7AafE7486CD674f7E5B1a) | `0x4bf3037EB1b5b87fD37d99FAD6579fe22049e906` |
+| tier2 | [`0xdc51…34aE`](https://hyperevmscan.io/address/0xdc5196C7d841b2C3C6E935dE04383Fb40b8534aE) | `0x11BfF9278097f31448f3F9973FEbec61eEf6E27A` |
+| tier2b | [`0xC439…02f5`](https://hyperevmscan.io/address/0xC43997299722A3896ddBA28730a7ff2A6A6B02f5) | `0x190d0c65182300B9b1C7F1FDD514c6cA3D9CCe5A` |
+| Registry | [`0xA430…0ba8`](https://hyperevmscan.io/address/0xA430c24f63BB3245723242c7843b2E07BA220ba8) | — |
+| USDC (quote) | `0xb88339CB7199b77E23DB6E890353E22632Ba630f` | — |
+
+The v1.3 fixes were confirmed on a throwaway test vault that placed a **resting BTC order via the contract path** (then cancelled, funds recovered); see [`docs/SECURITY.md`](docs/SECURITY.md).
 
 ---
 
 ## Known limitations and v1.1 follow-ups
 
 - **EIP-1167 minimal-proxy refactor** to restore the CREATE2 factory and keep the per-vault deploy under EIP-170
-- **`setLeverage` CoreWriter wrapper** or `add_api_wallet` flow to unblock perp order placement from contract accounts
 - **Multi-quote vault support** (current: USDC-only)
 - **Subaccount support** (current: one Core account per vault, derived from EVM address)
 - **Sweep stranded asset** is operator-gated; consider moving to `EMERGENCY_ROLE` for production
@@ -278,8 +294,7 @@ Total mainnet spend across the full validation exercise: ~0.011 HYPE (~$0.50) in
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — design rationale, NAV math, fee accounting
 - [`docs/INTEGRATION.md`](docs/INTEGRATION.md) — live-runner integration, event-to-SDK-field mapping, runbook
 - [`docs/SECURITY.md`](docs/SECURITY.md) — threat model, role matrix, audit checklist, mainnet findings
-- [`docs/TESTNET.md`](docs/TESTNET.md) — step-by-step testnet walkthrough
-- [`scripts/python/README.md`](scripts/python/README.md) — Python helper usage
+- [`scripts/python/README.md`](scripts/python/README.md) — Python helpers + live mainnet test harness
 
 ## License
 

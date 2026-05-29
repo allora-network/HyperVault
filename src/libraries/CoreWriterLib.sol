@@ -27,10 +27,11 @@ library CoreWriterLib {
 
     /// @param asset       Encoded asset id (perpIndex, or 10_000 + spotIndex).
     /// @param isBuy       True = buy / long, false = sell / short.
-    /// @param limitPx     Limit price as the integer used by HL (px*10^(8-szDecimals) for perps).
-    /// @param sz          Size in lots (sz*10^szDecimals).
+    /// @param limitPx     Limit price as round(human_px * 10^8) — uniform HL CoreWriter
+    ///                    scale, NOT szDecimals-based (a wrong-scale px is silently dropped).
+    /// @param sz          Size as round(human_sz * 10^8) — same uniform 10^8 scale.
     /// @param reduceOnly  If true, order can only reduce an existing position.
-    /// @param tif         Constants.TIF_* (ALO / GTC / IOC / FOK).
+    /// @param tif         Constants.TIF_* (ALO=1 / GTC=2 / IOC=3, per HL CoreWriter spec).
     /// @param cloid       Client order id (uint128). 0 = no cloid.
     function placeLimitOrder(
         uint32 asset,
