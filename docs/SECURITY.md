@@ -45,7 +45,7 @@ These are real bugs / footguns surfaced by running the vault end-to-end on Hyper
 
 ## Known limitations & audit focus
 
-- **Leverage cap is best-effort, not strict.** It checks the incremental notional of a new order plus current open-position notional (read from precompiles). It does not account for HL's own margin requirements per-asset, cross-margin offsets, or resting orders not yet filled. An operator can split orders to circumvent. Treat as a guideline, not a hard guarantee. Pair with off-chain monitoring.
+- **Leverage cap is best-effort, not strict.** It checks the incremental notional of a new order plus current open-position notional (read from precompiles). It does not account for HL's own margin requirements per-asset, cross-margin offsets, or resting orders not yet filled. An operator can split orders to circumvent. Treat as a guideline, not a hard guarantee. Pair with off-chain monitoring. The open-position notional is summed with the **lenient** `position` precompile wrapper by design — a strict read would revert trades whenever any whitelisted perp is flat (HyperCore returns empty for no-position accounts). The residual asymmetry vs the strict `markPx` read (a `position`-precompile failure for a *held* position would under-count it; ultrareview **bug_007**) is not operator-triggerable and is covered by the same off-chain monitoring; revisit with a strict `position` read only if HyperCore is confirmed to return a populated (non-empty) zero-struct for no-position accounts.
 
 - **Slippage band uses `oraclePrice` precompile.** HL's oracle is a median across multiple venues and is robust to single-venue manipulation. Still, if HL's oracle infra is degraded, the band can pass a bad order.
 

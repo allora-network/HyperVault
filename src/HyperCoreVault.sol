@@ -877,6 +877,16 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         uint256[] memory perps = _whitelistedPerps.values();
         for (uint256 i; i < perps.length; ++i) {
             uint32 a = uint32(perps[i]);
+            // Ultrareview bug_007: `position` is read leniently ON PURPOSE. This
+            // loop spans ALL whitelisted perps, and HyperCore reverts / returns
+            // empty for a perp the vault holds no position in — a strict read
+            // would then revert EVERY trade whenever any whitelisted perp is flat.
+            // Residual: a POSITION-precompile failure for a HELD position would
+            // under-count its notional (cap under-enforced), but that is not
+            // operator-triggerable and the cap is documented best-effort with
+            // off-chain monitoring (docs/SECURITY.md). Switch to a strict read
+            // only if HyperCore is confirmed to return a populated (non-empty)
+            // zero-struct for no-position accounts.
             int64 szi = PrecompileLib.position(address(this), a).szi;
             if (szi == 0) continue;
             uint64 markPx = PrecompileLib.markPxStrict(a);
