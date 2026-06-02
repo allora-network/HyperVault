@@ -469,11 +469,133 @@ def step_redeem(ctx: Ctx) -> bool:
 
 
 # -----------------------------------------------------------------------------
+# Withdrawal-queue / redemption-loop steps (live confirmation of the fork findings)
+#
+# These exercise the bespoke escrow queue on a REAL deployed vault and confirm the
+# residuals the fork suite cannot reach (NAV > idle, real Core repatriation). Run them
+# as an explicit sequence, e.g.:
+#   --steps deposit,push,spot_to_perp,request_withdraw,fulfill_withdraw,operator_repatriate,fulfill_withdraw,cancel_withdraw
+# The middle fulfill_withdraw is expected to be a NO-OP (Finding E) while capital is on
+# Core; the one after operator_repatriate is where the LP actually gets paid — IF the
+# asset's Core bridge is usable (see Finding G / operator_repatriate).
+# -----------------------------------------------------------------------------
+
+
+def step_request_withdraw(ctx: Ctx) -> bool:
+    ctx.console.rule("[bold]request withdrawal (escrow shares)")
+    shares = ctx.vault.functions.balanceOf(ctx.alice.address).call()
+    if shares == 0:
+        ctx.console.print("[yellow]alice has no shares to request[/yellow]")
+        return True
+    receipt = send_tx(ctx, ctx.alice, ctx.vault.functions.requestWithdraw(shares), gas=300_000)
+    parse_event(ctx, receipt, "WithdrawalRequested")
+    pending = ctx.vault.functions.pendingWithdrawalShares(ctx.alice.address).call()
+    free = ctx.vault.functions.balanceOf(ctx.alice.address).call()
+    ctx.console.print(f"escrowed {pending} shares; alice free balance now {free}")
+    ok = pending == shares and free == 0
+    if not ok:
+        ctx.failures.append("requestWithdraw did not escrow shares correctly")
+    return ok
+
+
+def step_fulfill_withdraw(ctx: Ctx) -> bool:
+    ctx.console.rule("[bold]fulfill withdrawal (keeper; pays from idle ONLY)")
+    pending = ctx.vault.functions.pendingWithdrawalShares(ctx.alice.address).call()
+    if pending == 0:
+        ctx.console.print("[yellow]no pending withdrawal[/yellow]")
+        return True
+    idle = ctx.vault.functions.idleUsdc().call()
+    usdc_before = ctx.usdc.functions.balanceOf(ctx.alice.address).call()
+    ctx.console.print(f"vault idle USDC: {idle/1e6:.6f}  (fulfill can only pay from this)")
+    # Anyone may call (permissionless); the operator acts as the keeper here.
+    receipt = send_tx(ctx, ctx.operator, ctx.vault.functions.fulfillWithdraw(ctx.alice.address), gas=400_000)
+    parse_event(ctx, receipt, "WithdrawalFulfilled")
+    paid = (ctx.usdc.functions.balanceOf(ctx.alice.address).call() - usdc_before) / 1e6
+    pending_after = ctx.vault.functions.pendingWithdrawalShares(ctx.alice.address).call()
+    ctx.console.print(f"alice paid {paid:.6f} USDC; pending {pending} → {pending_after}")
+    if idle == 0 and paid == 0:
+        ctx.console.print("[cyan]no-op as expected — value is off idle (Finding E)[/cyan]")
+    return True  # a no-op with idle==0 is a legitimate, expected outcome
+
+
+def step_cancel_withdraw(ctx: Ctx) -> bool:
+    ctx.console.rule("[bold]cancel withdrawal (return escrowed shares)")
+    pending = ctx.vault.functions.pendingWithdrawalShares(ctx.alice.address).call()
+    if pending == 0:
+        ctx.console.print("[yellow]no pending withdrawal to cancel[/yellow]")
+        return True
+    free_before = ctx.vault.functions.balanceOf(ctx.alice.address).call()
+    send_tx(ctx, ctx.alice, ctx.vault.functions.cancelWithdrawRequest(), gas=300_000)
+    free_after = ctx.vault.functions.balanceOf(ctx.alice.address).call()
+    pending_after = ctx.vault.functions.pendingWithdrawalShares(ctx.alice.address).call()
+    ctx.console.print(f"alice free shares: {free_before} → {free_after}; pending now {pending_after}")
+    ok = free_after == free_before + pending and pending_after == 0
+    if not ok:
+        ctx.failures.append("cancelWithdrawRequest did not return escrowed shares")
+    return ok
+
+
+def step_operator_repatriate(ctx: Ctx) -> bool:
+    ctx.console.rule("[bold]operator repatriate (perp → spot → EVM idle)")
+    amount = int(usdc_units(ctx.deposit_usdc) * 0.5)
+    try:
+        send_tx(ctx, ctx.operator, ctx.vault.functions.usdPerpToSpot(amount))
+    except Exception as e:
+        ctx.console.print(f"[yellow]usdPerpToSpot reverted/failed: {e}[/yellow]")
+    spot_core_wei = int(hl.spot_balance(ctx.info, ctx.vault_addr, 0) * 1e8)
+    if spot_core_wei == 0:
+        ctx.console.print("[yellow]no Core spot to pull[/yellow]")
+        return True
+    idle_before = ctx.usdc.functions.balanceOf(ctx.vault_addr).call()
+    try:
+        send_tx(ctx, ctx.operator, ctx.vault.functions.pullFromCore(spot_core_wei))
+    except Exception as e:
+        # Finding G: for an asset whose Core bridge address (0x2000..0000) is blacklisted
+        # (the shipped 0xb883..630f USDC), pullFromCore REVERTS — repatriation via the
+        # canonical bridge is impossible, so the queue can never be funded from Core.
+        ctx.console.print(f"[red]pullFromCore reverted — Finding G (bridge unusable for this asset): {e}[/red]")
+        ctx.failures.append(f"repatriate: pullFromCore reverted (Finding G): {e}")
+        return False
+    ok = wait_for(lambda: ctx.usdc.functions.balanceOf(ctx.vault_addr).call() > idle_before,
+                  timeout_s=30, label="bridge credit to vault idle")
+    idle_after = ctx.usdc.functions.balanceOf(ctx.vault_addr).call()
+    ctx.console.print(f"vault idle USDC: {idle_before/1e6:.6f} → {idle_after/1e6:.6f}")
+    if not ok:
+        ctx.failures.append("repatriate: bridge did not credit idle (Finding G)")
+    return ok
+
+
+def step_pause_freeze_check(ctx: Ctx) -> bool:
+    ctx.console.rule("[bold]pause-freeze check (Finding A: paused vault cannot repatriate)")
+    # Needs the caller to hold EMERGENCY_ROLE (the shipped single-key config has operator
+    # == emergencyAdmin). Pause, attempt pullFromCore (expect revert), then unpause.
+    try:
+        send_tx(ctx, ctx.operator, ctx.vault.functions.pause())
+    except Exception as e:
+        ctx.console.print(f"[yellow]pause failed (operator lacks EMERGENCY_ROLE?): {e}[/yellow]")
+        return True
+    reverted = False
+    try:
+        send_tx(ctx, ctx.operator, ctx.vault.functions.pullFromCore(1))
+    except Exception:
+        reverted = True
+    send_tx(ctx, ctx.operator, ctx.vault.functions.unpause())
+    ctx.console.print(f"pullFromCore while paused reverted: {reverted}")
+    if not reverted:
+        ctx.failures.append("pause-freeze: pullFromCore did NOT revert while paused")
+    return reverted
+
+
+# -----------------------------------------------------------------------------
 # Orchestration
 # -----------------------------------------------------------------------------
 
 ALL_STEPS = ["preflight", "deposit", "core_status", "push", "spot_to_perp",
              "place", "cancel", "fill", "perp_to_spot", "pull", "redeem"]
+
+# Redemption-loop steps — selected explicitly via --steps (not part of the default run).
+QUEUE_STEPS = ["request_withdraw", "fulfill_withdraw", "operator_repatriate",
+               "cancel_withdraw", "pause_freeze_check"]
 
 # Steps that require a real EVM-side USDC ↔ Core bridge. Skipped automatically
 # when the asset has no linked bridge (testnet MockUSDC case).
@@ -491,7 +613,9 @@ def main() -> int:
     parser.add_argument("--asset", type=int, default=0, help="perp asset id (default BTC=0)")
     parser.add_argument("--network", default="mainnet", choices=["mainnet", "testnet"])
     parser.add_argument("--steps", default=",".join(ALL_STEPS),
-                        help="comma-separated step names or 'all'")
+                        help="comma-separated step names or 'all' (lifecycle steps; plus "
+                             "redemption-queue steps: request_withdraw, fulfill_withdraw, "
+                             "operator_repatriate, cancel_withdraw, pause_freeze_check)")
     parser.add_argument("--skip-bridge", action="store_true",
                         help="omit push/pull steps (use for testnet MockUSDC)")
     args = parser.parse_args()
@@ -539,6 +663,16 @@ def main() -> int:
                 step_pull(ctx)
             elif step == "redeem":
                 step_redeem(ctx)
+            elif step == "request_withdraw":
+                step_request_withdraw(ctx)
+            elif step == "fulfill_withdraw":
+                step_fulfill_withdraw(ctx)
+            elif step == "operator_repatriate":
+                step_operator_repatriate(ctx)
+            elif step == "cancel_withdraw":
+                step_cancel_withdraw(ctx)
+            elif step == "pause_freeze_check":
+                step_pause_freeze_check(ctx)
             else:
                 ctx.console.print(f"[yellow]unknown step: {step}[/yellow]")
         except Exception as e:
