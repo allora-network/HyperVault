@@ -25,6 +25,9 @@ interface IHyperCoreVault is IERC4626 {
     error StrandedSweepRequiresZeroSupply();
     /// @notice `operatorRecoverSpot` destination is not on the admin allowlist (audit C-2).
     error SpotRecoverDestinationNotAllowed(address dest);
+    /// @notice Configured Core-USDC decimals disagree with the live `tokenInfo`
+    ///         precompile at deploy (audit C1/M5) — NAV would be off by 10^|Δ|.
+    error CoreUsdcDecimalsMismatch(uint8 configured, uint8 fromPrecompile);
 
     // -------------------------------------------------------------------------
     // CoreWriter submission events — these mirror what the legacy SDK response
@@ -87,6 +90,12 @@ interface IHyperCoreVault is IERC4626 {
     event StrictNavReadsUpdated(bool enabled);
     /// @notice Admin set the spot slippage band for `asset` (audit H-3).
     event SpotSlippageBandUpdated(uint32 indexed asset, uint16 bps);
+    /// @notice Emitted at deploy when the Core-USDC token's linked EVM contract
+    ///         (`tokenInfo(coreUsdcIndex).evmContract`) is NOT the vault's
+    ///         `asset()` (audit C1). Not fatal — the deliberate Path-B posture
+    ///         keeps the unlinked Circle USDC as the share asset — but the
+    ///         mismatch is surfaced on-chain rather than silently trusted.
+    event CoreLinkUnverified(address indexed asset, address indexed coreEvmContract);
 
     // -------------------------------------------------------------------------
     // Operator surface
@@ -150,6 +159,10 @@ interface IHyperCoreVault is IERC4626 {
 
     function nav() external view returns (uint256);
     function pricePerShare() external view returns (uint256);
+    /// @notice Core spot token index treated as USDC for NAV (audit C1).
+    function coreUsdcIndex() external view returns (uint64);
+    /// @notice Core wei decimals for {coreUsdcIndex}, validated at deploy (audit C1/M5).
+    function coreUsdcDecimals() external view returns (uint8);
     function idleUsdc() external view returns (uint256);
     function coreSpotUsdc() external view returns (uint256);
     function perpWithdrawable() external view returns (uint256);

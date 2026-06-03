@@ -40,6 +40,8 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
 
     struct Config {
         IERC20 asset;            // USDC ERC20 on HyperEVM
+        uint64 coreUsdcIndex;    // Core spot token index for USDC (canonical mainnet = 0)
+        uint8 coreUsdcDecimals;  // Core wei decimals for that token (validated vs live tokenInfo at deploy)
         string name;
         string symbol;
         address admin;           // DEFAULT_ADMIN_ROLE — should be a TimelockController
@@ -55,6 +57,19 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     }
 
     address public immutable feeRecipient;
+
+    /// @notice Core spot token index this vault treats as its USDC for NAV
+    ///         (`coreSpotUsdc`) and bridge/recover calls. Configured per-deployment
+    ///         and validated against the live `tokenInfo` precompile in the
+    ///         constructor (audit C1 / M5). Canonical mainnet value is 0.
+    uint64 public immutable coreUsdcIndex;
+
+    /// @notice Core wei decimals for {coreUsdcIndex}. Used to normalize the Core
+    ///         spot balance into the 6dp EVM-USDC scale in {_coreToEvm}. Asserted
+    ///         to equal `tokenInfo(coreUsdcIndex).weiDecimals` at deploy when the
+    ///         precompile resolves — a wrong value would put NAV off by 10^|Δ|
+    ///         (audit M5).
+    uint8 public immutable coreUsdcDecimals;
 
     // -------------------------------------------------------------------------
     // Mutable config (admin / timelock)
@@ -135,6 +150,28 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         }
 
         feeRecipient         = cfg.feeRecipient;
+        coreUsdcIndex        = cfg.coreUsdcIndex;
+        coreUsdcDecimals     = cfg.coreUsdcDecimals;
+        // Audit C1/M5: validate the Core-USDC linkage against the live precompile.
+        // When the `tokenInfo` row resolves (mainnet), the configured Core decimals
+        // MUST match `weiDecimals` (a mismatch silently mis-scales NAV by 10^|Δ|),
+        // and a Core `evmContract` that differs from `asset()` is surfaced on-chain
+        // via {CoreLinkUnverified} rather than silently trusted — the deliberate
+        // Path-B posture (Circle USDC stays the share asset; Core balance is
+        // operator-recoverable NAV). When the precompile is empty (a fresh Core
+        // account, or a revm fork), validation is skipped so deploys still work.
+        {
+            PrecompileLib.TokenInfo memory ti = PrecompileLib.tokenInfo(uint32(cfg.coreUsdcIndex));
+            bool resolved = ti.weiDecimals != 0 || ti.evmContract != address(0) || bytes(ti.name).length != 0;
+            if (resolved) {
+                if (ti.weiDecimals != cfg.coreUsdcDecimals) {
+                    revert CoreUsdcDecimalsMismatch(cfg.coreUsdcDecimals, ti.weiDecimals);
+                }
+                if (ti.evmContract != address(cfg.asset)) {
+                    emit CoreLinkUnverified(address(cfg.asset), ti.evmContract);
+                }
+            }
+        }
         leverageCapBps       = cfg.leverageCapBps;
         slippageBandBps      = cfg.slippageBandBps;
         mgmtFeeAnnualBps     = cfg.mgmtFeeAnnualBps;
@@ -348,12 +385,20 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         return IERC20(asset()).balanceOf(address(this));
     }
 
+    /// @notice The vault's Core spot USDC balance, normalized to the 6dp EVM-USDC
+    ///         scale. Counts as **operator-recoverable NAV**: with the configured
+    ///         Circle USDC unlinked from Core (audit C1, see {CoreLinkUnverified}
+    ///         and docs/SECURITY.md), this value is realized to idle EVM USDC via
+    ///         the Path-B route `operatorRecoverSpot → treasury → re-deposit`, not
+    ///         the (blacklisted) canonical bridge. Including it in NAV therefore
+    ///         carries an explicit ~1:1 cross-token assumption and operator-trust;
+    ///         the keeper automation of Path B is tracked as TODO-4 (out of scope).
     function coreSpotUsdc() public view returns (uint256) {
         // Audit H-1: when strictNavReads is enabled, surface precompile
         // failures instead of silently returning zero.
         uint64 totalCore = strictNavReads
-            ? PrecompileLib.spotBalanceStrict(address(this), Constants.USDC_CORE_INDEX).total
-            : PrecompileLib.spotBalance(address(this), Constants.USDC_CORE_INDEX).total;
+            ? PrecompileLib.spotBalanceStrict(address(this), coreUsdcIndex).total
+            : PrecompileLib.spotBalance(address(this), coreUsdcIndex).total;
         return _coreToEvm(totalCore);
     }
 
@@ -492,7 +537,7 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
 
     function pullFromCore(uint64 amountWei) external onlyRole(OPERATOR_ROLE) whenNotPaused nonReentrant {
         // spot_send to USDC system address — system tx then transfers ERC20 back to this vault
-        CoreWriterLib.spotSend(SystemAddress.usdc(), Constants.USDC_CORE_INDEX, amountWei);
+        CoreWriterLib.spotSend(SystemAddress.usdc(), coreUsdcIndex, amountWei);
         emit BridgeWithdraw(amountWei);
     }
 
@@ -907,14 +952,17 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     // Internal — decimal normalization for USDC
     // -------------------------------------------------------------------------
 
-    function _coreToEvm(uint64 coreWei) internal pure returns (uint256) {
+    /// @dev Normalizes a Core-wei USDC amount (in {coreUsdcDecimals}) to the 6dp
+    ///      EVM-USDC scale. `view` (not `pure`) because the Core decimals are an
+    ///      immutable read rather than a compile-time constant (audit C1/M5).
+    function _coreToEvm(uint64 coreWei) internal view returns (uint256) {
         uint256 cwei = uint256(coreWei);
-        if (Constants.USDC_CORE_DECIMALS >= Constants.USDC_EVM_DECIMALS) {
+        if (coreUsdcDecimals >= Constants.USDC_EVM_DECIMALS) {
             // Core has more decimals → divide
-            return cwei / (10 ** (Constants.USDC_CORE_DECIMALS - Constants.USDC_EVM_DECIMALS));
+            return cwei / (10 ** (coreUsdcDecimals - Constants.USDC_EVM_DECIMALS));
         } else {
             // EVM has more decimals → multiply
-            return cwei * (10 ** (Constants.USDC_EVM_DECIMALS - Constants.USDC_CORE_DECIMALS));
+            return cwei * (10 ** (Constants.USDC_EVM_DECIMALS - coreUsdcDecimals));
         }
     }
 

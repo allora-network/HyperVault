@@ -66,6 +66,8 @@ contract RemediationUltrareviewTest is Test {
         vault = new HyperCoreVault(
             HyperCoreVault.Config({
                 asset: IERC20(address(usdc)),
+                coreUsdcIndex: 0,
+                coreUsdcDecimals: 8,
                 name: "Test Vault",
                 symbol: "tVLT",
                 admin: admin,

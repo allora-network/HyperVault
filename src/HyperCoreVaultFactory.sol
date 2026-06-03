@@ -8,7 +8,6 @@ import {TimelockController} from "@openzeppelin/contracts/governance/TimelockCon
 import {HyperCoreVault} from "./HyperCoreVault.sol";
 import {HyperCoreVaultRegistry} from "./HyperCoreVaultRegistry.sol";
 import {PrecompileLib} from "./libraries/PrecompileLib.sol";
-import {Constants} from "./libraries/Constants.sol";
 
 /// @notice CREATE2 factory for HyperCoreVault. One factory per chain.
 contract HyperCoreVaultFactory is Ownable {
@@ -16,13 +15,20 @@ contract HyperCoreVaultFactory is Ownable {
 
     HyperCoreVaultRegistry public immutable registry;
 
-    /// @notice If true, factory validates `tokenInfo(USDC).evmContract` against the
-    ///         supplied asset address. Disabled by default for tests / chains
-    ///         where the precompile isn't populated; flip on once mainnet
-    ///         tokenInfo is confirmed wired up.
+    /// @notice If true, factory validates the configured Core-USDC linkage against
+    ///         the live `tokenInfo` precompile at deploy. Disabled by default for
+    ///         tests / chains where the precompile isn't populated; flip on once
+    ///         mainnet tokenInfo is confirmed wired up.
+    /// @dev    Audit C1/M5: validates `tokenInfo(cfg.coreUsdcIndex).weiDecimals`
+    ///         equals `cfg.coreUsdcDecimals` (a mismatch mis-scales NAV by 10^|Δ|).
+    ///         A Core `evmContract` differing from the asset is NOT fatal — Path B
+    ///         keeps the unlinked Circle USDC as the share asset; the vault
+    ///         constructor surfaces the mismatch via `CoreLinkUnverified`.
     bool public strictAssetValidation;
 
-    error AssetMismatch(address configured, address fromPrecompile);
+    /// @notice Configured Core-USDC decimals disagree with the live `tokenInfo`
+    ///         precompile (audit C1/M5).
+    error CoreUsdcDecimalsMismatch(uint8 configured, uint8 fromPrecompile);
     error ZeroAddress();
 
     event StrictAssetValidationUpdated(bool enabled);
@@ -63,9 +69,13 @@ contract HyperCoreVaultFactory is Ownable {
         if (address(cfg.asset) == address(0)) revert ZeroAddress();
 
         if (strictAssetValidation) {
-            address fromPrecompile = PrecompileLib.tokenInfo(uint32(Constants.USDC_CORE_INDEX)).evmContract;
-            if (fromPrecompile != address(0) && fromPrecompile != address(cfg.asset)) {
-                revert AssetMismatch(address(cfg.asset), fromPrecompile);
+            PrecompileLib.TokenInfo memory ti = PrecompileLib.tokenInfo(uint32(cfg.coreUsdcIndex));
+            bool resolved = ti.weiDecimals != 0 || ti.evmContract != address(0) || bytes(ti.name).length != 0;
+            // Audit C1/M5: enforce the decimals invariant (NAV scale); the link
+            // mismatch is non-fatal under Path B and is surfaced by the vault's
+            // CoreLinkUnverified event rather than reverting here.
+            if (resolved && ti.weiDecimals != cfg.coreUsdcDecimals) {
+                revert CoreUsdcDecimalsMismatch(cfg.coreUsdcDecimals, ti.weiDecimals);
             }
         }
 

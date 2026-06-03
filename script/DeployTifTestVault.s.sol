@@ -19,6 +19,8 @@ contract DeployTifTestVault is Script {
 
         HyperCoreVault.Config memory cfg = HyperCoreVault.Config({
             asset: IERC20(usdc),
+            coreUsdcIndex: 0,
+            coreUsdcDecimals: 8,
             name: "TIF Scale Test",
             symbol: "tifscale",
             admin: op,

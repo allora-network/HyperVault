@@ -119,6 +119,8 @@ abstract contract HyperVaultBaseForkTest is Test {
     function _deployVault(uint16 mgmtBps, uint16 perfBps) internal returns (HyperCoreVault v) {
         HyperCoreVault.Config memory cfg = HyperCoreVault.Config({
             asset: IERC20(USDC),
+            coreUsdcIndex: 0,
+            coreUsdcDecimals: 8,
             name: "Fork Proof Vault",
             symbol: "fpv",
             admin: address(this),
