@@ -14,7 +14,6 @@ cbor_metadata = false
 fs_permissions = [
     { access = "read", path = "./deployments/configs" },
     { access = "read-write", path = "./deployments/mainnet" },
-    { access = "read-write", path = "./deployments/testnet" },
     { access = "read-write", path = "./deployments/local" },
     { access = "read", path = "./out" },
 ]
@@ -37,7 +36,6 @@ int_types = "long"
 
 [rpc_endpoints]
 hyperevm_mainnet = "${HYPEREVM_RPC_MAINNET}"
-hyperevm_testnet = "${HYPEREVM_RPC_TESTNET}"
 
 [etherscan]
 hyperevm_mainnet = { key = "${HYPEREVM_EXPLORER_KEY}", url = "${HYPEREVM_EXPLORER_URL}" }

@@ -41,10 +41,10 @@ vault = w3.eth.contract(address=VAULT_ADDRESS, abi=VAULT_ABI)
 tx = vault.functions.placeLimitOrder(
     asset=0,                # BTC perp index
     isBuy=True,
-    limitPx=50_000_00000000, # encoded price (px * 10^(8-szDecimals))
-    sz=100,                  # encoded size (sz * 10^szDecimals)
+    limitPx=5_000_000_000_000, # encoded price = round(human_px * 10^8); 50000.0 -> 5e12
+    sz=20_000,                 # encoded size  = round(human_sz * 10^8); 0.0002 BTC -> 20000
     reduceOnly=False,
-    tif=1                    # GTC
+    tif=2                    # GTC  (TIF: 1=ALO post-only, 2=GTC, 3=IOC)
 ).build_transaction({
     "from": operator_addr,
     "nonce": w3.eth.get_transaction_count(operator_addr),
@@ -52,6 +52,10 @@ tx = vault.functions.placeLimitOrder(
 signed = operator_acct.sign_transaction(tx)
 receipt = w3.eth.wait_for_transaction_receipt(w3.eth.send_raw_transaction(signed.rawTransaction))
 ```
+
+> **Price/size encoding (critical).** `limitPx` and `sz` are each `round(human × 10^8)` — a **uniform 10^8 scale, NOT szDecimals-based**. (HL docs: "limitPx and sz should be sent as 10^8 * the human readable value"; verified on mainnet — an order encoded as `human × 10^(8−szDecimals)` is **silently dropped** by HyperCore, a `10^8` order rests.) Use `hl_helpers.PerpAssetMeta.encode_px/encode_sz`, and respect HL's rules on the *human* values: perp price ≤5 significant figures and ≤(6−szDecimals) decimals; size ≤szDecimals decimals; order notional ≥ $10.
+
+> **TIF encoding (critical).** `tif` is the raw HyperCore value and is **1-indexed**: `1 = ALO` (post-only), `2 = GTC`, `3 = IOC`. There is no FOK. A `tif` of `0` is invalid — HyperCore silently drops the action (the EVM tx still succeeds and the event still fires, but no order rests). Prefer the on-chain `Constants.TIF_*` names; if passing raw integers, use 1/2/3.
 
 The transaction emits `LimitOrderSubmitted(asset, isBuy, limitPx, sz, reduceOnly, tif, cloid, navSnapshot)`. The `cloid` is auto-assigned by the vault (monotonic counter). Capture it from the event log and use for subsequent `cancelOrderByCloid`.
 

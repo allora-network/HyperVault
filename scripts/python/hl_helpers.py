@@ -30,27 +30,37 @@ class PerpAssetMeta:
     max_leverage: int
 
     def encode_px(self, human_price: float) -> int:
-        """HL convention: encoded_px = floor(human_price * 10^(8 - szDecimals))."""
-        return int(human_price * (10 ** (8 - self.sz_decimals)))
+        """HL CoreWriter convention: encoded_px = round(human_price * 10^8).
+
+        The 10^8 multiplier is UNIFORM for both px and sz and does NOT depend on
+        szDecimals. Verified on HyperEVM mainnet: a px encoded as
+        human*10^(8-szDecimals) is silently dropped by HyperCore; human*10^8
+        rests correctly. (HL docs: "limitPx and sz should be sent as 10^8 * the
+        human readable value"; SDK: float_to_int_for_hashing = round(x*10^8).)"""
+        return int(round(human_price * 10 ** 8))
 
     def decode_px(self, encoded_px: int) -> float:
-        return encoded_px / (10 ** (8 - self.sz_decimals))
+        return encoded_px / 10 ** 8
 
     def encode_sz(self, human_size: float) -> int:
-        return int(human_size * (10 ** self.sz_decimals))
+        """HL CoreWriter convention: encoded_sz = round(human_size * 10^8)."""
+        return int(round(human_size * 10 ** 8))
 
     def round_to_tick(self, human_price: float, sig_figs: int = 5) -> float:
-        """HL requires <=5 sig figs and increments of 10^(8 - szDecimals) raw.
-        We round to 5 sig figs and to the nearest raw tick, returning the
-        human-readable value."""
+        """Round a human perp price to HL's validity rules, returning the human
+        value (encode_px then multiplies by 10^8):
+          - at most 5 significant figures, AND
+          - at most (6 - szDecimals) decimal places for perps.
+        """
         if human_price == 0:
             return 0.0
         # Round to sig_figs significant figures
         d = math.floor(math.log10(abs(human_price)))
         factor = 10 ** (sig_figs - 1 - d)
         rounded = round(human_price * factor) / factor
-        # Round to nearest raw tick
-        tick = 1 / (10 ** (8 - self.sz_decimals))
+        # Enforce the perp decimal-place limit: multiples of 10^-(6 - szDecimals).
+        decimals = max(0, 6 - self.sz_decimals)
+        tick = 1 / (10 ** decimals)
         return round(rounded / tick) * tick
 
 
@@ -95,6 +105,20 @@ def find_resting_by_cloid(info: Info, address: str, cloid: int) -> Optional[dict
 def user_state(info: Info, address: str) -> dict:
     """Perp account state: positions, marginSummary, withdrawable."""
     return info.user_state(address)
+
+
+def user_fills(info: Info, address: str) -> list[dict]:
+    """Recent fills for an account — used to confirm a taker order actually filled."""
+    return info.user_fills(address)
+
+
+def perp_position_szi(info: Info, address: str, coin: str) -> float:
+    """Signed perp position size (human units) for `coin`, or 0 if flat."""
+    for p in info.user_state(address).get("assetPositions", []):
+        pos = p.get("position", {})
+        if pos.get("coin") == coin:
+            return float(pos.get("szi", 0) or 0)
+    return 0.0
 
 
 def spot_user_state(info: Info, address: str) -> dict:

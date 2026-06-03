@@ -15,6 +15,18 @@ import {Constants} from "./Constants.sol";
 ///         a single place. All values are unscaled — callers normalize.
 library PrecompileLib {
     // -------------------------------------------------------------------------
+    // Errors (strict variants)
+    // -------------------------------------------------------------------------
+
+    /// @notice Strict read failed: precompile reverted or returned empty data.
+    /// @dev    Used by `*Strict` variants. Lenient `_read` swallows this case.
+    error PrecompileRevert(address precompile);
+
+    /// @notice Strict read returned a zero where zero is not a valid value
+    ///         (e.g. oracle / mark / spot price of a live market must be > 0).
+    error PrecompileZero(address precompile);
+
+    // -------------------------------------------------------------------------
     // Structs
     // -------------------------------------------------------------------------
 
@@ -88,6 +100,17 @@ library PrecompileLib {
         if (ok && ret.length == 0) ok = false;
     }
 
+    /// @dev Strict variant: reverts with `PrecompileRevert` on staticcall failure
+    ///      or empty return. Used by `*Strict` wrappers where silent fallback
+    ///      to zero would be a security issue (NAV reads, trade-gate oracle
+    ///      reads). Callers further reject zero with `PrecompileZero` when
+    ///      zero is not a valid value (e.g. live market prices).
+    function _readStrict(address precompile, bytes memory input) private view returns (bytes memory ret) {
+        bool ok;
+        (ok, ret) = precompile.staticcall(input);
+        if (!ok || ret.length == 0) revert PrecompileRevert(precompile);
+    }
+
     // -------------------------------------------------------------------------
     // NAV-critical reads
     // -------------------------------------------------------------------------
@@ -102,6 +125,18 @@ library PrecompileLib {
         if (ok) bal = abi.decode(ret, (SpotBalance));
     }
 
+    /// @notice Strict variant of {spotBalance}: reverts if the precompile
+    ///         reverts or returns empty data. Use after the vault's Core account
+    ///         has been initialised (any cross-chain action), at which point
+    ///         a revert indicates a system failure rather than "no row yet."
+    function spotBalanceStrict(address user, uint64 tokenIndex) internal view returns (SpotBalance memory bal) {
+        bytes memory ret = _readStrict(
+            Constants.SPOT_BALANCE_PRECOMPILE,
+            abi.encode(user, tokenIndex)
+        );
+        bal = abi.decode(ret, (SpotBalance));
+    }
+
     /// @notice Perp account "withdrawable" equity in 6dp USD. This is HL's own
     ///         conservative redeemable-margin figure and is the right number to
     ///         use in NAV — `accountMarginSummary.accountValue` includes
@@ -109,6 +144,12 @@ library PrecompileLib {
     function withdrawable(address user) internal view returns (Withdrawable memory w) {
         (bool ok, bytes memory ret) = _read(Constants.WITHDRAWABLE_PRECOMPILE, abi.encode(user));
         if (ok) w = abi.decode(ret, (Withdrawable));
+    }
+
+    /// @notice Strict variant of {withdrawable}. See {spotBalanceStrict}.
+    function withdrawableStrict(address user) internal view returns (Withdrawable memory w) {
+        bytes memory ret = _readStrict(Constants.WITHDRAWABLE_PRECOMPILE, abi.encode(user));
+        w = abi.decode(ret, (Withdrawable));
     }
 
     /// @notice Single position. Used by the leverage-cap pre-check.
@@ -136,16 +177,39 @@ library PrecompileLib {
         if (ok) px = abi.decode(ret, (uint64));
     }
 
+    /// @notice Strict variant of {oraclePx}: reverts on precompile failure
+    ///         AND on a zero return. Use in trade gates — a zero oracle is
+    ///         not a legitimate value for any live market.
+    function oraclePxStrict(uint32 perpIndex) internal view returns (uint64 px) {
+        bytes memory ret = _readStrict(Constants.ORACLE_PX_PRECOMPILE, abi.encode(perpIndex));
+        px = abi.decode(ret, (uint64));
+        if (px == 0) revert PrecompileZero(Constants.ORACLE_PX_PRECOMPILE);
+    }
+
     /// @notice Mark price (closer to mid). Useful for emergency-close pricing.
     function markPx(uint32 perpIndex) internal view returns (uint64 px) {
         (bool ok, bytes memory ret) = _read(Constants.MARK_PX_PRECOMPILE, abi.encode(perpIndex));
         if (ok) px = abi.decode(ret, (uint64));
     }
 
+    /// @notice Strict variant of {markPx}. See {oraclePxStrict}.
+    function markPxStrict(uint32 perpIndex) internal view returns (uint64 px) {
+        bytes memory ret = _readStrict(Constants.MARK_PX_PRECOMPILE, abi.encode(perpIndex));
+        px = abi.decode(ret, (uint64));
+        if (px == 0) revert PrecompileZero(Constants.MARK_PX_PRECOMPILE);
+    }
+
     /// @notice Spot mid price for spot index `spotIndex`.
     function spotPx(uint32 spotIndex) internal view returns (uint64 px) {
         (bool ok, bytes memory ret) = _read(Constants.SPOT_PX_PRECOMPILE, abi.encode(spotIndex));
         if (ok) px = abi.decode(ret, (uint64));
+    }
+
+    /// @notice Strict variant of {spotPx}. See {oraclePxStrict}.
+    function spotPxStrict(uint32 spotIndex) internal view returns (uint64 px) {
+        bytes memory ret = _readStrict(Constants.SPOT_PX_PRECOMPILE, abi.encode(spotIndex));
+        px = abi.decode(ret, (uint64));
+        if (px == 0) revert PrecompileZero(Constants.SPOT_PX_PRECOMPILE);
     }
 
     /// @notice Best bid / offer.
@@ -161,6 +225,16 @@ library PrecompileLib {
     function perpAssetInfo(uint32 perpIndex) internal view returns (PerpAssetInfo memory info) {
         (bool ok, bytes memory ret) = _read(Constants.PERP_ASSET_INFO_PRECOMPILE, abi.encode(perpIndex));
         if (ok) info = abi.decode(ret, (PerpAssetInfo));
+    }
+
+    /// @notice Strict variant of {perpAssetInfo}: reverts on precompile failure
+    ///         or empty return. Used by the perp slippage band, which needs a
+    ///         trustworthy `szDecimals` to normalize the oracle price into the
+    ///         limit-order action's 10^8 scale (a wrong/zero szDecimals would
+    ///         silently mis-scale the band — fail closed instead, per audit H-4).
+    function perpAssetInfoStrict(uint32 perpIndex) internal view returns (PerpAssetInfo memory info) {
+        bytes memory ret = _readStrict(Constants.PERP_ASSET_INFO_PRECOMPILE, abi.encode(perpIndex));
+        info = abi.decode(ret, (PerpAssetInfo));
     }
 
     function spotInfo(uint32 spotIndex) internal view returns (SpotInfo memory info) {

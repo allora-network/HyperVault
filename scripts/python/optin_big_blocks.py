@@ -25,7 +25,7 @@ from hyperliquid.utils import constants
 def main() -> int:
     key = os.environ["OPERATOR_PRIVATE_KEY"]
     vault = os.environ["VAULT_ADDRESS"]
-    network = os.environ.get("NETWORK", "testnet")
+    network = os.environ.get("NETWORK", "mainnet")
     base = constants.TESTNET_API_URL if network == "testnet" else constants.MAINNET_API_URL
 
     account = Account.from_key(key)

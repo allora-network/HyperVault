@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Schedule + execute whitelist seeding through a TimelockController.
 
-For testnet bootstrap, the deploy script handles this automatically when
-`timelockMinDelaySec == 0`. Use this script for any later additions, or for
-production deploys after the delay window has passed.
+On deploy, the script handles this automatically when `timelockMinDelaySec == 0`.
+Use this script for any later additions, or for production deploys after the
+delay window has passed.
 
 Usage:
-    ARTIFACT=deployments/testnet/<strategy>.json \\
+    ARTIFACT=deployments/mainnet/<strategy>.json \\
     DEPLOYER_PRIVATE_KEY=0x... \\
     PERPS_TO_ADD=1,5,12 \\
     SPOTS_TO_ADD= \\
@@ -54,7 +54,7 @@ def main() -> int:
         return 2
     artifact = json.loads(Path(artifact_path).read_text())
 
-    rpc = os.environ.get("HYPEREVM_RPC_TESTNET") or os.environ.get("HYPEREVM_RPC_MAINNET")
+    rpc = os.environ["HYPEREVM_RPC_MAINNET"]
     w3 = Web3(Web3.HTTPProvider(rpc))
 
     vault_addr = Web3.to_checksum_address(artifact["vault"])

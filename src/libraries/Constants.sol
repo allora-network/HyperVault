@@ -65,13 +65,20 @@ library Constants {
     uint8 internal constant CORE_WRITER_VERSION = 1;
 
     // -------------------------------------------------------------------------
-    // TIF (time in force) enum, encoded as uint8 in limit_order payload
+    // TIF (time in force) enum, encoded as uint8 in limit_order payload.
+    //
+    // Values are fixed by the HyperCore `limit_order` action and are 1-INDEXED:
+    //   1 = Alo, 2 = Gtc, 3 = Ioc
+    // See the Hyperliquid CoreWriter docs ("Interacting with HyperCore") and the
+    // canonical hyper-evm-lib HLConstants (LIMIT_ORDER_TIF_ALO/GTC/IOC = 1/2/3).
+    // A tif byte of 0 is OUT OF RANGE: HyperCore silently drops the action
+    // (CoreWriter is fire-and-forget, so the EVM tx still succeeds but no order
+    // ever rests). There is no FOK variant in the CoreWriter limit_order encoding.
     // -------------------------------------------------------------------------
 
-    uint8 internal constant TIF_ALO = 0; // add liquidity only (post-only)
-    uint8 internal constant TIF_GTC = 1; // good till cancel
-    uint8 internal constant TIF_IOC = 2; // immediate or cancel
-    uint8 internal constant TIF_FOK = 3; // fill or kill
+    uint8 internal constant TIF_ALO = 1; // add liquidity only (post-only)
+    uint8 internal constant TIF_GTC = 2; // good till cancel
+    uint8 internal constant TIF_IOC = 3; // immediate or cancel
 
     // -------------------------------------------------------------------------
     // Asset ID encoding (CoreWriter limit_order `asset` field)
