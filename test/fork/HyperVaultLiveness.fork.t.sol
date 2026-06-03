@@ -11,6 +11,17 @@ import {IHyperCoreVault} from "../../src/interfaces/IHyperCoreVault.sol";
 import {PrecompileLib} from "../../src/libraries/PrecompileLib.sol";
 import {Constants} from "../../src/libraries/Constants.sol";
 
+/// @dev CoreWriter stub etched at the system address so the Core->EVM movers
+///      execute deterministically (we test the pause-modifier change, not
+///      CoreWriter's processing; the real CoreWriter path is the live spike's job).
+contract MockCoreWriter {
+    event RawAction(bytes data);
+
+    function sendRawAction(bytes calldata data) external {
+        emit RawAction(data);
+    }
+}
+
 /// @title  Liveness / fund-safety finding proofs (forked HyperEVM mainnet, real bytecode)
 /// @notice One test per finding from docs/REDEMPTION_ASSESSMENT.md §4. Every test runs
 ///         against the real USDC ERC20 and a freshly deployed vault — no mocks.
@@ -22,11 +33,13 @@ contract HyperVaultLivenessForkTest is HyperVaultBaseForkTest {
     //   Contract: HyperCoreVault.sol:487,493,516,544,549 (whenNotPaused) vs :558 (pause).
     //   Fork-provable: FULL (reverts fire at the modifier, before any precompile/CoreWriter).
     // ───────────────────────────────────────────────────────────────────────
-    function test_A_pauseFreezesRefillPath() public {
+    function test_A_pauseDoesNotFreezeRepatriation() public {
         _skipIfNoFork();
+        // H2: the exact movers that reverted EnforcedPause in the 2026-06-03 live
+        // spike must now SUCCEED while paused (no refill freeze). Etch a CoreWriter
+        // stub so the calls execute deterministically (modifier change is the unit).
+        vm.etch(Constants.CORE_WRITER, type(MockCoreWriter).runtimeCode);
 
-        // Allow-list a recover destination BEFORE pausing, to prove pause dominates
-        // even the otherwise-permitted operatorRecoverSpot path.
         address treasury = makeAddr("treasury");
         vault.setSpotRecoverDest(treasury, true); // admin == address(this)
 
@@ -34,38 +47,46 @@ contract HyperVaultLivenessForkTest is HyperVaultBaseForkTest {
         vault.pause();
 
         vm.startPrank(operator);
-        vm.expectRevert(Pausable.EnforcedPause.selector);
+        // Core->EVM refill movers now succeed while paused (no market risk added).
         vault.pullFromCore(1);
-        vm.expectRevert(Pausable.EnforcedPause.selector);
         vault.usdPerpToSpot(1);
+        vault.operatorRecoverSpot(treasury, 0, 1);
+        // usdSpotToPerp DEPLOYS into the market -> deliberately still blocked by pause.
         vm.expectRevert(Pausable.EnforcedPause.selector);
         vault.usdSpotToPerp(1);
-        vm.expectRevert(Pausable.EnforcedPause.selector); // pause dominates the allow-listed dest
-        vault.operatorRecoverSpot(treasury, 0, 1);
         vm.stopPrank();
 
-        console2.log("A PASS - paused: every operator Core<->EVM mover reverts EnforcedPause");
+        console2.log("A PASS - paused refill movers succeed; spot->perp (deploy) stays blocked (H2)");
     }
 
-    function test_A_emergencyRoleCannotRepatriate() public {
+    function test_A_emergencyRepatriateWorksWhilePaused() public {
         _skipIfNoFork();
+        vm.etch(Constants.CORE_WRITER, type(MockCoreWriter).runtimeCode);
 
-        // The emergency admin can pause and close positions, but has NO function that
-        // moves USDC from Core back to EVM idle. Prove it: the movers reject it on the
-        // missing OPERATOR_ROLE (even while the vault is unpaused).
+        address treasury = makeAddr("treasury");
+        vault.setSpotRecoverDest(treasury, true);
+
+        // Emergency admin still lacks OPERATOR_ROLE -> cannot call the operator movers.
         bytes32 opRole = vault.OPERATOR_ROLE();
-        vm.startPrank(emergency);
+        vm.prank(emergency);
         vm.expectRevert(
             abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, emergency, opRole)
         );
         vault.pullFromCore(1);
-        vm.expectRevert(
-            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, emergency, opRole)
-        );
-        vault.usdPerpToSpot(1);
-        vm.stopPrank();
 
-        console2.log("A PASS - EMERGENCY_ROLE has no repatriation path (lacks OPERATOR_ROLE)");
+        // ...but H2 gives EMERGENCY_ROLE its own repatriation hatch, even while paused.
+        vm.prank(emergency);
+        vault.pause();
+        vm.prank(emergency);
+        vault.emergencyRepatriate(treasury, 1, 1); // perp->spot + spot-send to allowlisted treasury
+
+        // The C-2 allowlist still binds: a non-allowlisted, non-bridge dest reverts.
+        address rogue = makeAddr("rogue");
+        vm.prank(emergency);
+        vm.expectRevert(abi.encodeWithSelector(IHyperCoreVault.SpotRecoverDestinationNotAllowed.selector, rogue));
+        vault.emergencyRepatriate(rogue, 0, 1);
+
+        console2.log("A PASS - EMERGENCY_ROLE repatriates while paused; still bound by the C-2 allowlist (H2)");
     }
 
     // ───────────────────────────────────────────────────────────────────────
@@ -170,6 +191,144 @@ contract HyperVaultLivenessForkTest is HyperVaultBaseForkTest {
         console2.log("F: race needs NAV > idle (capital on Core); not fork-representable without");
         console2.log("   mocking the precompile. Proven on the live spike (e2e_runner.py). Skipping.");
         vm.skip(true);
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Finding F remediation (H2 / TODO-5) — once a request's fulfillment SLA
+    //   lapses, prioritizeOverdue() RESERVES its claim on idle (carved out of the
+    //   pool ordinary redeems may draw from), and the reserve is released only when
+    //   that LP is fulfilled. The reservation ACCOUNTING is fully fork-provable
+    //   (idle is real USDC, no precompile needed). The starvation-prevention EFFECT
+    //   (where the cap actually BINDS and the queued LP would otherwise be starved)
+    //   needs NAV > idleUsdc() — capital genuinely on Core — which a forge fork
+    //   cannot represent (coreSpotUsdc() reads 0). That half is the live-spike proof
+    //   (e2e_runner.py), same limitation as Finding F itself.
+    // ───────────────────────────────────────────────────────────────────────
+    function test_F_overdueRequestReservesIdle() public {
+        _skipIfNoFork();
+
+        vault.setRequestFulfillmentWindow(1 hours); // admin == address(this)
+
+        _deposit(alice, 100e6);
+        _deposit(bob, 100e6);
+        uint256 aliceShares = vault.balanceOf(alice);
+        assertEq(_idle(), 200e6, "idle holds both deposits");
+
+        vm.prank(alice);
+        vault.requestWithdraw(aliceShares);
+        assertGt(vault.pendingWithdrawalDeadline(alice), 0, "deadline stamped");
+        assertFalse(vault.requestIsOverdue(alice), "not overdue yet");
+        assertEq(vault.availableIdleUsdc(), _idle(), "no reserve before prioritization");
+
+        vm.warp(block.timestamp + 1 hours + 1);
+        assertTrue(vault.requestIsOverdue(alice), "overdue after the window");
+
+        // Anyone reserves Alice's claim on idle.
+        uint256 idleNow = _idle();
+        vm.prank(keeper);
+        vault.prioritizeOverdue(alice);
+        uint256 reserved = vault.pendingWithdrawalReserved(alice);
+        assertGt(reserved, 0, "alice's claim reserved");
+        assertEq(vault.reservedIdleUsdc(), reserved, "global reserve tracks alice");
+        // The reserve is carved out of the idle ordinary redeems may draw.
+        assertEq(vault.availableIdleUsdc(), idleNow - reserved, "available idle reduced by the reserve");
+
+        // maxWithdraw of a racing redeemer routes through availableIdle (so it can
+        // never claim Alice's reserved slice): maxWithdraw == min(owned, available).
+        uint256 bobOwned = vault.convertToAssets(vault.balanceOf(bob));
+        uint256 avail = vault.availableIdleUsdc();
+        assertEq(vault.maxWithdraw(bob), bobOwned < avail ? bobOwned : avail, "maxWithdraw routes through availableIdle");
+
+        // Re-prioritizing is rejected (already reserved).
+        vm.expectRevert(abi.encodeWithSelector(IHyperCoreVault.RequestAlreadyPrioritized.selector, alice));
+        vault.prioritizeOverdue(alice);
+
+        // Fulfilling Alice pays from her reserve and releases it.
+        uint256 aliceBefore = IERC20(USDC).balanceOf(alice);
+        vm.prank(keeper);
+        vault.fulfillWithdraw(alice);
+        assertGt(IERC20(USDC).balanceOf(alice) - aliceBefore, 90e6, "alice paid ~her full claim from the reserve");
+        assertEq(vault.reservedIdleUsdc(), 0, "reserve released after fulfill");
+        assertEq(vault.pendingWithdrawalShares(alice), 0, "request cleared");
+
+        console2.log("F PASS - overdue request reserves idle (carved from availableIdle), released on fulfill (H2)");
+        console2.log("   note: the racing-redeem STARVATION case needs NAV>idle (capital on Core) -> live spike");
+    }
+
+    /// @dev H2: prioritizeOverdue guards — absent request, no-deadline, not-yet-overdue.
+    function test_F_prioritizeOverdueGuards() public {
+        _skipIfNoFork();
+
+        // No request -> NoPendingRequest.
+        vm.expectRevert(abi.encodeWithSelector(IHyperCoreVault.NoPendingRequest.selector, alice));
+        vault.prioritizeOverdue(alice);
+
+        // Request with the SLA window DISABLED (default 0) -> never overdue.
+        uint256 shares = _deposit(alice, 100e6);
+        vm.prank(alice);
+        vault.requestWithdraw(shares);
+        assertEq(vault.pendingWithdrawalDeadline(alice), 0, "no deadline when window disabled");
+        vm.expectRevert(abi.encodeWithSelector(IHyperCoreVault.RequestNotOverdue.selector, alice));
+        vault.prioritizeOverdue(alice);
+
+        console2.log("F PASS - prioritizeOverdue rejects absent / no-deadline / not-overdue requests (H2)");
+    }
+
+    /// @dev H2 regression: if NAV falls after prioritization so the LP's claim drops
+    ///      below the reserved amount, fulfilling must release the FULL reserve (no
+    ///      idle stranded in `_reservedIdle` forever).
+    function test_F_fullReserveReleasedWhenNavFallsAfterPrioritize() public {
+        _skipIfNoFork();
+        vault.setRequestFulfillmentWindow(1 hours);
+        _deposit(alice, 100e6);
+        _deposit(bob, 100e6);
+        uint256 aliceShares = vault.balanceOf(alice);
+
+        vm.prank(alice);
+        vault.requestWithdraw(aliceShares);
+        vm.warp(block.timestamp + 1 hours + 1);
+        vm.prank(keeper);
+        vault.prioritizeOverdue(alice);
+        uint256 reserved = vault.pendingWithdrawalReserved(alice);
+        assertEq(vault.reservedIdleUsdc(), reserved, "reserve set");
+
+        // NAV falls (on a fork NAV==idle) but idle still backs the reserve.
+        _drainIdle(50e6);
+        assertGe(_idle(), reserved, "idle still >= reserve (invariant)");
+
+        // Alice's claim is now below `reserved`; fulfill must release ALL of it.
+        vm.prank(keeper);
+        vault.fulfillWithdraw(alice);
+        assertEq(vault.reservedIdleUsdc(), 0, "entire reserve released; none stranded");
+        assertEq(vault.pendingWithdrawalShares(alice), 0, "request resolved");
+
+        console2.log("F PASS - full reserve released on fulfill even when NAV fell below the reserve (H2)");
+    }
+
+    /// @dev H2: the operator cannot deploy reserved idle to Core via pushToCore.
+    function test_F_pushToCoreCannotDeployReservedIdle() public {
+        _skipIfNoFork();
+        vault.setRequestFulfillmentWindow(1 hours);
+        _deposit(alice, 100e6);
+        _deposit(bob, 100e6);
+        uint256 aliceShares = vault.balanceOf(alice);
+
+        vm.prank(alice);
+        vault.requestWithdraw(aliceShares);
+        vm.warp(block.timestamp + 1 hours + 1);
+        vm.prank(keeper);
+        vault.prioritizeOverdue(alice);
+
+        uint256 avail = vault.availableIdleUsdc();
+        // Pushing more than availableIdle reverts at the H2 guard (before the bridge
+        // transfer / blacklist) — the reserve is protected from operator redeployment.
+        vm.prank(operator);
+        vm.expectRevert(
+            abi.encodeWithSelector(IHyperCoreVault.WithdrawExceedsIdleBalance.selector, uint256(uint64(avail + 1)), avail)
+        );
+        vault.pushToCore(uint64(avail + 1));
+
+        console2.log("F PASS - pushToCore cannot deploy idle reserved for an overdue request (H2)");
     }
 
     // ───────────────────────────────────────────────────────────────────────

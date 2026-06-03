@@ -31,6 +31,12 @@ interface IHyperCoreVault is IERC4626 {
     /// @notice {endNavBootstrap} called when the grace period is already over —
     ///         the transition to strict NAV reads is one-way (audit H-1).
     error NavBootstrapAlreadyEnded();
+    /// @notice {prioritizeOverdue} called for an LP with no pending request (H2).
+    error NoPendingRequest(address lp);
+    /// @notice {prioritizeOverdue} called before the request's deadline lapses (H2).
+    error RequestNotOverdue(address lp);
+    /// @notice {prioritizeOverdue} called on an already-prioritized request (H2).
+    error RequestAlreadyPrioritized(address lp);
 
     // -------------------------------------------------------------------------
     // CoreWriter submission events — these mirror what the legacy SDK response
@@ -79,6 +85,16 @@ interface IHyperCoreVault is IERC4626 {
 
     event WithdrawalRequested(address indexed lp, uint256 shares);
     event WithdrawalFulfilled(address indexed lp, uint256 assets);
+    /// @notice A withdrawal request was stamped with a fulfillment SLA deadline (H2).
+    event WithdrawalDeadlineSet(address indexed lp, uint64 deadline);
+    /// @notice An overdue request reserved `reservedAssets` of idle ahead of racing
+    ///         direct redeems (audit H2 / Finding F). Surfaces an operator stall.
+    event WithdrawalPrioritized(address indexed lp, uint256 reservedAssets, uint64 deadline);
+    /// @notice Admin updated the withdrawal-request fulfillment SLA window (H2).
+    event RequestFulfillmentWindowUpdated(uint64 window);
+    /// @notice EMERGENCY_ROLE repatriated Core funds toward idle when the operator
+    ///         is dark/compromised (audit H2). Works while paused.
+    event EmergencyRepatriated(address indexed to, uint64 perpToSpotNtl, uint64 spotSendWei);
 
     event LeverageCapUpdated(uint16 oldCap, uint16 newCap);
     event SlippageBandUpdated(uint16 oldBand, uint16 newBand);
@@ -148,6 +164,11 @@ interface IHyperCoreVault is IERC4626 {
     function setSpotSlippageBand(uint32 asset_, uint16 bps) external;
     function spotSlippageBandBps(uint32 asset_) external view returns (uint16);
 
+    /// @notice Withdrawal-request fulfillment SLA window in seconds (audit H2). 0
+    ///         disables deadlines. Used by {requestWithdraw}/{prioritizeOverdue}.
+    function setRequestFulfillmentWindow(uint64 window) external;
+    function requestFulfillmentWindow() external view returns (uint64);
+
     // -------------------------------------------------------------------------
     // Emergency surface
     // -------------------------------------------------------------------------
@@ -158,6 +179,10 @@ interface IHyperCoreVault is IERC4626 {
     function emergencyCancelByOid(uint32 asset, uint64 oid) external;
     function emergencyClosePositions(uint32[] calldata perpAssets, uint64[] calldata limitPxs) external;
     function emergencyShutdown() external;
+    /// @notice EMERGENCY_ROLE escape hatch to repatriate Core funds toward idle
+    ///         (perp->spot and/or spot-send to the bridge or an allowlisted
+    ///         treasury) even while paused / operator-dark (audit H2).
+    function emergencyRepatriate(address to, uint64 perpToSpotNtl, uint64 spotSendWei) external;
 
     // -------------------------------------------------------------------------
     // NAV / view helpers
@@ -170,6 +195,10 @@ interface IHyperCoreVault is IERC4626 {
     /// @notice Core wei decimals for {coreUsdcIndex}, validated at deploy (audit C1/M5).
     function coreUsdcDecimals() external view returns (uint8);
     function idleUsdc() external view returns (uint256);
+    /// @notice Idle not reserved for overdue prioritized requests (audit H2).
+    function availableIdleUsdc() external view returns (uint256);
+    /// @notice Idle reserved for overdue prioritized requests (audit H2).
+    function reservedIdleUsdc() external view returns (uint256);
     function coreSpotUsdc() external view returns (uint256);
     function perpWithdrawable() external view returns (uint256);
     function pendingMgmtFeeShares() external view returns (uint256);
@@ -185,5 +214,14 @@ interface IHyperCoreVault is IERC4626 {
     function requestWithdraw(uint256 shares) external;
     function cancelWithdrawRequest() external;
     function fulfillWithdraw(address lp) external;
+    /// @notice Permissionless: reserve an overdue request's claim on idle ahead of
+    ///         racing direct redeems, once its SLA deadline lapses (audit H2).
+    function prioritizeOverdue(address lp) external;
     function pendingWithdrawalShares(address lp) external view returns (uint256);
+    /// @notice Fulfillment SLA deadline for `lp`'s request (0 = none) (audit H2).
+    function pendingWithdrawalDeadline(address lp) external view returns (uint64);
+    /// @notice Idle reserved for `lp`'s prioritized request (audit H2).
+    function pendingWithdrawalReserved(address lp) external view returns (uint256);
+    /// @notice True iff `lp` has a request whose deadline has lapsed (audit H2).
+    function requestIsOverdue(address lp) external view returns (bool);
 }
