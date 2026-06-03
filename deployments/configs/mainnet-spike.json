@@ -1,0 +1,17 @@
+{
+  "name": "Allora Mainnet Spike",
+  "symbol": "amsp",
+  "operator": "0xb0aE7D6FC5526449997193b6455ED1c9e6faB174",
+  "emergencyAdmin": "0xb0aE7D6FC5526449997193b6455ED1c9e6faB174",
+  "feeRecipient": "0xb0aE7D6FC5526449997193b6455ED1c9e6faB174",
+  "usdcAddress": "0xb88339CB7199b77E23DB6E890353E22632Ba630f",
+  "timelockMinDelaySec": 0,
+  "leverageCapBps": 30000,
+  "slippageBandBps": 200,
+  "perfFeeBps": 1500,
+  "mgmtFeeAnnualBps": 200,
+  "depositCap": "100000000",
+  "maxDepositPerAddress": "100000000",
+  "whitelistPerps": [0],
+  "whitelistSpots": []
+}

@@ -4,9 +4,9 @@ Evidence that the findings in [`REDEMPTION_ASSESSMENT.md`](REDEMPTION_ASSESSMENT
 
 - **Forked-mainnet Solidity suite** — `test/fork/HyperVault*.fork.t.sol` (real USDC `0xb883…630f`, real vault deployed on the fork; LP funding via `deal`, a cheatcode, not a mock contract).
 - **Live read-only node calls** — for facts a forge fork *cannot* serve, because Foundry's revm does not implement the HyperCore precompiles (`0x0800–0x0810`). These are real `eth_call`s to the live node (`scripts/python/resolve_usdc_linkage.py`, `cast`).
-- **Live spike (funds)** — `scripts/python/e2e_runner.py` redemption-queue steps, for residuals that require a genuine NAV>idle gap (capital actually on Core). Staged, not yet executed — see [`REDEMPTION_LIVE_RUNBOOK.md`](REDEMPTION_LIVE_RUNBOOK.md).
+- **Live spike (funds)** — `scripts/python/e2e_runner.py` redemption-queue steps + `cast`, for residuals that require a genuine NAV>idle gap (capital actually on Core). **Executed 2026-06-03** on a throwaway v1.3 vault (`0x5DE26F34256f1303eCb3a3Ba70acEFD6E4f23b26`) — see [`REDEMPTION_LIVE_RUNBOOK.md`](REDEMPTION_LIVE_RUNBOOK.md) and the "Live spike" results section below.
 
-**Run substrate of record:** public RPC `https://rpc.hyperliquid.xyz/evm`, chainId 999, fork block **36760512** (2026-06-02). Last run: **25 passed, 0 failed, 2 skipped** (the 2 skips are the intentional live-only stubs F and Q4).
+**Run substrate of record:** HyperEVM mainnet, chainId 999 (`rpc.hyperliquid.xyz`). **Re-confirmed 2026-06-03 against the `.env` RPC at fork block 36763664** — fork suite **16 passed, 0 failed, 2 skipped** (the 2 skips are the intentional live-only stubs F and Q4); the full `forge test` is **25/0/2** including the legacy RemediationUltrareview + LighterCustody suites. First green run was block 36760512 (2026-06-02). The Finding-G linkage read returns the same values at both blocks.
 
 ```bash
 # fork suite (skips cleanly with no RPC; set HYPEREVM_FORK_BLOCK to pin)
@@ -26,7 +26,7 @@ python3 scripts/python/resolve_usdc_linkage.py
 | **B** | Only OPERATOR (unpaused) moves Core→EVM | `test_B_onlyOperatorCanRepatriate` | 🟢 PASS | fork |
 | **B** | Queue fns are permissionless (gap is deliberate) | `test_B_queueFunctionsArePermissionless` | 🟢 PASS | fork |
 | **E** | `fulfillWithdraw` pays from idle only; no-ops with value off-idle | `test_E_fulfillOnlyPaysFromIdle` | 🟢 PASS | fork |
-| **F** | Direct redeem races the queue (starvation) | `test_F_…_provenInLiveSpike` | ⏳ live-only | live spike |
+| **F** | Direct redeem races the queue (starvation) | live spike — bob direct-redeem drained idle, alice's `fulfillWithdraw` got 1 wei | 🟢 **PROVEN** | live spike |
 | **G** | Configured USDC ≠ Core-linked USDC | `resolve_usdc_linkage.py` (live precompile read) | 🟢 CONFIRMED | live read |
 | **G** | Core bridge blacklisted → `pushToCore` reverts | `test_G_pushToCoreRevertsOnBlacklistedBridge` | 🟢 PASS | fork |
 | **H** | Strict NAV reads default OFF; OFF fails open, ON fails closed | `test_H_strictNavReadsDefaultOffFailsOpen` | 🟢 PASS | fork |
@@ -35,7 +35,7 @@ python3 scripts/python/resolve_usdc_linkage.py
 | **Q1** | request escrows exactly the shares + emits | `test_Q1_requestEscrowsExactlyAndEmits` | 🟢 PASS | fork |
 | **Q2** | one open request per LP; over-balance / zero guards | `test_Q2_oneOpenRequestPerLp`, `test_Q2_overBalanceAndZeroGuards` | 🟢 PASS | fork |
 | **Q3** | cancel restores shares + preserves cost basis | `test_Q3_cancelRestoresSharesAndPreservesCostBasis` | 🟢 PASS | fork |
-| **Q4** | partial-fill math (idle < claim) | `test_Q4_…_provenInLiveSpike` | ⏳ live-only | live spike |
+| **Q4** | partial-fill math (idle < claim) | live spike — claim $8 vs idle $4 → fulfill paid $3.70, remainder escrowed | 🟢 **PROVEN** | live spike |
 | **Q5** | perf fee at fulfill uses the request-time snapshot | `test_Q5_perfFeeAtFulfillUsesRequestSnapshot` | 🟢 PASS | fork |
 | **Q6** | stuck request clears + pays once idle refunded | `test_Q6_fulfillPaysOutAfterIdleRefunded` | 🟢 PASS | fork |
 | **Q7** | fulfill on no request is a clean no-op | `test_Q7_fulfillNoRequestIsCleanNoOp` | 🟢 PASS | fork |
@@ -73,7 +73,30 @@ A plain forge fork cannot represent **NAV > idle**: revm does not implement the 
 - redeem is strictly proportional to idle → no LP can take more than its fair share → **starvation (F) cannot arise on a fork**;
 - `previewRedeem(req) ≤ NAV == idle` always → the **partial-fill branch (Q4) never triggers on a fork**.
 
-Reproducing NAV>idle on a fork would require mocking the precompile, which the no-mocks rule forbids. These are proven for real on the live spike, where `pushToCore`→`usdSpotToPerp` creates a genuine NAV>idle gap. The fork **does** prove the full-refund payout path (`Q6`) using `deal` as a stand-in for a completed bridge pull — the contract reads only `idleUsdc()` and cannot tell how idle was funded.
+Reproducing NAV>idle on a fork would require mocking the precompile, which the no-mocks rule forbids. These were proven for real on the **live spike of 2026-06-03** (results below). Because Finding G makes `pushToCore` revert, the NAV>idle gap was created by **seeding the vault's Core spot account directly** (HyperCore `sendAsset`, *not* the dead bridge) — the live precompiles then read it as real Core value. The fork **does** prove the full-refund payout path (`Q6`) using `deal` as a stand-in for a completed bridge pull — the contract reads only `idleUsdc()` and cannot tell how idle was funded.
+
+## Live spike — executed 2026-06-03 (real funds, HyperEVM mainnet)
+
+Throwaway v1.3 vault **`0x5DE26F34256f1303eCb3a3Ba70acEFD6E4f23b26`** (timelock `0x52D7…85CA`, deploy block 36824648, asset = shipped `0xb883…630f`, single-key operator==emergency==feeRecipient, $100 caps, BTC perp whitelisted). Actors: deployer/treasury `0x2003…753A`, operator `0xb0aE…B174`, LPs alice `0x496a…70Ba` + bob `0x1F03…A150`. NAV>idle gaps were manufactured by seeding the vault's **Core spot** account from the deployer's Core USDC (HyperCore `sendAsset("spot","spot",…)` — the documented `seed_vault_core.py` workaround, since the canonical bridge is dead per Finding G).
+
+| Finding | Live result | Evidence |
+|---|---|---|
+| **G** | `pushToCore($3.2)` **reverted** `Blacklistable: account is blacklisted` (real Circle USDC, not a fork) | tx `0x312657be…`; revert decoded from `0x08c379a0…` |
+| **A** | While paused, `usdSpotToPerp`/`pullFromCore` both revert `EnforcedPause()` (`0xd93c0665`); the same movers succeed before pause / after unpause — isolating the pause from the blacklist | pause `0x43a5e715…`, unpause `0x120ca738…` |
+| **Queue** | request escrows exactly (4e12 → free 0); cancel restores; permissionless keeper `fulfillWithdraw` pays from idle | Scenario-A run, alice round-tripped to her full $10 |
+| **Trade path (D1 re-confirm)** | BTC post-only order **rested on the HL book** from the contract at the uniform-10⁸ scale (enc px `6633000000000`, sz `18000`), then cancelled; leverage-cap + slippage-band + whitelist guards all passed | resting oid `454710262019`, cloid 1 |
+| **C-2** | `operatorRecoverSpot` to non-allowlisted alice **reverts** `SpotRecoverDestinationNotAllowed` (`0x72edc76e`); to allowlisted deployer **succeeds** (dest set via the 0-delay timelock) | recover tx `0xb1dc06b1…` |
+| **Q4** | NAV $8 (idle $4 + Core $4), alice claim $8 > idle $4 → `fulfillWithdraw` paid **$3.70** ($4 idle − $0.30 perf fee on the donation-driven gain), left **~2e12 shares escrowed**; Core $4 untouched | pending 4e12 → 1999999750000 |
+| **E** | same fulfill **could not reach the $4 on Core** — confirmed off-idle value is unreachable | `coreSpotUsdc()` unchanged at fulfill |
+| **F** | idle $8 shared by alice+bob (50/50, each claim $8); alice queues `requestWithdraw`, **bob front-runs with a direct `redeem`** → bob paid $1→$8.40, idle drained to 1 wei; alice's queued `fulfillWithdraw` got **1 wei (starved)**, value still trapped on Core | bob redeem; alice pending stayed 3999999500000 |
+
+**Recovery / reconciliation.** All Core seed was reclaimed via `operatorRecoverSpot` (C-2 path) and all funds consolidated to the deployer: **EVM USDC 100% conserved** (`19089258` = the exact starting balance). Core USDC `17.9198` vs `18.9198` start → **≈ $1.00 net cost** in HyperCore transfer fees across the 4× seed + 4× recover round-trips, plus ~0.01 HYPE gas. The throwaway vault is drained and decommissioned.
+
+**Operational findings (for the production runbook):**
+1. The vault deploy is ~9M gas (>2M small-block limit) → the **deployer must opt into HyperEVM big blocks** before `forge script --broadcast` (`use_big_blocks(True)`); toggle off afterwards so follow-on small txns stay on fast blocks.
+2. `seed_vault_core.py` uses `spot_transfer`, which is **disabled for unified accounts** (`Action disabled when unified account is active`); the working primitive is `Exchange.send_asset(dest, "spot", "spot", "USDC", amt)`. The SDK method for big blocks is `use_big_blocks`, not the script's `update_evm_user_modify`.
+3. `operatorRecoverSpot` is **fire-and-forget** (CoreWriter): one $8 recovery's EVM tx succeeded but HyperCore silently dropped the action (vault Core unchanged for 36s); a **retry settled it** (tx `0x6014fe01…`). Keepers must reconcile Core state after recovery, not trust the EVM receipt.
+4. `DEPLOYER_PRIVATE_KEY` in `.env` lacks the `0x` prefix — `cast`/`eth_account` accept it, but Foundry's `vm.envUint` requires the prefix.
 
 ## Cross-links
 
