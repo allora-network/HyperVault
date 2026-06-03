@@ -1,0 +1,17 @@
+{
+  "chainId": 999,
+  "vault": "0x5DE26F34256f1303eCb3a3Ba70acEFD6E4f23b26",
+  "timelock": "0x52D753E81B3C6224a8473826808f7bB2E01E85CA",
+  "registry": "0xA430c24f63BB3245723242c7843b2E07BA220ba8",
+  "asset": "0xb88339CB7199b77E23DB6E890353E22632Ba630f",
+  "operator": "0xb0aE7D6FC5526449997193b6455ED1c9e6faB174",
+  "feeRecipient": "0xb0aE7D6FC5526449997193b6455ED1c9e6faB174",
+  "name": "Allora Mainnet Spike",
+  "symbol": "amsp",
+  "deployBlock": 36824648,
+  "leverageCapBps": 30000,
+  "perfFeeBps": 1500,
+  "mgmtFeeAnnualBps": 200,
+  "whitelistPerps": [0],
+  "whitelistSpots": []
+}
