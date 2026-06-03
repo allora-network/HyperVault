@@ -389,28 +389,70 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///        - Vault-as-counterparty (escrow during requestWithdraw,
     ///          cancellation): no cost basis update. The pending request stores
     ///          a snapshot separately.
+    /// @dev   Audit M1 — an inter-LP transfer is a REALIZATION event for the
+    ///        transferor's gain. The old weighted-average-of-cost-bases behaviour
+    ///        let a gaining LP route shares into an underwater LP so the gain
+    ///        netted against the other LP's loss and was never taxed (perf-fee
+    ///        evasion). Now the transferor's perf fee on the transferred shares is
+    ///        crystallized at transfer time by DIVERTING fee-equivalent shares to
+    ///        `feeRecipient` — a redirect, NOT a mint, so `totalSupply` is unchanged
+    ///        and non-transacting LPs are not diluted (preserves audit C-3). The
+    ///        receiver gets `value - feeShares`, and those shares enter at the
+    ///        CURRENT price-per-share (the gain is realized), so a loss elsewhere
+    ///        can no longer absorb it.
+    ///
+    ///        INTEGRATOR NOTE (ERC-20-surprising): with a non-zero perf fee, a
+    ///        `transfer`/`transferFrom` of a gaining LP's shares delivers fewer
+    ///        shares than `value` to the recipient (the haircut funds the fee) and
+    ///        emits a second `Transfer` to `feeRecipient`. Escrow moves
+    ///        (requestWithdraw/cancel, where the vault is a counterparty) and
+    ///        mint/burn are exempt. See docs/SECURITY.md.
     function _update(address from, address to, uint256 value) internal override {
         if (
-            from != address(0) &&
-            to != address(0) &&
-            value > 0 &&
-            from != to &&
-            from != address(this) &&
-            to != address(this)
+            from != address(0) && to != address(0) && value > 0 && from != to && from != address(this)
+                && to != address(this)
         ) {
-            uint256 senderCb = _costBasisPerShare[from];
-            uint256 recvBalBefore = balanceOf(to);
-            uint256 recvBalAfter = recvBalBefore + value;
-            uint256 newCb;
-            if (recvBalBefore == 0) {
-                newCb = senderCb;
-            } else {
-                newCb = (recvBalBefore * _costBasisPerShare[to] + value * senderCb) / recvBalAfter;
+            // Crystallize the transferor's perf fee on the transferred shares.
+            uint256 feeAssets;
+            uint256 feeShares;
+            if (perfFeeBps != 0 && to != feeRecipient) {
+                feeAssets = _perfFeeAssetsWithCb(value, _costBasisPerShare[from]);
+                uint256 ta = totalAssets();
+                if (feeAssets != 0 && ta != 0) {
+                    feeShares = Math.mulDiv(feeAssets, totalSupply(), ta);
+                    if (feeShares >= value) feeShares = 0; // sanity: perfFee <= 50% so this never trips
+                }
             }
-            _costBasisPerShare[to] = newCb;
-            // sender keeps their cost basis on remaining shares
+
+            uint256 curPps = pricePerShare();
+            uint256 toReceives = value - feeShares;
+
+            // Receiver's transferred shares enter at the realized (current) PPS basis.
+            // (balanceOf reads are PRE-transfer here, as before — super._update follows.)
+            if (toReceives != 0) _absorbReceiveCostBasis(to, toReceives, curPps);
+            super._update(from, to, toReceives);
+
+            if (feeShares != 0) {
+                _absorbReceiveCostBasis(feeRecipient, feeShares, curPps);
+                super._update(from, feeRecipient, feeShares);
+                emit PerfFeePaid(from, feeAssets);
+            }
+            // `from` keeps its cost basis on any remaining shares.
+            return;
         }
         super._update(from, to, value);
+    }
+
+    /// @dev Weighted-average `addedShares` (entering at cost basis `cbForAdded`,
+    ///      1e18-fixed) into `acct`'s existing position. `balanceOf(acct)` must be
+    ///      read PRE-receipt (callers run this before `super._update`).
+    function _absorbReceiveCostBasis(address acct, uint256 addedShares, uint256 cbForAdded) internal {
+        uint256 balBefore = balanceOf(acct);
+        if (balBefore == 0) {
+            _costBasisPerShare[acct] = cbForAdded;
+        } else {
+            _costBasisPerShare[acct] = (balBefore * _costBasisPerShare[acct] + addedShares * cbForAdded) / (balBefore + addedShares);
+        }
     }
 
     // -------------------------------------------------------------------------
