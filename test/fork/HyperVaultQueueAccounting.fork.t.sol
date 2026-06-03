@@ -192,4 +192,31 @@ contract HyperVaultQueueAccountingForkTest is HyperVaultBaseForkTest {
         assertEq(vault.pendingWithdrawalShares(bob), 0, "no request created");
         console2.log("Q7 PASS - fulfillWithdraw on an LP with no request is a clean no-op");
     }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // M2 — deposit/withdraw-request mutual exclusion. A deposit into an LP with an
+    //   open request would double-count the escrowed shares' basis on the fulfill
+    //   path (perf-fee over-charge). The deposit is now blocked; the LP must cancel
+    //   first, so the inconsistent-basis state is unreachable.
+    // ───────────────────────────────────────────────────────────────────────
+    function test_M2_depositBlockedWhileRequestOpen() public {
+        _skipIfNoFork();
+
+        uint256 shares = _deposit(alice, 100e6);
+        vm.startPrank(alice);
+        vault.requestWithdraw(shares); // escrow all shares -> request open
+
+        deal(USDC, alice, 10e6);
+        IERC20(USDC).approve(address(vault), 10e6);
+        vm.expectRevert(abi.encodeWithSelector(IHyperCoreVault.PendingRequestBlocksDeposit.selector, alice));
+        vault.deposit(10e6, alice);
+
+        // Cancelling the request unblocks deposits again.
+        vault.cancelWithdrawRequest();
+        vault.deposit(10e6, alice);
+        vm.stopPrank();
+
+        assertGt(vault.balanceOf(alice), shares, "deposit allowed once the request is cancelled");
+        console2.log("M2 PASS - deposit blocked while a request is open; allowed after cancel");
+    }
 }

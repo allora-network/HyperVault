@@ -6,6 +6,7 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {HyperCoreVault} from "../src/HyperCoreVault.sol";
+import {IHyperCoreVault} from "../src/interfaces/IHyperCoreVault.sol";
 import {PrecompileLib} from "../src/libraries/PrecompileLib.sol";
 import {Constants} from "../src/libraries/Constants.sol";
 
@@ -104,11 +105,13 @@ contract RemediationUltrareviewTest is Test {
     }
 
     // ======================================================================
-    // bug_010 — performance-fee evasion via requestWithdraw -> deposit ->
-    // cancel -> redeem. Pre-fix: a dust deposit while a withdrawal request is
-    // open overwrote the LP's cost basis to the current PPS, so redeem charged
-    // ZERO perf fee. Post-fix: the escrowed shares are counted, the deposit
-    // weighted-averages, and the full perf fee is collected.
+    // bug_010 / M2 — performance-fee evasion via requestWithdraw -> deposit ->
+    // cancel -> redeem. The bug_010 fix (count escrowed shares in the cost-basis
+    // weighted-average) closed the EVASION on the cancel path; M2 then makes the
+    // whole class unreachable by BLOCKING a deposit while a request is open (which
+    // also closed the symmetric perf-fee OVER-charge on the fulfill path). This
+    // test proves both: the mid-request deposit reverts, and the legitimate
+    // cancel-then-deposit-then-redeem path still collects the full perf fee.
     // ======================================================================
     function test_bug010_perfFeeEvasionClosed() public {
         // Alice deposits 100 USDC at PPS 1.0; cost basis = 1.0.
@@ -117,15 +120,19 @@ contract RemediationUltrareviewTest is Test {
         // Strategy gains 50 USDC -> PPS 1.5, alice's unrealized gain = 50 USDC.
         _simulateGain(50e6);
 
-        // Fund the dust deposit used to poison the cost basis.
+        // Fund the dust deposit that used to poison the cost basis.
         usdc.mint(alice, 1e6);
 
-        // ---- the exploit sequence ----
         vm.startPrank(alice);
         vault.requestWithdraw(shares); // escrow all shares (balanceOf(alice) -> 0)
         usdc.approve(address(vault), 1e6);
-        vault.deposit(1e6, alice); // dust deposit at PPS 1.5 (the cb-poisoning step)
-        vault.cancelWithdrawRequest(); // shares returned
+        // M2: the cost-basis-poisoning deposit while a request is open now REVERTS.
+        vm.expectRevert(abi.encodeWithSelector(IHyperCoreVault.PendingRequestBlocksDeposit.selector, alice));
+        vault.deposit(1e6, alice);
+
+        // Legitimate path: cancel first, then deposit, then redeem -> full fee.
+        vault.cancelWithdrawRequest(); // shares returned (cb preserved)
+        vault.deposit(1e6, alice); // now allowed; 1 USDC at PPS 1.5 carries no gain
         uint256 aliceShares = vault.balanceOf(alice);
         vault.redeem(aliceShares, alice, alice);
         vm.stopPrank();
