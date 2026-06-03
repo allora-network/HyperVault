@@ -28,6 +28,9 @@ interface IHyperCoreVault is IERC4626 {
     /// @notice Configured Core-USDC decimals disagree with the live `tokenInfo`
     ///         precompile at deploy (audit C1/M5) — NAV would be off by 10^|Δ|.
     error CoreUsdcDecimalsMismatch(uint8 configured, uint8 fromPrecompile);
+    /// @notice {endNavBootstrap} called when the grace period is already over —
+    ///         the transition to strict NAV reads is one-way (audit H-1).
+    error NavBootstrapAlreadyEnded();
 
     // -------------------------------------------------------------------------
     // CoreWriter submission events — these mirror what the legacy SDK response
@@ -86,8 +89,9 @@ interface IHyperCoreVault is IERC4626 {
     event EmergencyShutdownTriggered(address indexed by);
     /// @notice Admin (un)allowlisted a destination for `operatorRecoverSpot` (audit C-2).
     event SpotRecoverDestUpdated(address indexed dest, bool allowed);
-    /// @notice Admin toggled strict NAV reads (audit H-1).
-    event StrictNavReadsUpdated(bool enabled);
+    /// @notice Admin ended the fresh-vault NAV grace period; NAV reads are now
+    ///         strict / fail-closed (audit H-1). One-way.
+    event NavBootstrapEnded(address indexed by);
     /// @notice Admin set the spot slippage band for `asset` (audit H-3).
     event SpotSlippageBandUpdated(uint32 indexed asset, uint16 bps);
     /// @notice Emitted at deploy when the Core-USDC token's linked EVM contract
@@ -130,12 +134,14 @@ interface IHyperCoreVault is IERC4626 {
     function setSpotRecoverDest(address dest, bool allowed) external;
     function spotRecoverDest(address dest) external view returns (bool);
 
-    /// @notice Enable strict NAV-precompile reads (audit H-1). Once enabled, any
-    ///         revert from `spotBalance` / `withdrawable` bubbles up rather than
-    ///         silently zeroing NAV. Admin should enable after the vault's Core
-    ///         account is initialised (any successful cross-chain action).
-    function setStrictNavReads(bool enabled) external;
-    function strictNavReads() external view returns (bool);
+    /// @notice End the one-way fresh-vault NAV grace period (audit H-1). After this,
+    ///         any revert from `spotBalance` / `withdrawable` bubbles up rather than
+    ///         silently zeroing NAV (strict / fail-closed). Call after the vault's
+    ///         Core account is initialised (any successful cross-chain action).
+    function endNavBootstrap() external;
+    /// @notice True while NAV reads are lenient (fresh-vault grace); false once
+    ///         {endNavBootstrap} has switched them to strict (audit H-1).
+    function navBootstrap() external view returns (bool);
 
     /// @notice Per-spot-asset slippage band in bps (audit H-3). 0 = no band
     ///         (legacy / opt-out). Compared against `spotPx` from the precompile.

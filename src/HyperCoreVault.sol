@@ -117,13 +117,21 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///         Core spot funds to any address.
     mapping(address => bool) public spotRecoverDest;
 
-    /// @notice When true, NAV-component reads (`coreSpotUsdc`,
-    ///         `perpWithdrawable`) use strict precompile wrappers that revert
-    ///         on failure rather than silently returning zero. Mitigates audit
-    ///         finding H-1. Default false to preserve fresh-vault behaviour
-    ///         (where precompile rows may not yet exist); admin should enable
-    ///         after the first successful cross-chain action.
-    bool public strictNavReads;
+    /// @notice One-way "fresh vault" grace flag for NAV reads (audit H-1).
+    /// @dev    While true (the deploy default), NAV-component reads (`coreSpotUsdc`,
+    ///         `perpWithdrawable`) use LENIENT precompile wrappers — a precompile
+    ///         that reverts / has no row reads as 0. This is the only safe posture
+    ///         for a brand-new vault whose Core account has no precompile rows yet
+    ///         (and it keeps revm-fork harnesses, which can't serve precompiles,
+    ///         working). Once {endNavBootstrap} is called — after the Core account
+    ///         is initialised by its first cross-chain action — this flips to false
+    ///         PERMANENTLY and NAV reads become STRICT (fail-closed): any precompile
+    ///         revert bubbles up rather than silently zeroing NAV and mispricing
+    ///         shares. Strict is therefore the DEFAULT for a live vault — the
+    ///         opposite of the prior `strictNavReads=false` footgun. Trade-off:
+    ///         once strict, redemption liveness is coupled to precompile liveness
+    ///         (why the grace exists; off-chain monitoring required — docs/SECURITY.md).
+    bool public navBootstrap = true;
 
     /// @notice Per-spot-asset slippage band in bps. Mitigates audit finding
     ///         H-3 (spot orders previously had no slippage protection). 0 =
@@ -394,19 +402,19 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///         carries an explicit ~1:1 cross-token assumption and operator-trust;
     ///         the keeper automation of Path B is tracked as TODO-4 (out of scope).
     function coreSpotUsdc() public view returns (uint256) {
-        // Audit H-1: when strictNavReads is enabled, surface precompile
-        // failures instead of silently returning zero.
-        uint64 totalCore = strictNavReads
-            ? PrecompileLib.spotBalanceStrict(address(this), coreUsdcIndex).total
-            : PrecompileLib.spotBalance(address(this), coreUsdcIndex).total;
+        // Audit H-1: once {navBootstrap} ends, NAV reads are strict — a precompile
+        // failure surfaces instead of silently returning zero (fail-closed).
+        uint64 totalCore = navBootstrap
+            ? PrecompileLib.spotBalance(address(this), coreUsdcIndex).total
+            : PrecompileLib.spotBalanceStrict(address(this), coreUsdcIndex).total;
         return _coreToEvm(totalCore);
     }
 
     function perpWithdrawable() public view returns (uint256) {
         // Audit H-1: see {coreSpotUsdc}.
-        return strictNavReads
-            ? uint256(PrecompileLib.withdrawableStrict(address(this)).withdrawable)
-            : uint256(PrecompileLib.withdrawable(address(this)).withdrawable);
+        return navBootstrap
+            ? uint256(PrecompileLib.withdrawable(address(this)).withdrawable)
+            : uint256(PrecompileLib.withdrawableStrict(address(this)).withdrawable);
     }
 
     function nav() external view returns (uint256) {
@@ -735,14 +743,17 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         emit SpotRecoverDestUpdated(dest, allowed);
     }
 
-    /// @notice Audit H-1: toggle strict NAV reads. Enable once the vault's
-    ///         Core account has had its first successful cross-chain
-    ///         interaction (so precompile rows exist) — after that point,
-    ///         any precompile revert indicates a system failure and NAV
-    ///         should fail closed rather than silently zeroing.
-    function setStrictNavReads(bool enabled) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        strictNavReads = enabled;
-        emit StrictNavReadsUpdated(enabled);
+    /// @notice Audit H-1: end the fresh-vault NAV grace period. One-way — flips
+    ///         {navBootstrap} false PERMANENTLY, switching NAV reads from lenient
+    ///         (fail-open, returns 0 on a precompile failure) to strict
+    ///         (fail-closed, reverts). Call once the vault's Core account has had
+    ///         its first successful cross-chain action (so the precompile rows
+    ///         exist); after that, a precompile revert indicates a real system
+    ///         failure and NAV must not silently zero and misprice shares.
+    function endNavBootstrap() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (!navBootstrap) revert NavBootstrapAlreadyEnded();
+        navBootstrap = false;
+        emit NavBootstrapEnded(msg.sender);
     }
 
     /// @notice Audit H-3: set per-spot-asset slippage band in bps. 0 disables
