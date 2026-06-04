@@ -48,6 +48,9 @@ interface IHyperCoreVault is IERC4626 {
     /// @notice A non-zero spot slippage band requires a calibrated, non-zero
     ///         `spotPxScaleFactor` (audit M6) — else the band gives false protection.
     error SpotBandRequiresScaleFactor(uint32 asset);
+    /// @notice The vault received less than `expected` on deposit/mint (audit L1) —
+    ///         the asset must be USDC-class (non-fee-on-transfer, non-rebasing).
+    error DepositAmountNotReceived(uint256 expected, uint256 received);
 
     // -------------------------------------------------------------------------
     // CoreWriter submission events — these mirror what the legacy SDK response

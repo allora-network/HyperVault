@@ -30,6 +30,26 @@ contract MockCoreWriter {
     }
 }
 
+/// @notice 6-dp fee-on-transfer token (1% fee) to exercise the L1 deposit guard.
+contract MockFOT is ERC20 {
+    constructor() ERC20("Fee On Transfer", "FOT") {}
+    function decimals() public pure override returns (uint8) {
+        return 6;
+    }
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+    function _update(address from, address to, uint256 value) internal override {
+        if (from != address(0) && to != address(0)) {
+            uint256 fee = value / 100; // 1% skimmed to a burn sink
+            super._update(from, address(0xdEaD), fee);
+            super._update(from, to, value - fee);
+        } else {
+            super._update(from, to, value);
+        }
+    }
+}
+
 /// @title Regression tests for the ultrareview findings on `audit/mitigations`.
 /// @dev   No prior test suite existed in this repo; this harness is built from
 ///        scratch. Precompile reads are low-level staticcalls, so unmocked
@@ -298,5 +318,104 @@ contract RemediationUltrareviewTest is Test {
         vm.prank(alice);
         vault.withdraw(mw, alice, alice); // pre-fix: reverts for an LP with a gain
         assertLt(vault.balanceOf(alice), 1e9, "maxWithdraw should drain ~all shares");
+    }
+
+    // ======================================================================
+    // L1 — deposit rejects a fee-on-transfer asset (USDC-class invariant). A FOT
+    // token that delivers less than `assets` would otherwise over-credit shares.
+    // ======================================================================
+    function _deployVaultWithAsset(address asset_, uint16 mgmtBps) internal returns (HyperCoreVault v) {
+        v = new HyperCoreVault(
+            HyperCoreVault.Config({
+                asset: IERC20(asset_),
+                coreUsdcIndex: 0,
+                coreUsdcDecimals: 8,
+                name: "L Vault",
+                symbol: "lvlt",
+                admin: admin,
+                operator: operator,
+                emergencyAdmin: emergency,
+                feeRecipient: feeRecipient,
+                leverageCapBps: 0,
+                slippageBandBps: 0,
+                mgmtFeeAnnualBps: mgmtBps,
+                perfFeeBps: 0,
+                depositCap: type(uint256).max,
+                maxDepositPerAddress: 0
+            })
+        );
+    }
+
+    function test_L1_depositRejectsFeeOnTransferAsset() public {
+        MockFOT fot = new MockFOT();
+        HyperCoreVault fotVault = _deployVaultWithAsset(address(fot), 0);
+        fot.mint(alice, 100e6);
+        vm.startPrank(alice);
+        fot.approve(address(fotVault), 100e6);
+        // Vault receives only 99e6 (1% fee) -> guard reverts (no over-credit).
+        vm.expectRevert(abi.encodeWithSelector(IHyperCoreVault.DepositAmountNotReceived.selector, uint256(100e6), uint256(99e6)));
+        fotVault.deposit(100e6, alice);
+        vm.stopPrank();
+    }
+
+    // ======================================================================
+    // L2 — long-dormancy management fee is capped at one annual period (the rate),
+    // not the old nav/2 confiscation (~50% of NAV in a single accrual).
+    // ======================================================================
+    function test_L2_dormancyMgmtFeeCappedAtAnnualRate() public {
+        HyperCoreVault mv = _deployVaultWithAsset(address(usdc), 2000); // 20%/yr mgmt fee
+        usdc.mint(alice, 100e6);
+        vm.startPrank(alice);
+        usdc.approve(address(mv), 100e6);
+        mv.deposit(100e6, alice);
+        vm.stopPrank();
+
+        // 10 years dormant: linear fee = 100e6 * 0.20 * 10 = 200e6 >= NAV -> the cap fires.
+        vm.warp(block.timestamp + 3650 days);
+
+        uint256 supply = mv.totalSupply();
+        uint256 pending = mv.pendingMgmtFeeShares();
+        // New cap: feeAssets = 20% of NAV (20e6) -> feeShares = 20e6*S/(100e6-20e6) = S/4.
+        // Old nav/2: feeShares = 50e6*S/50e6 = S (would halve every LP). Assert well below.
+        assertGt(pending, 0, "some fee accrues");
+        assertLt(pending, (supply * 30) / 100, "dormancy fee capped near 25% of supply, not the old ~100%");
+
+        // Trigger the real accrual and confirm feeRecipient gets the (capped) shares.
+        usdc.mint(router, 1e6);
+        vm.startPrank(router);
+        usdc.approve(address(mv), 1e6);
+        mv.deposit(1e6, router);
+        vm.stopPrank();
+        assertApproxEqRel(mv.balanceOf(feeRecipient), pending, 0.05e18, "minted ~the capped pending amount");
+    }
+
+    // ======================================================================
+    // L3 — emergencyClose handles a position of exactly int64.min without the
+    // `-szi` negation overflow (uint64(-szi) would revert at int64.min).
+    // ======================================================================
+    function test_L3_emergencyCloseHandlesInt64Min() public {
+        uint32 perp = 0;
+        PrecompileLib.Position memory pos = PrecompileLib.Position({
+            szi: type(int64).min,
+            entryNtl: 0,
+            isolatedRawUsd: 0,
+            leverage: 0,
+            isIsolated: false
+        });
+        vm.mockCall(Constants.POSITION_PRECOMPILE, abi.encode(address(vault), perp), abi.encode(pos));
+        // szDecimals 8 keeps the scaled size within uint64 (sz = |szi| * 10^(8-8)).
+        PrecompileLib.PerpAssetInfo memory info =
+            PrecompileLib.PerpAssetInfo({coin: "X", marginTableId: 0, szDecimals: 8, maxLeverage: 50, onlyIsolated: false});
+        vm.mockCall(Constants.PERP_ASSET_INFO_PRECOMPILE, abi.encode(perp), abi.encode(info));
+
+        uint32[] memory perps = new uint32[](1);
+        perps[0] = perp;
+        uint64[] memory pxs = new uint64[](1);
+        pxs[0] = 100_000_000;
+
+        // Band off (default) -> no markPx read. Pre-L3 this reverts on `-szi`; now it
+        // computes |int64.min| via int256 widening and dispatches.
+        vm.prank(emergency);
+        vault.emergencyClosePositions(perps, pxs);
     }
 }

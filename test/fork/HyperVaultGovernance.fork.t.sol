@@ -158,6 +158,42 @@ contract HyperVaultGovernanceForkTest is HyperVaultBaseForkTest {
     }
 
     // ───────────────────────────────────────────────────────────────────────
+    // L4 — factory + registry use Ownable2Step: a handoff (e.g. to a multisig)
+    //   requires the new owner to explicitly accept, preventing a fat-finger
+    //   transfer to a wrong/uncontrolled address.
+    // ───────────────────────────────────────────────────────────────────────
+    function test_L4_factoryOwnershipIsTwoStep() public {
+        _skipIfNoFork();
+        HyperCoreVaultFactory f = _factory(); // owner == address(this)
+        HyperCoreVaultRegistry reg = f.registry();
+        address newOwner = makeAddr("newOwner");
+
+        // Step 1: transfer is pending, ownership unchanged.
+        f.transferOwnership(newOwner);
+        assertEq(f.owner(), address(this), "factory owner unchanged until accepted");
+        assertEq(f.pendingOwner(), newOwner, "factory pending owner set");
+
+        // A non-pending account cannot accept.
+        vm.prank(attacker);
+        vm.expectRevert();
+        f.acceptOwnership();
+
+        // Step 2: the new owner accepts.
+        vm.prank(newOwner);
+        f.acceptOwnership();
+        assertEq(f.owner(), newOwner, "factory ownership transferred only after accept");
+
+        // Registry is likewise two-step.
+        reg.transferOwnership(newOwner);
+        assertEq(reg.owner(), address(this), "registry owner unchanged until accepted");
+        vm.prank(newOwner);
+        reg.acceptOwnership();
+        assertEq(reg.owner(), newOwner, "registry ownership transferred only after accept");
+
+        console2.log("L4 PASS - factory + registry ownership handoff is two-step (Ownable2Step)");
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
     // Finding I — Deposit caps are test values ($100), enforced on real bytecode.
     //   Source:  deployments/configs/mainnet-tier1.json (depositCap == maxDepositPerAddress == 100e6).
     //   Fork-provable: FULL.

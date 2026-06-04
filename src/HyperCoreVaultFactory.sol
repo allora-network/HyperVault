@@ -3,6 +3,7 @@ pragma solidity ^0.8.27;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
 
 import {HyperCoreVault} from "./HyperCoreVault.sol";
@@ -10,7 +11,10 @@ import {HyperCoreVaultRegistry} from "./HyperCoreVaultRegistry.sol";
 import {PrecompileLib} from "./libraries/PrecompileLib.sol";
 
 /// @notice CREATE2 factory for HyperCoreVault. One factory per chain.
-contract HyperCoreVaultFactory is Ownable {
+/// @dev    Audit L4: Ownable2Step — ownership handoff (e.g. to a multisig) requires
+///         the new owner to explicitly accept, preventing a fat-finger transfer to
+///         a wrong/uncontrolled address.
+contract HyperCoreVaultFactory is Ownable2Step {
     string public constant VERSION = "v1.0.0";
 
     /// @notice Minimum per-vault timelock delay the factory will deploy with
