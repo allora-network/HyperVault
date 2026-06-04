@@ -13,6 +13,11 @@ import {PrecompileLib} from "./libraries/PrecompileLib.sol";
 contract HyperCoreVaultFactory is Ownable {
     string public constant VERSION = "v1.0.0";
 
+    /// @notice Minimum per-vault timelock delay the factory will deploy with
+    ///         (audit H3). The "24h timelock protects LPs" model is void with a
+    ///         0-delay timelock; the factory refuses to mint that footgun.
+    uint256 public constant MIN_TIMELOCK_DELAY = 24 hours;
+
     HyperCoreVaultRegistry public immutable registry;
 
     /// @notice If true, factory validates the configured Core-USDC linkage against
@@ -29,6 +34,11 @@ contract HyperCoreVaultFactory is Ownable {
     /// @notice Configured Core-USDC decimals disagree with the live `tokenInfo`
     ///         precompile (audit C1/M5).
     error CoreUsdcDecimalsMismatch(uint8 configured, uint8 fromPrecompile);
+    /// @notice `timelockMinDelaySec` is below {MIN_TIMELOCK_DELAY} (audit H3).
+    error TimelockDelayBelowFloor(uint256 provided, uint256 floor);
+    /// @notice operator / emergencyAdmin / feeRecipient are not three distinct
+    ///         addresses — the timelock/role-separation model is void (audit H3).
+    error RolesNotDistinct();
     error ZeroAddress();
 
     event StrictAssetValidationUpdated(bool enabled);
@@ -67,6 +77,19 @@ contract HyperCoreVaultFactory is Ownable {
         returns (address vault, address timelock)
     {
         if (address(cfg.asset) == address(0)) revert ZeroAddress();
+
+        // Audit H3: enforce a real timelock delay and distinct operator / emergency
+        // / feeRecipient keys. A 0-delay timelock or a single key holding all three
+        // roles voids the LP-protection model; the factory refuses to deploy it.
+        if (timelockMinDelaySec < MIN_TIMELOCK_DELAY) {
+            revert TimelockDelayBelowFloor(timelockMinDelaySec, MIN_TIMELOCK_DELAY);
+        }
+        if (
+            cfg.operator == cfg.emergencyAdmin || cfg.operator == cfg.feeRecipient
+                || cfg.emergencyAdmin == cfg.feeRecipient
+        ) {
+            revert RolesNotDistinct();
+        }
 
         if (strictAssetValidation) {
             PrecompileLib.TokenInfo memory ti = PrecompileLib.tokenInfo(uint32(cfg.coreUsdcIndex));
