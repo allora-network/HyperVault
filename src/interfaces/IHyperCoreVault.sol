@@ -45,6 +45,9 @@ interface IHyperCoreVault is IERC4626 {
     ///         `emergencyCloseBandBps` (audit M4). Use {emergencyClosePositionsForce}
     ///         only if the oracle itself is unusable.
     error EmergencyCloseBandExceeded(uint64 limitPx, uint64 markPx, uint16 bandBps);
+    /// @notice A non-zero spot slippage band requires a calibrated, non-zero
+    ///         `spotPxScaleFactor` (audit M6) — else the band gives false protection.
+    error SpotBandRequiresScaleFactor(uint32 asset);
 
     // -------------------------------------------------------------------------
     // CoreWriter submission events — these mirror what the legacy SDK response
@@ -116,8 +119,9 @@ interface IHyperCoreVault is IERC4626 {
     /// @notice Admin ended the fresh-vault NAV grace period; NAV reads are now
     ///         strict / fail-closed (audit H-1). One-way.
     event NavBootstrapEnded(address indexed by);
-    /// @notice Admin set the spot slippage band for `asset` (audit H-3).
-    event SpotSlippageBandUpdated(uint32 indexed asset, uint16 bps);
+    /// @notice Admin set the spot slippage band + calibrated scale factor for
+    ///         `asset` (audit H-3 / M6).
+    event SpotSlippageBandUpdated(uint32 indexed asset, uint16 bps, uint64 scaleFactor);
     /// @notice Admin updated the emergency-close sanity band (audit M4).
     event EmergencyCloseBandUpdated(uint16 oldBps, uint16 newBps);
     /// @notice Emitted at deploy when the Core-USDC token's linked EVM contract
@@ -169,10 +173,15 @@ interface IHyperCoreVault is IERC4626 {
     ///         {endNavBootstrap} has switched them to strict (audit H-1).
     function navBootstrap() external view returns (bool);
 
-    /// @notice Per-spot-asset slippage band in bps (audit H-3). 0 = no band
-    ///         (legacy / opt-out). Compared against `spotPx` from the precompile.
-    function setSpotSlippageBand(uint32 asset_, uint16 bps) external;
+    /// @notice Per-spot-asset slippage band in bps + calibrated spotPx->limitPx
+    ///         scale factor (audit H-3 / M6). 0 bps = no band; a non-zero band
+    ///         requires a non-zero scaleFactor. Compared against the NORMALIZED spotPx.
+    function setSpotSlippageBand(uint32 asset_, uint16 bps, uint64 scaleFactor) external;
     function spotSlippageBandBps(uint32 asset_) external view returns (uint16);
+    function spotPxScaleFactor(uint32 asset_) external view returns (uint64);
+    /// @notice Suggested starting scale factor (10^(2+baseSzDecimals)) for calibrating
+    ///         {setSpotSlippageBand} — guidance only; verify on a live order (audit M6).
+    function suggestedSpotPxScaleFactor(uint32 asset_) external view returns (uint64);
 
     /// @notice Withdrawal-request fulfillment SLA window in seconds (audit H2). 0
     ///         disables deadlines. Used by {requestWithdraw}/{prioritizeOverdue}.
