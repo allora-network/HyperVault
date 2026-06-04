@@ -150,8 +150,16 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
 
     /// @notice Per-spot-asset slippage band in bps. Mitigates audit finding
     ///         H-3 (spot orders previously had no slippage protection). 0 =
-    ///         no band (legacy / opt-out). Compared against `spotPx`.
+    ///         no band (legacy / opt-out). Compared against the NORMALIZED `spotPx`.
     mapping(uint32 => uint16) public spotSlippageBandBps;
+
+    /// @notice Per-spot-asset multiplier that brings the `spotPx` precompile value
+    ///         up to the `limit_order` action's 10^8 scale (audit M6). Required
+    ///         (non-zero) whenever {spotSlippageBandBps} is set — the spot price
+    ///         scale is HL-defined and asset-specific, so the admin calibrates this
+    ///         from a live test order (see {suggestedSpotPxScaleFactor}) rather than
+    ///         the contract guessing a factor that would give false protection.
+    mapping(uint32 => uint64) public spotPxScaleFactor;
 
     /// @notice Sanity band (bps) for `emergencyClosePositions` limit prices vs the
     ///         strict markPx (audit M4). 0 = no band (default). Set WIDE (e.g.
@@ -620,19 +628,21 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
             uint256 maxDiff = (oracleNorm * slippageBandBps) / Constants.BPS;
             if (diff > maxDiff) revert SlippageBandExceeded(limitPx, oraclePxRaw, slippageBandBps);
         } else if (AssetId.isSpot(asset_)) {
-            // Audit H-3: per-spot-asset slippage band. Off by default for
-            //            backwards compatibility; admin must opt in per asset.
-            //            Scale relationship between `spotPx` and the
-            //            `limit_order` action's `limitPx` for spot is HL-defined
-            //            and asset-specific; admin must verify on a test order
-            //            before tightening the band.
+            // Audit H-3 + M6: per-spot-asset slippage band. Off by default; admin
+            // opts in per asset. The previous code compared `limitPx` (10^8 action
+            // scale) DIRECTLY against `spotPx` (precompile scale) with NO
+            // normalization — a different scale gives FALSE protection. The spot
+            // `spotPx -> limitPx` factor is HL-defined and asset-specific, so M6
+            // requires the admin to set a CALIBRATED `spotPxScaleFactor[asset]`
+            // (verified on a live test order; see {suggestedSpotPxScaleFactor})
+            // alongside the band. Normalizing makes the band sound when enabled.
             uint16 spotBand = spotSlippageBandBps[asset_];
             if (spotBand > 0) {
                 uint64 spotPxRaw = PrecompileLib.spotPxStrict(AssetId.indexOf(asset_));
+                uint256 spotPxNorm = uint256(spotPxRaw) * uint256(spotPxScaleFactor[asset_]);
                 uint256 limitPxU = uint256(limitPx);
-                uint256 oracleU  = uint256(spotPxRaw);
-                uint256 diff = limitPxU > oracleU ? limitPxU - oracleU : oracleU - limitPxU;
-                uint256 maxDiff = (oracleU * spotBand) / Constants.BPS;
+                uint256 diff = limitPxU > spotPxNorm ? limitPxU - spotPxNorm : spotPxNorm - limitPxU;
+                uint256 maxDiff = (spotPxNorm * spotBand) / Constants.BPS;
                 if (diff > maxDiff) revert SlippageBandExceeded(limitPx, spotPxRaw, spotBand);
             }
         }
@@ -968,13 +978,31 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         emit RequestFulfillmentWindowUpdated(window);
     }
 
-    /// @notice Audit H-3: set per-spot-asset slippage band in bps. 0 disables
-    ///         the band for that asset (legacy default). Admin must verify
-    ///         the `spotPx` ↔ `limitPx` scale relationship for the asset
-    ///         before tightening.
-    function setSpotSlippageBand(uint32 asset_, uint16 bps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    /// @notice Audit H-3 + M6: set per-spot-asset slippage band in bps together with
+    ///         the calibrated `spotPx -> limitPx` scale factor. 0 bps disables the
+    ///         band (the factor is ignored). A non-zero band REQUIRES a non-zero,
+    ///         live-verified `scaleFactor` (see {suggestedSpotPxScaleFactor}) so the
+    ///         normalized comparison is sound — enabling a band without calibrating
+    ///         the scale would give false protection (the original H-3 footgun).
+    function setSpotSlippageBand(uint32 asset_, uint16 bps, uint64 scaleFactor) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (bps > 0 && scaleFactor == 0) revert SpotBandRequiresScaleFactor(asset_);
         spotSlippageBandBps[asset_] = bps;
-        emit SpotSlippageBandUpdated(asset_, bps);
+        spotPxScaleFactor[asset_] = scaleFactor;
+        emit SpotSlippageBandUpdated(asset_, bps, scaleFactor);
+    }
+
+    /// @notice Audit M6: the factor the admin should START from when calibrating
+    ///         {setSpotSlippageBand} — derived by mirroring the perp band, i.e.
+    ///         10^(2 + baseTokenSzDecimals) where the base token is `spotInfo(idx).
+    ///         tokens[0]`. This ASSUMES spotPx follows the perp `human * 10^(6 -
+    ///         szDecimals)` family; because that is not guaranteed for every spot
+    ///         market, this is guidance only — the admin MUST confirm it against a
+    ///         live test order before calling {setSpotSlippageBand}.
+    function suggestedSpotPxScaleFactor(uint32 asset_) external view returns (uint64) {
+        uint32 idx = AssetId.indexOf(asset_);
+        uint64 baseToken = PrecompileLib.spotInfo(idx).tokens[0];
+        uint256 szDec = uint256(PrecompileLib.tokenInfo(uint32(baseToken)).szDecimals);
+        return uint64(10 ** (szDec + 2));
     }
 
     /// @notice Audit M4: set the emergency-close sanity band in bps (vs strict
