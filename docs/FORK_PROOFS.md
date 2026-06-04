@@ -6,7 +6,7 @@ Evidence that the findings in [`REDEMPTION_ASSESSMENT.md`](REDEMPTION_ASSESSMENT
 - **Live read-only node calls** — for facts a forge fork *cannot* serve, because Foundry's revm does not implement the HyperCore precompiles (`0x0800–0x0810`). These are real `eth_call`s to the live node (`scripts/python/resolve_usdc_linkage.py`, `cast`).
 - **Live spike (funds)** — `scripts/python/e2e_runner.py` redemption-queue steps, for residuals that require a genuine NAV>idle gap (capital actually on Core). Staged, not yet executed — see [`REDEMPTION_LIVE_RUNBOOK.md`](REDEMPTION_LIVE_RUNBOOK.md).
 
-**Run substrate of record:** public RPC `https://rpc.hyperliquid.xyz/evm`, chainId 999, fork block **36760512** (2026-06-02). Last run: **25 passed, 0 failed, 2 skipped** (the 2 skips are the intentional live-only stubs F and Q4).
+**Run substrate of record:** public RPC `https://rpc.hyperliquid.xyz/evm`, chainId 999. The original finding suite ran at fork block **36760512** (2026-06-02): **25 passed, 2 skipped**. After the v1.4 audit remediation (bottom section) the full fork suite is **44 passed, 0 failed, 2 skipped** (the 2 skips remain the intentional live-only stubs F and Q4). Per-finding remediation proofs, plus the renamed/flipped tests, are tabulated in the **v1.4 Audit Remediation** section at the end of this file.
 
 ```bash
 # fork suite (skips cleanly with no RPC; set HYPEREVM_FORK_BLOCK to pin)
@@ -81,3 +81,65 @@ Reproducing NAV>idle on a fork would require mocking the precompile, which the n
 - Live spike runbook: [`REDEMPTION_LIVE_RUNBOOK.md`](REDEMPTION_LIVE_RUNBOOK.md)
 - Live harness: `scripts/python/e2e_runner.py` (queue steps `request_withdraw` / `fulfill_withdraw` / `operator_repatriate` / `cancel_withdraw` / `pause_freeze_check`)
 - Linkage resolver: `scripts/python/resolve_usdc_linkage.py`
+
+---
+
+## v1.4 Audit Remediation — per-finding fork proofs
+
+The findings above are *closed* by the v1.4 remediation, developed as one stacked
+branch per finding (`fix/<finding>-…` off `audit/mitigations`, in the coordination
+order C1→H1→H2→H3→M2→M1→M3→M4→M6→L). Each fix ships its contract change + a green
+fork test; the pure-EVM invariants are fork-proven on real mainnet bytecode, and
+the proofs that genuinely need NAV>idle / a live order remain live-spike items
+(below). Several original tests were **flipped** (the finding's *presence* assertion
+becomes the *fix* assertion).
+
+| Phase | Closes | Fork test(s) | Status |
+|---|---|---|:--:|
+| **C1 (+M5)** | G, decimals | `HyperVaultLinkage`: `test_C1_decimalsMismatchRevertsDeploy`, `test_C1_coreSpotUsdcNormalizesScale`, `…MultiplyBranch`, `test_C1_coreLinkUnverifiedFiresForShippedAsset`, `…noEventWhenLinkMatches`, `…matchingDecimalsDeploysClean` (6) | 🟢 PASS |
+| **H1** | H | `HyperVaultLiveness`: `test_H_navBootstrapGraceThenStrictFailsClosed` (flips old `test_H_strictNavReadsDefaultOffFailsOpen`), `test_H_depositRedeemWorkWhileBootstrapping` | 🟢 PASS |
+| **H2** | A, B, E, F (fairness) | `HyperVaultLiveness`: `test_A_pauseDoesNotFreezeRepatriation` (flips `test_A_pauseFreezesRefillPath`), `test_A_emergencyRepatriateWorksWhilePaused` (flips `test_A_emergencyRoleCannotRepatriate`), `test_F_overdueRequestReservesIdle`, `…prioritizeOverdueGuards`, `…fullReserveReleasedWhenNavFallsAfterPrioritize`, `…pushToCoreCannotDeployReservedIdle` | 🟢 PASS |
+| **H3** | C, I | `HyperVaultGovernance`: `test_C_shippedConfigNowDistinctWithRealDelay` (flips `test_C_shippedConfigCollapsesRolesAndTimelock`), `…factoryEnforcesTimelockFloor`, `…factoryRejectsSharedRoles`, `…factoryAcceptsCompliantConfig`, `…timelock24hGateBlocksThenAllows` | 🟢 PASS |
+| **M2** | perf-fee over-charge | `HyperVaultQueueAccounting.test_M2_depositBlockedWhileRequestOpen`; `RemediationUltrareview.test_bug010_perfFeeEvasionClosed` (updated) | 🟢 PASS |
+| **M1** | loss-netting evasion | `HyperVaultFeeTransfer`: `test_M1_transferRealizesTransferorGain`, `…transferFeeMatchesDirectRedeem`, `…escrowTransfersAreFeeFree`, `…zeroGainTransferNoHaircut`, `…noDilutionOfStayers` (5) | 🟢 PASS |
+| **M3** | maxRedeem conformance | `HyperVaultQueueAccounting.test_M3_maxRedeemHonorsPreviewWhenIdleShort` | 🟢 PASS |
+| **M4** | emergency-close band | `RemediationUltrareview`: `test_M4_emergencyCloseBandRejectsAbsurdPrice`, `…bandOffMatchesLegacyBehavior` | 🟢 PASS |
+| **M6** | spot-band scale | `HyperVaultSpotBand`: `test_M6_bandRequiresScaleFactor`, `…normalizedBandInsideRestsOutsideReverts`, `…demonstratesNormalizationMatters`, `…bandZeroDisablesCheck`, `…suggestedFactorMirrorsPerpDerivation` (5) | 🟢 PASS |
+| **L1–L4** | hardening | `RemediationUltrareview`: `test_L1_depositRejectsFeeOnTransferAsset`, `test_L2_dormancyMgmtFeeCappedAtAnnualRate`, `test_L3_emergencyCloseHandlesInt64Min`; `HyperVaultGovernance.test_L4_factoryOwnershipIsTwoStep` | 🟢 PASS |
+
+**Substrate note on the mocked NAV reads.** `HyperVaultLinkage` (C1) and
+`test_M3_…` use `vm.mockCall` on the spot-balance / tokenInfo precompiles to create
+the NAV>idle / known-Core-balance states a revm fork can't serve. This is consistent
+with the no-mocks rule: those are *pure-EVM accounting* invariants (decimal
+normalization, maxRedeem math), **not** claims about live Core behaviour — the live
+Core confirmation is the spike below. (The starvation *effect* of F and the
+partial-fill of Q4 remain live-only for the same reason.)
+
+### Finding G — re-confirmed live (2026-06-04)
+
+`resolve_usdc_linkage.py` re-run on the live node re-confirms the linkage gap and
+validates the C1 config (`coreUsdcIndex=0`, `coreUsdcDecimals=8`):
+
+```
+Core USDC (token 0) linked EVM contract: 0x6b9e773128f453f5c2c60935ee2de2cbc5390a24
+Core USDC weiDecimals / evmExtraWeiDecimals:   8 / -2  (EVM side decimals = 6)
+Configured vault asset:                  0xb88339cb7199b77e23db6e890353e22632ba630f
+VERDICT: NOT LINKED (Finding G CONFIRMED).
+```
+
+So the real mainnet C1 deploy validates `coreUsdcDecimals == 8` (matches `weiDecimals`)
+and emits `CoreLinkUnverified(0xb883…630f, 0x6b9e…0a24)` — the mismatch is now
+on-chain-visible rather than silently trusted.
+
+### Live consolidated spike — PENDING (funded)
+
+The headline live proofs that need a funded mainnet throwaway — C1 Path-B round-trip
+(`operatorRecoverSpot → treasury → re-deposit`), H1 `endNavBootstrap` under a real
+Core balance, H2 the exact `pullFromCore`/`operatorRecoverSpot` that reverted
+`EnforcedPause` on 2026-06-03 now succeeding while paused, H3 the timelock gate at a
+tractable delay, M1 transfer-realization with a real idle gain, and F/Q4 starvation
++ partial-fill — are **staged but NOT yet executed**. Funding constraint: the .env
+actors hold ~37 USDC + ~0.31 HYPE total (almost all on the deployer), which does not
+support the plan's 10 independent per-phase spikes; a single consolidated spike
+sized to that budget is the fallback. See [`REDEMPTION_LIVE_RUNBOOK.md`](REDEMPTION_LIVE_RUNBOOK.md).
+Record the real tx hashes + `status==1` confirmations here once run.

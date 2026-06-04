@@ -86,6 +86,28 @@ Severity is relative to the goals "write a strategy, users deposit, users secure
 
 Each is framed per the de-risk rule — the proof is a **forked-mainnet harness or live test**, not a mock.
 
+> **v1.4 remediation status** (contract + fork-test layers complete; see
+> [`FORK_PROOFS.md`](FORK_PROOFS.md) §"v1.4 Audit Remediation" and [`SECURITY.md`](SECURITY.md)):
+> - **TODO-1 (C1/M5):** ✅ code — Core-USDC index/decimals configurable + deploy-validated;
+>   `coreSpotUsdc()` documented as Path-B operator-recoverable NAV. Bridge confirmed dead
+>   (Finding G re-confirmed live 2026-06-04). ⏳ Path-B round-trip = live spike.
+> - **TODO-2 (A+B / H2):** ✅ code — `pullFromCore`/`usdPerpToSpot`/`operatorRecoverSpot`
+>   no longer `whenNotPaused`; `emergencyRepatriate` for EMERGENCY_ROLE; fork-tested
+>   "operator dark → drain still reachable."
+> - **TODO-3 (C / H3):** ✅ code — factory + `Deploy.s.sol` reject sub-24h delay + shared
+>   roles on mainnet; tier configs split roles + 86400s. (Multisig handoff = post-deploy op.)
+> - **TODO-5 (E / H2):** ✅ code — `fulfillmentDeadline` + permissionless `prioritizeOverdue`
+>   reserves idle ahead of racing redeems. (Starvation *effect* needs NAV>idle = live spike.)
+> - **TODO-8 (H / H1):** ✅ code — strict NAV reads default ON behind the one-way
+>   `navBootstrap` grace (`endNavBootstrap()`).
+> - **TODO-9:** ✅ done — queue paths covered (Q1–Q7 + M2/M3 fork tests).
+> - **TODO-10 (I / H3):** ✅ partial — README "24h timelock" reconciled (now enforced);
+>   production deposit caps still to be raised from the $100 test values before LP launch.
+> - **TODO-4 (D, keeper) / TODO-6 (F policy) / TODO-7 (barriers):** still open (P1 product work);
+>   F fairness is now *mitigated* on-chain by TODO-5's reservation.
+> - **Plus M1/M2/M4/M6/L1–L5** (fee realization, deposit guard, emergency band, spot-band
+>   scale, hardening) — all code-complete + fork-proven; not original redemption TODOs.
+
 ### P0 — before any strategy goes live with real LP money
 - **TODO-1 (Finding G):** Fork-prove the USDC repatriation path on real mainnet bytecode: does `pushToCore` → `usdSpotToPerp` → `usdPerpToSpot` → `pullFromCore` actually round-trip the *configured* `asset()` back to idle? If not, define and fork-test the `operatorRecoverSpot`-to-treasury-then-deposit path, and reconcile `coreSpotUsdc()` NAV. **This is the single most important unknown** — the rest of the redemption design depends on the answer.
 - **TODO-2 (Findings A+B):** Close the liveness gap. Minimum: make repatriation reachable under emergency (e.g. an `EMERGENCY_ROLE` repatriate path and/or drop `whenNotPaused` from the Core→EVM movers so a paused vault can still drain to idle). Strategic: design the permissionless forced-close / escape hatch for the HL venue. Fork-test "operator goes dark → LPs still get paid."
