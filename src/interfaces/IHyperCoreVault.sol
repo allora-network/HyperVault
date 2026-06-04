@@ -41,6 +41,10 @@ interface IHyperCoreVault is IERC4626 {
     ///         request — would corrupt the per-LP cost basis (audit M2). The LP
     ///         must {cancelWithdrawRequest} first.
     error PendingRequestBlocksDeposit(address receiver);
+    /// @notice emergency-close `limitPx` deviates from the strict markPx beyond
+    ///         `emergencyCloseBandBps` (audit M4). Use {emergencyClosePositionsForce}
+    ///         only if the oracle itself is unusable.
+    error EmergencyCloseBandExceeded(uint64 limitPx, uint64 markPx, uint16 bandBps);
 
     // -------------------------------------------------------------------------
     // CoreWriter submission events — these mirror what the legacy SDK response
@@ -114,6 +118,8 @@ interface IHyperCoreVault is IERC4626 {
     event NavBootstrapEnded(address indexed by);
     /// @notice Admin set the spot slippage band for `asset` (audit H-3).
     event SpotSlippageBandUpdated(uint32 indexed asset, uint16 bps);
+    /// @notice Admin updated the emergency-close sanity band (audit M4).
+    event EmergencyCloseBandUpdated(uint16 oldBps, uint16 newBps);
     /// @notice Emitted at deploy when the Core-USDC token's linked EVM contract
     ///         (`tokenInfo(coreUsdcIndex).evmContract`) is NOT the vault's
     ///         `asset()` (audit C1). Not fatal — the deliberate Path-B posture
@@ -182,7 +188,13 @@ interface IHyperCoreVault is IERC4626 {
     function emergencyCancelByCloid(uint32[] calldata assets, uint128[][] calldata cloids) external;
     function emergencyCancelByOid(uint32 asset, uint64 oid) external;
     function emergencyClosePositions(uint32[] calldata perpAssets, uint64[] calldata limitPxs) external;
+    /// @notice Emergency close that skips the {emergencyCloseBandBps} sanity band —
+    ///         explicit last-resort override when the oracle is unusable (audit M4).
+    function emergencyClosePositionsForce(uint32[] calldata perpAssets, uint64[] calldata limitPxs) external;
     function emergencyShutdown() external;
+    /// @notice Sanity band (bps) for emergency-close prices vs strict markPx (audit M4).
+    function setEmergencyCloseBand(uint16 bps) external;
+    function emergencyCloseBandBps() external view returns (uint16);
     /// @notice EMERGENCY_ROLE escape hatch to repatriate Core funds toward idle
     ///         (perp->spot and/or spot-send to the bridge or an allowlisted
     ///         treasury) even while paused / operator-dark (audit H2).

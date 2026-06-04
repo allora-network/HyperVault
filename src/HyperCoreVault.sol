@@ -153,6 +153,13 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///         no band (legacy / opt-out). Compared against `spotPx`.
     mapping(uint32 => uint16) public spotSlippageBandBps;
 
+    /// @notice Sanity band (bps) for `emergencyClosePositions` limit prices vs the
+    ///         strict markPx (audit M4). 0 = no band (default). Set WIDE (e.g.
+    ///         1000-2000 bps) — looser than the trade-time band, since an emergency
+    ///         must still be able to exit, but absurd prices on a thin market are
+    ///         rejected so a compromised EMERGENCY key cannot bleed value.
+    uint16 public emergencyCloseBandBps;
+
     // -------------------------------------------------------------------------
     // Constructor
     // -------------------------------------------------------------------------
@@ -766,12 +773,36 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///         caller-supplied `limitPxs` (recommend: mark px ± slippage).
     /// @dev    Caller is responsible for sizing — read each `position(this, a).szi`
     ///         off-chain and pass the matching `limitPx`. Iterates serially.
+    ///         Audit M4: when `emergencyCloseBandBps > 0`, each `limitPx` is sanity-
+    ///         checked against the STRICT `markPx` (normalized to the 10^8 action
+    ///         scale) and rejected if it deviates beyond the (wide) band — so a
+    ///         compromised EMERGENCY key cannot bleed value by closing at an absurd
+    ///         price on a thin market. The band is wider than the trade-time band
+    ///         (emergencies must still exit). Use {emergencyClosePositionsForce} to
+    ///         skip the band in the rare case the oracle itself is unusable.
     function emergencyClosePositions(uint32[] calldata perpAssets, uint64[] calldata limitPxs)
         external
         onlyRole(EMERGENCY_ROLE)
         nonReentrant
     {
+        _emergencyClose(perpAssets, limitPxs, true);
+    }
+
+    /// @notice Audit M4: emergency close that SKIPS the {emergencyCloseBandBps}
+    ///         sanity band — explicit, last-resort override for when the oracle is
+    ///         down/unusable and the position must be exited regardless. Separate
+    ///         function so the band is never silently bypassed.
+    function emergencyClosePositionsForce(uint32[] calldata perpAssets, uint64[] calldata limitPxs)
+        external
+        onlyRole(EMERGENCY_ROLE)
+        nonReentrant
+    {
+        _emergencyClose(perpAssets, limitPxs, false);
+    }
+
+    function _emergencyClose(uint32[] calldata perpAssets, uint64[] calldata limitPxs, bool enforceBand) internal {
         require(perpAssets.length == limitPxs.length, "len");
+        uint16 band = emergencyCloseBandBps;
         for (uint256 i; i < perpAssets.length; ++i) {
             uint32 a = perpAssets[i];
             int64 szi = PrecompileLib.position(address(this), a).szi;
@@ -785,6 +816,21 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
             // leaving the position essentially open. szDecimals is read strictly so
             // a failed asset-info read fails the close closed (consistent with H-4).
             uint8 szDec = PrecompileLib.perpAssetInfoStrict(a).szDecimals;
+
+            // Audit M4: sanity-bound the supplied price against the strict markPx,
+            // normalized to the 10^8 action scale (markPx = human * 10^(6-szDec),
+            // limitPx = human * 10^8 -> factor 10^(2+szDec); same derivation as the
+            // perp trade band). Strict read => a zero/missing markPx fails closed.
+            if (enforceBand && band > 0) {
+                uint64 markRaw = PrecompileLib.markPxStrict(a);
+                uint256 markNorm = uint256(markRaw) * (10 ** (uint256(szDec) + 2));
+                uint256 lpx = uint256(limitPxs[i]);
+                uint256 diff = lpx > markNorm ? lpx - markNorm : markNorm - lpx;
+                if (diff > (markNorm * band) / Constants.BPS) {
+                    revert EmergencyCloseBandExceeded(limitPxs[i], markRaw, band);
+                }
+            }
+
             uint64 sz = uint64(uint256(absSz) * (10 ** (8 - szDec)));
             bool isBuy = szi < 0; // close: sell if currently long, buy if currently short
             uint128 cloid = _cloidCounter++;
@@ -929,6 +975,15 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     function setSpotSlippageBand(uint32 asset_, uint16 bps) external onlyRole(DEFAULT_ADMIN_ROLE) {
         spotSlippageBandBps[asset_] = bps;
         emit SpotSlippageBandUpdated(asset_, bps);
+    }
+
+    /// @notice Audit M4: set the emergency-close sanity band in bps (vs strict
+    ///         markPx). 0 disables it (default). Set WIDE — emergencies must still
+    ///         exit; the band only rejects absurd prices. {emergencyClosePositionsForce}
+    ///         bypasses it when the oracle itself is unusable.
+    function setEmergencyCloseBand(uint16 bps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        emit EmergencyCloseBandUpdated(emergencyCloseBandBps, bps);
+        emergencyCloseBandBps = bps;
     }
 
     // -------------------------------------------------------------------------

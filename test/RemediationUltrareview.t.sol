@@ -195,6 +195,68 @@ contract RemediationUltrareviewTest is Test {
     }
 
     // ======================================================================
+    // M4 — emergencyClosePositions sanity-bounds the caller's limitPx against the
+    // strict markPx (normalized to the 10^8 action scale). A sane price passes; an
+    // absurd one reverts; the explicit Force variant bypasses the band. Defaults
+    // OFF (so bug_009 above, with band 0, is unaffected).
+    // ======================================================================
+    function _mockBtcPositionAndMark() internal returns (uint32 perp) {
+        perp = 0;
+        // 0.5 BTC long, szDecimals 5.
+        PrecompileLib.Position memory pos =
+            PrecompileLib.Position({szi: int64(50_000), entryNtl: 0, isolatedRawUsd: 0, leverage: 0, isIsolated: false});
+        vm.mockCall(Constants.POSITION_PRECOMPILE, abi.encode(address(vault), perp), abi.encode(pos));
+        PrecompileLib.PerpAssetInfo memory info =
+            PrecompileLib.PerpAssetInfo({coin: "BTC", marginTableId: 0, szDecimals: 5, maxLeverage: 50, onlyIsolated: false});
+        vm.mockCall(Constants.PERP_ASSET_INFO_PRECOMPILE, abi.encode(perp), abi.encode(info));
+        // markPx = human(60000) * 10^(6 - szDec=5) = 600000 -> markNorm = 600000*10^7 = 6e12 (= $60k @ 10^8).
+        vm.mockCall(Constants.MARK_PX_PRECOMPILE, abi.encode(perp), abi.encode(uint64(600_000)));
+    }
+
+    function test_M4_emergencyCloseBandRejectsAbsurdPrice() public {
+        uint32 perp = _mockBtcPositionAndMark();
+
+        vm.prank(admin);
+        vault.setEmergencyCloseBand(2000); // wide 20% band
+
+        uint32[] memory perps = new uint32[](1);
+        perps[0] = perp;
+        uint64[] memory pxs = new uint64[](1);
+
+        // Sane: $60k (= markNorm) is within the band -> passes.
+        pxs[0] = 6_000_000_000_000;
+        vm.prank(emergency);
+        vault.emergencyClosePositions(perps, pxs);
+
+        // Absurd: $30k is 50% below markPx -> exceeds the 20% band -> reverts.
+        pxs[0] = 3_000_000_000_000;
+        vm.prank(emergency);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IHyperCoreVault.EmergencyCloseBandExceeded.selector, uint64(3_000_000_000_000), uint64(600_000), uint16(2000)
+            )
+        );
+        vault.emergencyClosePositions(perps, pxs);
+
+        // The explicit Force variant bypasses the band (oracle-unusable last resort).
+        vm.prank(emergency);
+        vault.emergencyClosePositionsForce(perps, pxs); // absurd price, but forced -> no revert
+    }
+
+    function test_M4_bandOffMatchesLegacyBehavior() public {
+        uint32 perp = _mockBtcPositionAndMark();
+        // Band defaults OFF: an absurd price is accepted (legacy behavior preserved
+        // for bug_009 and any deployment that hasn't set a band).
+        assertEq(vault.emergencyCloseBandBps(), 0, "band defaults off");
+        uint32[] memory perps = new uint32[](1);
+        perps[0] = perp;
+        uint64[] memory pxs = new uint64[](1);
+        pxs[0] = 1; // absurd
+        vm.prank(emergency);
+        vault.emergencyClosePositions(perps, pxs); // no band -> no revert
+    }
+
+    // ======================================================================
     // merged_bug_002 — the C-3 fix made `withdraw` treat `assets` as NET and
     // over-burn previewWithdraw(assets + fee) shares, breaking three ERC-4626
     // invariants. Post-fix `assets` is GROSS (mirrors redeem): burn exactly
