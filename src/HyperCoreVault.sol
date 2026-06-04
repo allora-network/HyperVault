@@ -263,6 +263,13 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         returns (uint256 shares)
     {
         if (emergencyShutdownActive) revert EmergencyShutdownActive();
+        // Audit M2: a deposit into an LP with an open withdrawal request would
+        // weighted-average the new basis against shares escrowed at the vault. The
+        // bug_010 fix makes that correct for the CANCEL path, but on the FULFILL
+        // path the escrowed shares are paid out, double-counting their basis and
+        // OVER-charging the perf fee. Block the deposit so the inconsistent state
+        // is simply unreachable (the LP must cancel first).
+        if (_pendingWithdrawal[receiver].shares != 0) revert PendingRequestBlocksDeposit(receiver);
         _accrueMgmtFee();
         shares = super.deposit(assets, receiver);
         _absorbCostBasis(receiver, shares, assets);
@@ -276,6 +283,8 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         returns (uint256 assets)
     {
         if (emergencyShutdownActive) revert EmergencyShutdownActive();
+        // Audit M2: see {deposit} — block mints into an LP with an open request.
+        if (_pendingWithdrawal[receiver].shares != 0) revert PendingRequestBlocksDeposit(receiver);
         _accrueMgmtFee();
         assets = super.mint(shares, receiver);
         _absorbCostBasis(receiver, shares, assets);

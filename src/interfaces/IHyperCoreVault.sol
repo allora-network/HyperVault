@@ -37,6 +37,10 @@ interface IHyperCoreVault is IERC4626 {
     error RequestNotOverdue(address lp);
     /// @notice {prioritizeOverdue} called on an already-prioritized request (H2).
     error RequestAlreadyPrioritized(address lp);
+    /// @notice deposit/mint into an LP (`receiver`) that has an open withdrawal
+    ///         request — would corrupt the per-LP cost basis (audit M2). The LP
+    ///         must {cancelWithdrawRequest} first.
+    error PendingRequestBlocksDeposit(address receiver);
 
     // -------------------------------------------------------------------------
     // CoreWriter submission events — these mirror what the legacy SDK response
