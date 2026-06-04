@@ -295,7 +295,13 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         // is simply unreachable (the LP must cancel first).
         if (_pendingWithdrawal[receiver].shares != 0) revert PendingRequestBlocksDeposit(receiver);
         _accrueMgmtFee();
+        // Audit L1: USDC-class (non-FOT, non-rebasing) assets only — verify the vault
+        // actually received the full `assets`, else a fee-on-transfer token would
+        // over-credit shares. (Invariant documented in docs/SECURITY.md.)
+        uint256 idleBefore = idleUsdc();
         shares = super.deposit(assets, receiver);
+        uint256 received = idleUsdc() - idleBefore;
+        if (received < assets) revert DepositAmountNotReceived(assets, received);
         _absorbCostBasis(receiver, shares, assets);
     }
 
@@ -310,7 +316,11 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         // Audit M2: see {deposit} — block mints into an LP with an open request.
         if (_pendingWithdrawal[receiver].shares != 0) revert PendingRequestBlocksDeposit(receiver);
         _accrueMgmtFee();
+        // Audit L1: USDC-class assets only — verify the full `assets` was received.
+        uint256 idleBefore = idleUsdc();
         assets = super.mint(shares, receiver);
+        uint256 received = idleUsdc() - idleBefore;
+        if (received < assets) revert DepositAmountNotReceived(assets, received);
         _absorbCostBasis(receiver, shares, assets);
     }
 
@@ -545,7 +555,13 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         uint256 currNav = totalAssets();
         if (currNav == 0 || dt == 0) return 0;
         uint256 feeAssets = (currNav * mgmtFeeAnnualBps * dt) / (Constants.BPS * Constants.SECONDS_PER_YEAR);
-        if (feeAssets >= currNav) feeAssets = currNav / 2;
+        // Audit L2: a long-dormancy linear fee can exceed NAV; cap it at ONE annual
+        // period's worth (the configured rate) rather than the old nav/2 — which
+        // confiscated ~50% of NAV in a single accrual. This bounds the dormancy
+        // over-charge to <= mgmtFeeAnnualBps of NAV.
+        uint256 maxFee = (currNav * mgmtFeeAnnualBps) / Constants.BPS;
+        if (feeAssets > maxFee) feeAssets = maxFee;
+        if (feeAssets >= currNav) return 0; // defensive: cannot take >= all of NAV
         return (feeAssets * supply) / (currNav - feeAssets);
     }
 
@@ -817,7 +833,9 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
             uint32 a = perpAssets[i];
             int64 szi = PrecompileLib.position(address(this), a).szi;
             if (szi == 0) continue;
-            uint64 absSz = szi < 0 ? uint64(-szi) : uint64(szi);
+            // Audit L3: widen through int256 so `-szi` cannot overflow at int64.min
+            // (where `-szi` on an int64 would revert).
+            uint64 absSz = uint64(szi < 0 ? uint256(-int256(szi)) : uint256(int256(szi)));
             // Ultrareview bug_009: `position().szi` is in szDecimals lots
             // (human_sz * 10^szDecimals), but the limit_order action `sz` is the
             // uniform human_sz * 10^8 scale (see CoreWriterLib.placeLimitOrder and
@@ -1159,7 +1177,14 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
             return;
         }
         uint256 feeAssets = (navNow * mgmtFeeAnnualBps * dt) / (Constants.BPS * Constants.SECONDS_PER_YEAR);
-        if (feeAssets >= navNow) feeAssets = navNow / 2; // sanity cap on absurd dt
+        // Audit L2: cap a long-dormancy fee at one annual period (the configured
+        // rate) instead of the old nav/2 confiscation; see {pendingMgmtFeeShares}.
+        uint256 maxFee = (navNow * mgmtFeeAnnualBps) / Constants.BPS;
+        if (feeAssets > maxFee) feeAssets = maxFee;
+        if (feeAssets >= navNow) {
+            _lastAccrualTs = nowTs;
+            return;
+        }
         uint256 feeShares = (feeAssets * supply) / (navNow - feeAssets);
         if (feeShares > 0) {
             _mint(feeRecipient, feeShares);
@@ -1243,7 +1268,9 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
             int64 szi = PrecompileLib.position(address(this), a).szi;
             if (szi == 0) continue;
             uint64 markPx = PrecompileLib.markPxStrict(a);
-            uint64 absSz = szi < 0 ? uint64(-szi) : uint64(szi);
+            // Audit L3: widen through int256 so `-szi` cannot overflow at int64.min
+            // (where `-szi` on an int64 would revert).
+            uint64 absSz = uint64(szi < 0 ? uint256(-int256(szi)) : uint256(int256(szi)));
             total += uint256(absSz) * uint256(markPx);
         }
     }
