@@ -20,6 +20,8 @@ contract HyperVaultGovernanceForkTest is HyperVaultBaseForkTest {
     function _deployWithSharedKey(address admin_, address single) internal returns (HyperCoreVault v) {
         HyperCoreVault.Config memory cfg = HyperCoreVault.Config({
             asset: IERC20(USDC),
+            coreUsdcIndex: 0,
+            coreUsdcDecimals: 8,
             name: "Gov Proof Vault",
             symbol: "gpv",
             admin: admin_,

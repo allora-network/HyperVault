@@ -7,6 +7,7 @@ import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 import {HyperVaultBaseForkTest} from "./HyperVaultBase.fork.t.sol";
+import {IHyperCoreVault} from "../../src/interfaces/IHyperCoreVault.sol";
 import {PrecompileLib} from "../../src/libraries/PrecompileLib.sol";
 import {Constants} from "../../src/libraries/Constants.sol";
 
@@ -201,18 +202,21 @@ contract HyperVaultLivenessForkTest is HyperVaultBaseForkTest {
     }
 
     // ───────────────────────────────────────────────────────────────────────
-    // Finding H — Strict NAV reads ship OFF; OFF fails OPEN (silent 0), ON fails CLOSED.
-    //   Contract: HyperCoreVault.sol:111 (default false), :351-365, :698 (toggle);
-    //             PrecompileLib.sol:108-112,132-138 (strict reverts PrecompileRevert).
-    //   Fork-provable: FULL for the vault's wrapper logic. NOTE: on a forge fork the
-    //            precompile read fails because revm does not implement HyperCore
-    //            precompiles — mechanically identical to a fresh Core account with no
-    //            row. Self-guarded so it never false-greens if the substrate returns data.
+    // Finding H (H1 remediation) — NAV reads default to the fresh-vault GRACE
+    //   (lenient) and become STRICT (fail-closed) once endNavBootstrap() is called.
+    //   Strict is now the default posture for a live vault (the prior
+    //   strictNavReads=false footgun is gone), behind a one-way bootstrap flag so a
+    //   brand-new vault with no Core rows (and the revm fork) still functions.
+    //   Contract: HyperCoreVault.sol navBootstrap (default true), coreSpotUsdc/
+    //             perpWithdrawable (strict = !navBootstrap), endNavBootstrap (one-way);
+    //             PrecompileLib strict reverts PrecompileRevert.
+    //   Fork-provable: FULL. Self-guarded so it never false-greens if the substrate
+    //             returns precompile data.
     // ───────────────────────────────────────────────────────────────────────
-    function test_H_strictNavReadsDefaultOffFailsOpen() public {
+    function test_H_navBootstrapGraceThenStrictFailsClosed() public {
         _skipIfNoFork();
 
-        assertFalse(vault.strictNavReads(), "strictNavReads must default OFF");
+        assertTrue(vault.navBootstrap(), "navBootstrap must default ON (fresh-vault grace)");
 
         // Self-guard: the proof needs the spot-balance precompile to FAIL for the vault's
         // (uninitialised) Core account. If the substrate returns a populated struct we
@@ -224,17 +228,41 @@ contract HyperVaultLivenessForkTest is HyperVaultBaseForkTest {
             vm.skip(true);
         }
 
-        // OFF (default): a failing precompile read is swallowed -> NAV silently reads 0.
-        assertEq(vault.coreSpotUsdc(), 0, "lenient read silently returns 0");
-        assertEq(vault.perpWithdrawable(), 0, "lenient read silently returns 0");
+        // BOOTSTRAP (default): a failing precompile read is swallowed -> NAV reads 0
+        // (fail-open). This is the safe posture for a vault with no Core rows yet.
+        assertEq(vault.coreSpotUsdc(), 0, "bootstrap: lenient read returns 0");
+        assertEq(vault.perpWithdrawable(), 0, "bootstrap: lenient read returns 0");
 
-        // ON: the same failing read now fails CLOSED (revert) instead of zeroing NAV.
-        vault.setStrictNavReads(true); // admin == address(this)
+        // End the grace (one-way) -> strict: the same failing read now fails CLOSED.
+        vault.endNavBootstrap(); // admin == address(this)
+        assertFalse(vault.navBootstrap(), "navBootstrap ended");
         vm.expectRevert(
             abi.encodeWithSelector(PrecompileLib.PrecompileRevert.selector, Constants.SPOT_BALANCE_PRECOMPILE)
         );
         vault.coreSpotUsdc();
 
-        console2.log("H PASS - default OFF silently zeros a failed NAV read; ON fails closed (revert)");
+        // The transition is one-way: cannot re-enter the grace period.
+        vm.expectRevert(IHyperCoreVault.NavBootstrapAlreadyEnded.selector);
+        vault.endNavBootstrap();
+
+        console2.log("H PASS - bootstrap reads fail-open; endNavBootstrap -> strict fail-closed; one-way");
+    }
+
+    /// @dev H1: deposits and redeems must still settle while bootstrapping (the grace
+    ///      keeps a fresh vault usable before its Core account is initialised).
+    function test_H_depositRedeemWorkWhileBootstrapping() public {
+        _skipIfNoFork();
+        assertTrue(vault.navBootstrap(), "still bootstrapping");
+
+        uint256 shares = _deposit(alice, 100e6);
+        assertGt(shares, 0, "deposit minted shares during bootstrap");
+        assertEq(vault.totalAssets(), 100e6, "NAV == idle during bootstrap (Core reads 0)");
+
+        vm.prank(alice);
+        vault.redeem(shares, alice, alice);
+        assertEq(vault.balanceOf(alice), 0, "redeem settled during bootstrap");
+        assertEq(IERC20(USDC).balanceOf(alice), 100e6, "alice recovered her USDC");
+
+        console2.log("H PASS - deposit + redeem settle normally during the NAV bootstrap grace");
     }
 }

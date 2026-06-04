@@ -5,6 +5,8 @@
   "emergencyAdmin": "0x200342145Ae3A0c1da9AdE8571EC0ff23c2b753A",
   "feeRecipient": "0x200342145Ae3A0c1da9AdE8571EC0ff23c2b753A",
   "usdcAddress": "0xb88339CB7199b77E23DB6E890353E22632Ba630f",
+  "coreUsdcIndex": 0,
+  "coreUsdcDecimals": 8,
   "timelockMinDelaySec": 0,
   "leverageCapBps": 30000,
   "slippageBandBps": 200,

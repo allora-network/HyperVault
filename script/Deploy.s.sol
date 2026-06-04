@@ -30,6 +30,8 @@ contract Deploy is Script {
 
         HyperCoreVault.Config memory cfg;
         cfg.asset                = IERC20(vm.parseJsonAddress(json, ".usdcAddress"));
+        cfg.coreUsdcIndex        = uint64(vm.parseJsonUint(json, ".coreUsdcIndex"));
+        cfg.coreUsdcDecimals     = uint8(vm.parseJsonUint(json, ".coreUsdcDecimals"));
         cfg.name                 = vm.parseJsonString(json, ".name");
         cfg.symbol               = vm.parseJsonString(json, ".symbol");
         cfg.operator             = vm.parseJsonAddress(json, ".operator");
