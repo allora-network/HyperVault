@@ -251,8 +251,17 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         return Math.min(ownedAssets, _availableIdle());
     }
 
+    /// @notice Audit M3: cap to the shares whose `previewRedeem` fits in the idle
+    ///         available for redemption, so `previewRedeem(maxRedeem(owner))` is
+    ///         honored with no silent partial fill — symmetric with the
+    ///         idle-bounded {maxWithdraw}. (Plain ERC-4626's full-balance maxRedeem
+    ///         over-reports when the operator has parked capital on Core: a naive
+    ///         integrator redeeming `maxRedeem` would receive less than
+    ///         `previewRedeem(maxRedeem)`.) `convertToShares` rounds down, so the
+    ///         cap never maps back above available idle. The withdrawal queue
+    ///         (requestWithdraw) is the path for the remainder.
     function maxRedeem(address owner) public view override(ERC4626, IERC4626) returns (uint256) {
-        return balanceOf(owner);
+        return Math.min(balanceOf(owner), convertToShares(_availableIdle()));
     }
 
     function deposit(uint256 assets, address receiver)
