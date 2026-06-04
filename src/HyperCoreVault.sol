@@ -101,11 +101,26 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     struct WithdrawalRequest {
         uint256 shares;             // shares escrowed at the vault
         uint256 costBasisAtRequest; // 1e18-fixed snapshot of LP's cb at request time
+        uint64 fulfillmentDeadline; // 0 = no SLA; else unix ts after which the request is overdue (H2)
+        uint256 reservedAssets;     // idle assets reserved for this overdue request (H2 priority over redeem)
     }
 
     /// @notice One pending withdrawal request per LP. Issue a new one only after
     ///         cancelling the existing one.
     mapping(address => WithdrawalRequest) private _pendingWithdrawal;
+
+    /// @notice On-chain fulfillment SLA window for withdrawal requests (audit H2 /
+    ///         TODO-5). 0 = disabled. When > 0, {requestWithdraw} stamps a
+    ///         `fulfillmentDeadline = now + window`; once it lapses, anyone may call
+    ///         {prioritizeOverdue} to reserve the request's claim on idle ahead of
+    ///         racing direct redeems, and the SLA breach is visible on-chain.
+    uint64 public requestFulfillmentWindow;
+
+    /// @notice Total idle assets reserved for overdue, prioritized requests (audit
+    ///         H2 — Finding F fairness). Ordinary redeem/withdraw and the
+    ///         fulfillment of NON-prioritized requests may not draw idle below this
+    ///         floor; only the matching prioritized request's fulfillment releases it.
+    uint256 private _reservedIdle;
 
     // -------------------------------------------------------------------------
     // Audit-mitigation state (v1.3)
@@ -232,7 +247,8 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///         silently reverted when the operator has parked capital on Core.
     function maxWithdraw(address owner) public view override(ERC4626, IERC4626) returns (uint256) {
         uint256 ownedAssets = convertToAssets(balanceOf(owner));
-        return Math.min(ownedAssets, idleUsdc());
+        // Audit H2: bound by idle NOT reserved for overdue prioritized requests.
+        return Math.min(ownedAssets, _availableIdle());
     }
 
     function maxRedeem(address owner) public view override(ERC4626, IERC4626) returns (uint256) {
@@ -294,7 +310,9 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     {
         _accrueMgmtFee();
 
-        uint256 idle = idleUsdc();
+        // Audit H2: idle reserved for overdue prioritized requests is off-limits to
+        // direct withdraws (Finding F — racing redeems can't drain a queued LP's reserve).
+        uint256 idle = _availableIdle();
         if (assets > idle) revert WithdrawExceedsIdleBalance(assets, idle);
 
         // `assets` is gross: burn exactly the shares it converts to, then pay the
@@ -331,7 +349,8 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         _accrueMgmtFee();
 
         uint256 grossAssets = previewRedeem(shares);
-        uint256 idle = idleUsdc();
+        // Audit H2: only un-reserved idle is available to a direct redeem.
+        uint256 idle = _availableIdle();
         if (grossAssets > idle) {
             // Partial payout: scale down both legs proportionally
             grossAssets = idle;
@@ -391,6 +410,23 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
 
     function idleUsdc() public view returns (uint256) {
         return IERC20(asset()).balanceOf(address(this));
+    }
+
+    /// @notice Idle USDC available to ordinary redemption (everything except the
+    ///         idle reserved for overdue, prioritized withdrawal requests — H2).
+    function availableIdleUsdc() public view returns (uint256) {
+        return _availableIdle();
+    }
+
+    /// @notice Idle currently reserved for overdue prioritized requests (H2).
+    function reservedIdleUsdc() external view returns (uint256) {
+        return _reservedIdle;
+    }
+
+    /// @dev Idle minus the overdue-request reserve, floored at 0 (audit H2).
+    function _availableIdle() internal view returns (uint256) {
+        uint256 idle = idleUsdc();
+        return idle > _reservedIdle ? idle - _reservedIdle : 0;
     }
 
     /// @notice The vault's Core spot USDC balance, normalized to the 6dp EVM-USDC
@@ -456,6 +492,22 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
 
     function pendingWithdrawalShares(address lp) external view returns (uint256) {
         return _pendingWithdrawal[lp].shares;
+    }
+
+    /// @notice Fulfillment SLA deadline stamped on `lp`'s request (0 = none) (H2).
+    function pendingWithdrawalDeadline(address lp) external view returns (uint64) {
+        return _pendingWithdrawal[lp].fulfillmentDeadline;
+    }
+
+    /// @notice Idle assets currently reserved for `lp`'s prioritized request (H2).
+    function pendingWithdrawalReserved(address lp) external view returns (uint256) {
+        return _pendingWithdrawal[lp].reservedAssets;
+    }
+
+    /// @notice True iff `lp` has a request with a lapsed fulfillment deadline (H2).
+    function requestIsOverdue(address lp) external view returns (bool) {
+        WithdrawalRequest storage req = _pendingWithdrawal[lp];
+        return req.shares != 0 && req.fulfillmentDeadline != 0 && block.timestamp > req.fulfillmentDeadline;
     }
 
     function nextCloid() external view returns (uint128) {
@@ -538,12 +590,20 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     }
 
     function pushToCore(uint64 amount) external onlyRole(OPERATOR_ROLE) whenNotPaused nonReentrant {
+        // Audit H2: cannot deploy idle that is reserved for an overdue prioritized
+        // request (Finding F) — the reserve is LP-claimable idle, not operator capital.
+        uint256 avail = _availableIdle();
+        if (amount > avail) revert WithdrawExceedsIdleBalance(amount, avail);
         // ERC20 transfer to USDC bridge — Core credits 8dp wei after scaling by evmExtraWeiDecimals
         IERC20(asset()).safeTransfer(SystemAddress.usdc(), amount);
         emit BridgeDeposit(amount);
     }
 
-    function pullFromCore(uint64 amountWei) external onlyRole(OPERATOR_ROLE) whenNotPaused nonReentrant {
+    /// @dev Audit H2: NOT `whenNotPaused`. This only moves funds Core->EVM idle
+    ///      (toward LP redeemability), adding no market risk — pausing it would
+    ///      freeze the refill path and strand LPs (Finding A, proven live). Pause
+    ///      still blocks deposits and outbound/market-risk movers.
+    function pullFromCore(uint64 amountWei) external onlyRole(OPERATOR_ROLE) nonReentrant {
         // spot_send to USDC system address — system tx then transfers ERC20 back to this vault
         CoreWriterLib.spotSend(SystemAddress.usdc(), coreUsdcIndex, amountWei);
         emit BridgeWithdraw(amountWei);
@@ -566,10 +626,12 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///        allowlist. A compromised OPERATOR key can no longer drain Core
     ///        spot funds to an arbitrary address — destinations must be
     ///        pre-approved via timelock.
+    /// @dev Audit H2: NOT `whenNotPaused` — it only moves Core spot to an
+    ///      allowlisted (C-2) treasury for the Path-B refill, never deploys new
+    ///      market risk; freezing it on pause would strand LPs (Finding A).
     function operatorRecoverSpot(address to, uint64 token, uint64 amountWei)
         external
         onlyRole(OPERATOR_ROLE)
-        whenNotPaused
         nonReentrant
     {
         if (to == address(0)) revert ZeroAddress();
@@ -599,7 +661,10 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         emit UsdClassTransferSubmitted(ntl, true);
     }
 
-    function usdPerpToSpot(uint64 ntl) external onlyRole(OPERATOR_ROLE) whenNotPaused nonReentrant {
+    /// @dev Audit H2: NOT `whenNotPaused` — perp->spot moves equity toward
+    ///      redeemable idle (no new market risk). `usdSpotToPerp` (spot->perp,
+    ///      which DOES add exposure) deliberately stays paused.
+    function usdPerpToSpot(uint64 ntl) external onlyRole(OPERATOR_ROLE) nonReentrant {
         CoreWriterLib.usdClassTransfer(ntl, false);
         emit UsdClassTransferSubmitted(ntl, false);
     }
@@ -673,6 +738,39 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     function emergencyShutdown() external onlyRole(EMERGENCY_ROLE) {
         emergencyShutdownActive = true;
         emit EmergencyShutdownTriggered(msg.sender);
+    }
+
+    /// @notice Audit H2: EMERGENCY_ROLE escape hatch to repatriate Core funds
+    ///         toward LP redeemability when the operator key is dark/compromised.
+    ///         Moves perp equity to spot and/or sends Core spot USDC to either the
+    ///         canonical USDC bridge (→ vault idle) or an allowlisted (C-2)
+    ///         treasury for the Path-B refill. Deliberately NOT `whenNotPaused`:
+    ///         the entire point is liveness under a paused / operator-absent vault.
+    ///         It deploys NO new market risk (only moves funds toward idle), and
+    ///         the destination is constrained to the same C-2 allowlist as
+    ///         `operatorRecoverSpot`, so a rogue EMERGENCY key cannot exfiltrate.
+    /// @param  to             spot-send destination: SystemAddress.usdc() (bridge)
+    ///                        or an allowlisted `spotRecoverDest`. Ignored if
+    ///                        `spotSendWei == 0`.
+    /// @param  perpToSpotNtl  6dp USD to move perp→spot first (0 = skip).
+    /// @param  spotSendWei    Core-wei USDC to spot-send to `to` (0 = skip).
+    function emergencyRepatriate(address to, uint64 perpToSpotNtl, uint64 spotSendWei)
+        external
+        onlyRole(EMERGENCY_ROLE)
+        nonReentrant
+    {
+        if (perpToSpotNtl > 0) {
+            CoreWriterLib.usdClassTransfer(perpToSpotNtl, false); // perp -> spot
+            emit UsdClassTransferSubmitted(perpToSpotNtl, false);
+        }
+        if (spotSendWei > 0) {
+            if (to != SystemAddress.usdc() && !spotRecoverDest[to]) {
+                revert SpotRecoverDestinationNotAllowed(to);
+            }
+            CoreWriterLib.spotSend(to, coreUsdcIndex, spotSendWei);
+            emit OperatorSpotRecovered(to, coreUsdcIndex, spotSendWei);
+        }
+        emit EmergencyRepatriated(to, perpToSpotNtl, spotSendWei);
     }
 
     // -------------------------------------------------------------------------
@@ -756,6 +854,14 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         emit NavBootstrapEnded(msg.sender);
     }
 
+    /// @notice Audit H2/TODO-5: set the withdrawal-request fulfillment SLA window
+    ///         (seconds). 0 disables deadlines (requests never go overdue). After
+    ///         a request's `now + window` lapses, anyone may {prioritizeOverdue} it.
+    function setRequestFulfillmentWindow(uint64 window) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        requestFulfillmentWindow = window;
+        emit RequestFulfillmentWindowUpdated(window);
+    }
+
     /// @notice Audit H-3: set per-spot-asset slippage band in bps. 0 disables
     ///         the band for that asset (legacy default). Admin must verify
     ///         the `spotPx` ↔ `limitPx` scale relationship for the asset
@@ -780,20 +886,53 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         if (shares > bal) revert WithdrawExceedsIdleBalance(shares, bal);
         if (_pendingWithdrawal[msg.sender].shares != 0) revert WithdrawExceedsIdleBalance(shares, 0);
 
+        // Audit H2/TODO-5: stamp the on-chain fulfillment SLA deadline (0 = disabled).
+        uint64 deadline = requestFulfillmentWindow == 0 ? 0 : uint64(block.timestamp) + requestFulfillmentWindow;
         _pendingWithdrawal[msg.sender] = WithdrawalRequest({
             shares: shares,
-            costBasisAtRequest: _costBasisPerShare[msg.sender]
+            costBasisAtRequest: _costBasisPerShare[msg.sender],
+            fulfillmentDeadline: deadline,
+            reservedAssets: 0
         });
         _transfer(msg.sender, address(this), shares);
         emit WithdrawalRequested(msg.sender, shares);
+        if (deadline != 0) emit WithdrawalDeadlineSet(msg.sender, deadline);
     }
 
     function cancelWithdrawRequest() external nonReentrant {
         WithdrawalRequest memory req = _pendingWithdrawal[msg.sender];
         if (req.shares == 0) return;
+        // Audit H2: release any idle reserved for this (now-cancelled) request.
+        if (req.reservedAssets != 0) _reservedIdle -= req.reservedAssets;
         delete _pendingWithdrawal[msg.sender];
         _transfer(address(this), msg.sender, req.shares);
         // cb is preserved on receive (from == address(this) skipped in _update)
+    }
+
+    /// @notice Audit H2 (Finding F) — permissionless. Once a request's
+    ///         `fulfillmentDeadline` has lapsed, reserve its current claim on idle
+    ///         so racing direct redeems can no longer drain it; the matching
+    ///         {fulfillWithdraw} then pays the LP from that reserve. Surfaces the
+    ///         operator-stall SLA breach on-chain. Reverts if the request is absent,
+    ///         has no deadline, isn't overdue yet, or is already prioritized.
+    /// @dev    Honest scope: with the canonical bridge dead (C1) no contract can
+    ///         permissionlessly pull Core->EVM, so this enforces fairness/priority
+    ///         over EXISTING idle and makes stalls visible; actual repatriation
+    ///         still needs the operator or the EMERGENCY_ROLE Path-B hatch.
+    function prioritizeOverdue(address lp) external nonReentrant {
+        WithdrawalRequest storage req = _pendingWithdrawal[lp];
+        uint256 shares = req.shares;
+        if (shares == 0) revert NoPendingRequest(lp);
+        uint64 deadline = req.fulfillmentDeadline;
+        if (deadline == 0 || block.timestamp <= deadline) revert RequestNotOverdue(lp);
+        if (req.reservedAssets != 0) revert RequestAlreadyPrioritized(lp);
+
+        uint256 claim = previewRedeem(shares);
+        uint256 avail = _availableIdle();
+        if (claim > avail) claim = avail;
+        req.reservedAssets = claim;
+        _reservedIdle += claim;
+        emit WithdrawalPrioritized(lp, claim, deadline);
     }
 
     /// @notice Anyone may call (keeper-friendly). Pays out as much of the request
@@ -808,7 +947,11 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         _accrueMgmtFee();
 
         uint256 grossPossible = previewRedeem(req.shares);
-        uint256 idle = idleUsdc();
+        // Audit H2: this LP may draw the free (un-reserved) idle PLUS its own overdue
+        // reserve. Non-prioritized requests (reservedAssets == 0) get only the
+        // un-reserved idle, leaving other LPs' reserves intact. `_availableIdle()` is
+        // floored, so this never underflows even if idle were somehow short.
+        uint256 idle = _availableIdle() + req.reservedAssets;
         uint256 grossOut;
         uint256 outShares;
 
@@ -826,10 +969,21 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         if (feeAssets >= grossOut) feeAssets = 0;
         uint256 userPayout = grossOut - feeAssets;
 
+        // Audit H2: release this request's ENTIRE idle reserve on every fulfill.
+        // A partial fill always consumes the whole reserve first (grossOut, the
+        // LP's full available draw, is >= reservedAssets), and a full fill resolves
+        // the request — so in both cases the reserve must be fully released. (A naive
+        // `min(grossOut, reservedAssets)` would strand `reservedAssets - grossOut`
+        // in `_reservedIdle` forever if NAV fell after prioritization, permanently
+        // locking idle.) The remainder of a partial fill keeps its deadline and can
+        // be re-prioritized by a keeper.
+        if (req.reservedAssets != 0) _reservedIdle -= req.reservedAssets;
+
         if (outShares == req.shares) {
             delete _pendingWithdrawal[lp];
         } else {
             _pendingWithdrawal[lp].shares = req.shares - outShares;
+            _pendingWithdrawal[lp].reservedAssets = 0;
         }
 
         _burn(address(this), outShares);
