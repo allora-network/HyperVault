@@ -89,6 +89,7 @@ contract RemediationUltrareviewTest is Test {
                 asset: IERC20(address(usdc)),
                 coreUsdcIndex: 0,
                 coreUsdcDecimals: 8,
+                coreDepositWallet: address(0), // legacy route (MockUSDC unit substrate)
                 name: "Test Vault",
                 symbol: "tVLT",
                 admin: admin,
@@ -330,6 +331,7 @@ contract RemediationUltrareviewTest is Test {
                 asset: IERC20(asset_),
                 coreUsdcIndex: 0,
                 coreUsdcDecimals: 8,
+                coreDepositWallet: address(0), // legacy route (mock asset substrate)
                 name: "L Vault",
                 symbol: "lvlt",
                 admin: admin,
@@ -417,5 +419,100 @@ contract RemediationUltrareviewTest is Test {
         // computes |int64.min| via int256 widening and dispatches.
         vm.prank(emergency);
         vault.emergencyClosePositions(perps, pxs);
+    }
+
+    // ======================================================================
+    // G2 — pushToCore routing (unit substrate). The wallet-mode happy path runs
+    // against the REAL CoreDepositWallet bytecode in the fork suite; these two
+    // cover what the fork cannot: the preserved legacy route on a plain ERC20,
+    // and the defensive allowance-zeroing against a misbehaving wallet.
+    // ======================================================================
+
+    /// @dev Deploy a wallet-mode vault around a fixture wallet (unit substrate).
+    function _deployVaultWithFixtureWallet(address wallet_) internal returns (HyperCoreVault v) {
+        v = new HyperCoreVault(
+            HyperCoreVault.Config({
+                asset: IERC20(address(usdc)),
+                coreUsdcIndex: 0,
+                coreUsdcDecimals: 8,
+                coreDepositWallet: wallet_,
+                name: "G2 Vault",
+                symbol: "g2vlt",
+                admin: admin,
+                operator: operator,
+                emergencyAdmin: emergency,
+                feeRecipient: feeRecipient,
+                leverageCapBps: 0,
+                slippageBandBps: 0,
+                mgmtFeeAnnualBps: 0,
+                perfFeeBps: 0,
+                depositCap: type(uint256).max,
+                maxDepositPerAddress: 0
+            })
+        );
+    }
+
+    function test_G2_legacyPushStillTransfersToSystemAddress() public {
+        // setUp()'s vault is legacy mode (coreDepositWallet == 0): the pre-G2
+        // route (ERC20 transfer to the token system address) must be preserved
+        // for genuinely direct-linked assets. MockUSDC has no blacklist.
+        usdc.mint(alice, 100e6);
+        vm.startPrank(alice);
+        usdc.approve(address(vault), 100e6);
+        vault.deposit(100e6, alice);
+        vm.stopPrank();
+
+        address sysAddr = address(uint160(uint256(uint8(0x20)) << 152)); // forToken(0)
+        vm.prank(operator);
+        vault.pushToCore(40e6);
+        assertEq(usdc.balanceOf(sysAddr), 40e6, "legacy route transfers to the system address");
+    }
+
+    function test_G2_pushClearsResidualAllowance() public {
+        // A (hypothetically misbehaving / upgraded) wallet that consumes only
+        // HALF the approved amount: the vault's trailing forceApprove(0) must
+        // still leave ZERO standing allowance to the third-party contract.
+        FixtureCoreDepositWallet w = new FixtureCoreDepositWallet(IERC20(address(usdc)));
+        HyperCoreVault v = _deployVaultWithFixtureWallet(address(w));
+
+        usdc.mint(alice, 100e6);
+        vm.startPrank(alice);
+        usdc.approve(address(v), 100e6);
+        v.deposit(100e6, alice);
+        vm.stopPrank();
+
+        vm.prank(operator);
+        v.pushToCore(50e6);
+
+        assertEq(usdc.allowance(address(v), address(w)), 0, "residual allowance zeroed");
+        assertEq(usdc.balanceOf(address(w)), 25e6, "fixture consumed only half");
+        assertEq(v.idleUsdc(), 75e6, "only the consumed half left the vault");
+    }
+}
+
+/// @notice Fixture CoreDepositWallet for the unit substrate: correct getters for
+///         the constructor's G2 validation, but a deposit() that deliberately
+///         consumes only half the allowance (a benign-but-misbehaving upgrade).
+contract FixtureCoreDepositWallet {
+    IERC20 private immutable _token;
+
+    constructor(IERC20 token_) {
+        _token = token_;
+    }
+
+    function token() external view returns (address) {
+        return address(_token);
+    }
+
+    function tokenSystemAddress() external pure returns (address) {
+        return address(uint160(uint256(uint8(0x20)) << 152)); // SystemAddress.forToken(0)
+    }
+
+    function paused() external pure returns (bool) {
+        return false;
+    }
+
+    function deposit(uint256 amount, uint32) external {
+        require(_token.transferFrom(msg.sender, address(this), amount / 2), "transferFrom failed");
     }
 }

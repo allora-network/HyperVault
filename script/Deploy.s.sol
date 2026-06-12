@@ -32,6 +32,7 @@ contract Deploy is Script {
         cfg.asset                = IERC20(vm.parseJsonAddress(json, ".usdcAddress"));
         cfg.coreUsdcIndex        = uint64(vm.parseJsonUint(json, ".coreUsdcIndex"));
         cfg.coreUsdcDecimals     = uint8(vm.parseJsonUint(json, ".coreUsdcDecimals"));
+        cfg.coreDepositWallet    = vm.parseJsonAddress(json, ".coreDepositWallet");
         cfg.name                 = vm.parseJsonString(json, ".name");
         cfg.symbol               = vm.parseJsonString(json, ".symbol");
         cfg.operator             = vm.parseJsonAddress(json, ".operator");
@@ -63,6 +64,14 @@ contract Deploy is Script {
             require(
                 allowShort || timelockDelay >= 24 hours,
                 "mainnet: timelockMinDelaySec must be >= 24h (set ALLOW_SHORT_TIMELOCK=1 for a throwaway spike)"
+            );
+            // Audit G2: mainnet Core-USDC (index 0) MUST use the official
+            // CoreDepositWallet route — the legacy system-address transfer is
+            // proven dead for natively-minted USDC (Finding G: bridge blacklisted).
+            bool allowLegacyBridge = vm.envOr("ALLOW_LEGACY_BRIDGE", false);
+            require(
+                allowLegacyBridge || cfg.coreUsdcIndex != 0 || cfg.coreDepositWallet != address(0),
+                "mainnet: coreUsdcIndex 0 requires coreDepositWallet (set ALLOW_LEGACY_BRIDGE=1 to override)"
             );
         }
 
@@ -175,7 +184,8 @@ contract Deploy is Script {
             "  \"vault\": \"", vm.toString(vaultAddr), "\",\n",
             "  \"timelock\": \"", vm.toString(timelockAddr), "\",\n",
             "  \"registry\": \"", vm.toString(registryAddr), "\",\n",
-            "  \"asset\": \"", vm.toString(address(cfg.asset)), "\",\n"
+            "  \"asset\": \"", vm.toString(address(cfg.asset)), "\",\n",
+            "  \"coreDepositWallet\": \"", vm.toString(cfg.coreDepositWallet), "\",\n"
         );
         string memory body = string.concat(
             "  \"operator\": \"", vm.toString(cfg.operator), "\",\n",

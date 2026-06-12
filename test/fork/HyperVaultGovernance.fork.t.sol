@@ -24,6 +24,7 @@ contract HyperVaultGovernanceForkTest is HyperVaultBaseForkTest {
             asset: IERC20(USDC),
             coreUsdcIndex: 0,
             coreUsdcDecimals: 8,
+            coreDepositWallet: address(0), // governance proofs are route-orthogonal
             name: "Gov Proof Vault",
             symbol: "gpv",
             admin: admin_,
@@ -59,6 +60,7 @@ contract HyperVaultGovernanceForkTest is HyperVaultBaseForkTest {
             asset: IERC20(USDC),
             coreUsdcIndex: 0,
             coreUsdcDecimals: 8,
+            coreDepositWallet: address(0), // governance proofs are route-orthogonal
             name: "Factory Vault",
             symbol: "facv",
             admin: address(0), // factory overwrites with the per-vault timelock

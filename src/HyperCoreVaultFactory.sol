@@ -30,9 +30,11 @@ contract HyperCoreVaultFactory is Ownable2Step {
     ///         mainnet tokenInfo is confirmed wired up.
     /// @dev    Audit C1/M5: validates `tokenInfo(cfg.coreUsdcIndex).weiDecimals`
     ///         equals `cfg.coreUsdcDecimals` (a mismatch mis-scales NAV by 10^|Δ|).
-    ///         A Core `evmContract` differing from the asset is NOT fatal — Path B
-    ///         keeps the unlinked Circle USDC as the share asset; the vault
-    ///         constructor surfaces the mismatch via `CoreLinkUnverified`.
+    ///         Link validation lives in the vault constructor (audit G2):
+    ///         wallet-mode deploys hard-revert on a token/system-address/linkage
+    ///         mismatch and emit `CoreLinkVerified` when the precompile confirms;
+    ///         legacy deploys (no wallet) keep the warn-only `CoreLinkUnverified`
+    ///         Path-B surface. Deliberately not duplicated here (drift risk).
     bool public strictAssetValidation;
 
     /// @notice Configured Core-USDC decimals disagree with the live `tokenInfo`
@@ -98,9 +100,10 @@ contract HyperCoreVaultFactory is Ownable2Step {
         if (strictAssetValidation) {
             PrecompileLib.TokenInfo memory ti = PrecompileLib.tokenInfo(uint32(cfg.coreUsdcIndex));
             bool resolved = ti.weiDecimals != 0 || ti.evmContract != address(0) || bytes(ti.name).length != 0;
-            // Audit C1/M5: enforce the decimals invariant (NAV scale); the link
-            // mismatch is non-fatal under Path B and is surfaced by the vault's
-            // CoreLinkUnverified event rather than reverting here.
+            // Audit C1/M5: enforce the decimals invariant (NAV scale). Link
+            // validation is the vault constructor's job (audit G2): fatal in
+            // wallet mode (CoreLinkMismatch), warn-only in legacy mode
+            // (CoreLinkUnverified) — deliberately not duplicated here.
             if (resolved && ti.weiDecimals != cfg.coreUsdcDecimals) {
                 revert CoreUsdcDecimalsMismatch(cfg.coreUsdcDecimals, ti.weiDecimals);
             }

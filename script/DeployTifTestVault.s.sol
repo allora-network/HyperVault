@@ -21,6 +21,8 @@ contract DeployTifTestVault is Script {
             asset: IERC20(usdc),
             coreUsdcIndex: 0,
             coreUsdcDecimals: 8,
+            // Audit G2: official Circle CoreDepositWallet (tokenInfo(0).evmContract).
+            coreDepositWallet: 0x6B9E773128f453f5c2C60935Ee2DE2CBc5390A24,
             name: "TIF Scale Test",
             symbol: "tifscale",
             admin: op,

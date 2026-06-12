@@ -21,13 +21,15 @@ import {Constants} from "../../src/libraries/Constants.sol";
 ///  Core seed at the right scale + the Path-B round-trip) is the live-spike proof
 ///  recorded in docs/FORK_PROOFS.md.
 contract HyperVaultLinkageForkTest is HyperVaultBaseForkTest {
-    /// @dev Stand-in for the real Core-linked USDC EVM contract
-    ///      (tokenInfo(0).evmContract = 0x6B9E…0A24 on mainnet, per Finding G) —
-    ///      any address distinct from the configured asset `USDC` exercises the
-    ///      mismatch path; the value is mocked, so the exact address is immaterial.
+    /// @dev Stand-in for a Core-linked EVM contract that ISN'T what the vault
+    ///      expects — exercises the legacy CoreLinkUnverified surface and the
+    ///      wallet-mode CoreLinkMismatch hard-revert. (On real mainnet,
+    ///      tokenInfo(0).evmContract = 0x6B9E…0A24 = Circle's CoreDepositWallet,
+    ///      audit G2; the value here is mocked, so the exact address is immaterial.)
     address internal coreLinkedUsdc = makeAddr("coreLinkedUsdc");
 
     event CoreLinkUnverified(address indexed asset, address indexed coreEvmContract);
+    event CoreLinkVerified(address indexed asset, address indexed coreDepositWallet);
 
     /// @dev Deploy a vault with custom Core-USDC index/decimals (admin == this).
     function _deployWithCore(uint64 idx, uint8 dec) internal returns (HyperCoreVault v) {
@@ -35,6 +37,10 @@ contract HyperVaultLinkageForkTest is HyperVaultBaseForkTest {
             asset: IERC20(USDC),
             coreUsdcIndex: idx,
             coreUsdcDecimals: dec,
+            // Legacy mode: these C1 tests exercise arbitrary Core indices/decimals,
+            // which wallet-mode validation would (correctly) reject. G2 wallet-mode
+            // deploys are covered by the dedicated G2 tests below.
+            coreDepositWallet: address(0),
             name: "Linkage Proof Vault",
             symbol: "lpv",
             admin: address(this),
@@ -109,12 +115,12 @@ contract HyperVaultLinkageForkTest is HyperVaultBaseForkTest {
     }
 
     // ───────────────────────────────────────────────────────────────────────
-    // C1 (3) — the shipped-asset linkage gap is surfaced on-chain (not silent).
-    //   Finding G: tokenInfo(0).evmContract (the real Core-linked USDC) is NOT
-    //   the configured Circle USDC. Path B keeps the unlinked asset, but the
-    //   constructor must emit CoreLinkUnverified so the mismatch is visible.
+    // C1 (3) — LEGACY MODE (no wallet): a linkage gap is surfaced on-chain (not
+    //   silent). With no CoreDepositWallet configured, an evmContract that isn't
+    //   the asset emits the warn-only CoreLinkUnverified (the pre-G2 Path-B
+    //   posture). Wallet-mode vaults hard-revert instead (G2 tests below).
     // ───────────────────────────────────────────────────────────────────────
-    function test_C1_coreLinkUnverifiedFiresForShippedAsset() public {
+    function test_C1_coreLinkUnverifiedFiresInLegacyMode() public {
         _skipIfNoFork();
         // Core token 0 links a DIFFERENT EVM contract than our asset.
         _mockTokenInfo(0, 8, coreLinkedUsdc);
@@ -131,5 +137,103 @@ contract HyperVaultLinkageForkTest is HyperVaultBaseForkTest {
         HyperCoreVault v = _deployWithCore(0, 8);
         // (Sanity: deploy succeeded with a real address.)
         assertTrue(address(v) != address(0), "vault deployed");
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // G2 — wallet-mode deploy validation (audit G2). Three fail-closed layers:
+    //   (a)  wallet.token() == asset()            — direct, precompile-free
+    //   (a') wallet.tokenSystemAddress() == forToken(coreUsdcIndex)
+    //   (c)  tokenInfo.evmContract == wallet when the row resolves, attested by
+    //        CoreLinkVerified. Layer (a)/(a') run against the REAL wallet
+    //        bytecode on the fork; layer (c) uses the mocked-precompile
+    //        technique established above.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// @dev Deploy a wallet-mode vault (mainnet posture: index 0, 8 Core decimals).
+    function _deployWithWallet(address wallet_) internal returns (HyperCoreVault v) {
+        HyperCoreVault.Config memory cfg = HyperCoreVault.Config({
+            asset: IERC20(USDC),
+            coreUsdcIndex: 0,
+            coreUsdcDecimals: 8,
+            coreDepositWallet: wallet_,
+            name: "G2 Wallet Vault",
+            symbol: "g2v",
+            admin: address(this),
+            operator: operator,
+            emergencyAdmin: emergency,
+            feeRecipient: feeRecipient,
+            leverageCapBps: 0,
+            slippageBandBps: 0,
+            mgmtFeeAnnualBps: 0,
+            perfFeeBps: 0,
+            depositCap: type(uint256).max,
+            maxDepositPerAddress: 0
+        });
+        v = new HyperCoreVault(cfg);
+    }
+
+    function test_G2_realWalletDeploysClean() public {
+        _skipIfNoFork();
+        // No tokenInfo mock: the precompile is empty on a fork (fresh-account
+        // semantics), so only the direct wallet checks run — against the REAL
+        // CoreDepositWallet bytecode.
+        HyperCoreVault v = _deployWithWallet(CORE_DEPOSIT_WALLET);
+        assertEq(v.coreDepositWallet(), CORE_DEPOSIT_WALLET, "wallet immutable stored");
+    }
+
+    function test_G2_walletTokenMismatchRevertsDeploy() public {
+        _skipIfNoFork();
+        address otherToken = makeAddr("otherToken");
+        FixtureDepositWallet wrong = new FixtureDepositWallet(otherToken, USDC_BRIDGE);
+        vm.expectRevert(
+            abi.encodeWithSelector(IHyperCoreVault.CoreDepositWalletTokenMismatch.selector, USDC, otherToken)
+        );
+        _deployWithWallet(address(wrong));
+    }
+
+    function test_G2_walletSystemAddressMismatchRevertsDeploy() public {
+        _skipIfNoFork();
+        address wrongSys = makeAddr("wrongSys");
+        FixtureDepositWallet wrong = new FixtureDepositWallet(USDC, wrongSys);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IHyperCoreVault.CoreDepositWalletSystemAddressMismatch.selector, USDC_BRIDGE, wrongSys
+            )
+        );
+        _deployWithWallet(address(wrong));
+    }
+
+    function test_G2_coreLinkMismatchRevertsDeploy() public {
+        _skipIfNoFork();
+        // The real wallet passes (a)/(a'), but the (mocked) tokenInfo row claims a
+        // DIFFERENT linked contract → push and pull would route differently → revert.
+        _mockTokenInfo(0, 8, coreLinkedUsdc);
+        vm.expectRevert(
+            abi.encodeWithSelector(IHyperCoreVault.CoreLinkMismatch.selector, CORE_DEPOSIT_WALLET, coreLinkedUsdc)
+        );
+        _deployWithWallet(CORE_DEPOSIT_WALLET);
+    }
+
+    function test_G2_coreLinkVerifiedEmitsWhenResolved() public {
+        _skipIfNoFork();
+        // tokenInfo row confirms the wallet (the real mainnet state, mocked here
+        // because the fork can't serve the precompile) → positive attestation.
+        _mockTokenInfo(0, 8, CORE_DEPOSIT_WALLET);
+        vm.expectEmit(true, true, false, true);
+        emit CoreLinkVerified(USDC, CORE_DEPOSIT_WALLET);
+        _deployWithWallet(CORE_DEPOSIT_WALLET);
+    }
+}
+
+/// @dev Minimal wallet stand-in for the deploy-validation mismatch tests — only
+///      the two getters the constructor reads. (The REAL wallet covers the
+///      happy path above; this exists to exercise the revert branches.)
+contract FixtureDepositWallet {
+    address public token;
+    address public tokenSystemAddress;
+
+    constructor(address token_, address sys_) {
+        token = token_;
+        tokenSystemAddress = sys_;
     }
 }

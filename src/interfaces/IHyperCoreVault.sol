@@ -28,6 +28,18 @@ interface IHyperCoreVault is IERC4626 {
     /// @notice Configured Core-USDC decimals disagree with the live `tokenInfo`
     ///         precompile at deploy (audit C1/M5) — NAV would be off by 10^|Δ|.
     error CoreUsdcDecimalsMismatch(uint8 configured, uint8 fromPrecompile);
+    /// @notice The configured CoreDepositWallet custodies a different token than
+    ///         the vault's `asset()` (audit G2) — deposits would feed someone
+    ///         else's bridge. Checked directly against the wallet at deploy.
+    error CoreDepositWalletTokenMismatch(address asset, address walletToken);
+    /// @notice The configured CoreDepositWallet's `tokenSystemAddress()` is not
+    ///         the system address derived from `coreUsdcIndex` (audit G2) — the
+    ///         wallet and the NAV/pull leg would point at different Core tokens.
+    error CoreDepositWalletSystemAddressMismatch(address expected, address actual);
+    /// @notice `tokenInfo(coreUsdcIndex).evmContract` resolved to something other
+    ///         than the configured CoreDepositWallet (audit G2). Push and pull
+    ///         would route through different contracts — fail closed.
+    error CoreLinkMismatch(address wallet, address coreEvmContract);
     /// @notice {endNavBootstrap} called when the grace period is already over —
     ///         the transition to strict NAV reads is one-way (audit H-1).
     error NavBootstrapAlreadyEnded();
@@ -75,7 +87,11 @@ interface IHyperCoreVault is IERC4626 {
     event OrderCancelByCloidSubmitted(uint32 indexed asset, uint128 indexed cloid);
     event OrderCancelByOidSubmitted(uint32 indexed asset, uint64 indexed oid);
     event UsdClassTransferSubmitted(uint64 ntl, bool toPerp);
-    event BridgeDeposit(uint64 amount);  // EVM USDC -> Core spot
+    /// @notice EVM USDC -> Core spot. Wallet mode: `approve + deposit` on the
+    ///         CoreDepositWallet (the ERC20 `Transfer` goes to the wallet, not
+    ///         the system address). Legacy mode: ERC20 transfer to the system
+    ///         address. Route is fixed per-vault via {coreDepositWallet} (G2).
+    event BridgeDeposit(uint64 amount);
     event BridgeWithdraw(uint64 amountWei); // Core spot -> EVM USDC (via system address)
     event OperatorSpotRecovered(address indexed to, uint64 token, uint64 amountWei); // Core spot -> arbitrary recipient
     event StrandedSwept(address indexed to, uint256 amount); // EVM asset sweep when totalSupply==0
@@ -127,12 +143,20 @@ interface IHyperCoreVault is IERC4626 {
     event SpotSlippageBandUpdated(uint32 indexed asset, uint16 bps, uint64 scaleFactor);
     /// @notice Admin updated the emergency-close sanity band (audit M4).
     event EmergencyCloseBandUpdated(uint16 oldBps, uint16 newBps);
-    /// @notice Emitted at deploy when the Core-USDC token's linked EVM contract
+    /// @notice LEGACY MODE ONLY (no CoreDepositWallet configured): emitted at
+    ///         deploy when the Core-USDC token's linked EVM contract
     ///         (`tokenInfo(coreUsdcIndex).evmContract`) is NOT the vault's
-    ///         `asset()` (audit C1). Not fatal — the deliberate Path-B posture
-    ///         keeps the unlinked Circle USDC as the share asset — but the
-    ///         mismatch is surfaced on-chain rather than silently trusted.
+    ///         `asset()` (audit C1). Not fatal — the pre-G2 Path-B posture keeps
+    ///         the unlinked asset as the share asset — but the mismatch is
+    ///         surfaced on-chain rather than silently trusted. Wallet-mode vaults
+    ///         hard-revert on a mismatch instead ({CoreLinkMismatch}).
     event CoreLinkUnverified(address indexed asset, address indexed coreEvmContract);
+    /// @notice WALLET MODE: emitted at deploy when the live `tokenInfo` row
+    ///         confirms the configured CoreDepositWallet IS the Core-USDC linked
+    ///         EVM contract (audit G2) — the on-chain attestation that push and
+    ///         pull route through the same official bridge. Absent on substrates
+    ///         where the precompile is empty (fresh Core account, revm fork).
+    event CoreLinkVerified(address indexed asset, address indexed coreDepositWallet);
 
     // -------------------------------------------------------------------------
     // Operator surface
@@ -222,6 +246,9 @@ interface IHyperCoreVault is IERC4626 {
     function coreUsdcIndex() external view returns (uint64);
     /// @notice Core wei decimals for {coreUsdcIndex}, validated at deploy (audit C1/M5).
     function coreUsdcDecimals() external view returns (uint8);
+    /// @notice Circle's CoreDepositWallet used by {pushToCore} (audit G2);
+    ///         `address(0)` = legacy HIP-1 route. Immutable; validated at deploy.
+    function coreDepositWallet() external view returns (address);
     function idleUsdc() external view returns (uint256);
     /// @notice Idle not reserved for overdue prioritized requests (audit H2).
     function availableIdleUsdc() external view returns (uint256);

@@ -11,6 +11,7 @@ import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {IHyperCoreVault} from "./interfaces/IHyperCoreVault.sol";
+import {ICoreDepositWallet} from "./interfaces/ICoreDepositWallet.sol";
 import {CoreWriterLib} from "./libraries/CoreWriterLib.sol";
 import {PrecompileLib} from "./libraries/PrecompileLib.sol";
 import {SystemAddress} from "./libraries/SystemAddress.sol";
@@ -42,6 +43,7 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         IERC20 asset;            // USDC ERC20 on HyperEVM
         uint64 coreUsdcIndex;    // Core spot token index for USDC (canonical mainnet = 0)
         uint8 coreUsdcDecimals;  // Core wei decimals for that token (validated vs live tokenInfo at deploy)
+        address coreDepositWallet; // Circle CoreDepositWallet for EVM->Core deposits (audit G2); 0 = legacy HIP-1 route
         string name;
         string symbol;
         address admin;           // DEFAULT_ADMIN_ROLE — should be a TimelockController
@@ -70,6 +72,23 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///         precompile resolves — a wrong value would put NAV off by 10^|Δ|
     ///         (audit M5).
     uint8 public immutable coreUsdcDecimals;
+
+    /// @notice Circle's CoreDepositWallet — the official EVM->Core deposit route
+    ///         for natively-minted USDC (audit G2). When set, {pushToCore} runs
+    ///         `approve + deposit(amount, CORE_SPOT_DEX_ID)` against it; when
+    ///         `address(0)` the vault uses the legacy HIP-1 route (ERC20 transfer
+    ///         to the token system address), which is only valid for assets whose
+    ///         `tokenInfo.evmContract == asset()`.
+    /// @dev    IMMUTABLE by design: a mutable fund-routing destination would hand
+    ///         a compromised timelock a clean idle-drain lever (point it at an
+    ///         attacker, wait for the next push). The wallet is an EIP-1967 proxy,
+    ///         so Circle upgrades change the implementation, not this address; if
+    ///         the address itself were ever migrated, only pushToCore breaks (new
+    ///         deployments to Core), while {pullFromCore} (Core-side, follows the
+    ///         live linkage) and every redemption path keep working — the remedy
+    ///         is a vault redeploy, consistent with the repo's posture for
+    ///         linkage params. Validated three ways at deploy; see constructor.
+    address public immutable coreDepositWallet;
 
     // -------------------------------------------------------------------------
     // Mutable config (admin / timelock)
@@ -190,22 +209,53 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         feeRecipient         = cfg.feeRecipient;
         coreUsdcIndex        = cfg.coreUsdcIndex;
         coreUsdcDecimals     = cfg.coreUsdcDecimals;
-        // Audit C1/M5: validate the Core-USDC linkage against the live precompile.
-        // When the `tokenInfo` row resolves (mainnet), the configured Core decimals
-        // MUST match `weiDecimals` (a mismatch silently mis-scales NAV by 10^|Δ|),
-        // and a Core `evmContract` that differs from `asset()` is surfaced on-chain
-        // via {CoreLinkUnverified} rather than silently trusted — the deliberate
-        // Path-B posture (Circle USDC stays the share asset; Core balance is
-        // operator-recoverable NAV). When the precompile is empty (a fresh Core
-        // account, or a revm fork), validation is skipped so deploys still work.
+        coreDepositWallet    = cfg.coreDepositWallet;
+        // Audit C1/M5/G2: validate the Core-USDC linkage at deploy.
+        //
+        // WALLET MODE (cfg.coreDepositWallet != 0 — the official route for
+        // natively-minted USDC): three layered checks, all fail-closed.
+        //   (a)  wallet.token() must be asset() — direct positive check against
+        //        the wallet's own bytecode; needs no precompile, so it protects
+        //        fork deploys too. A codeless/wrong address reverts on decode.
+        //   (a') wallet.tokenSystemAddress() must be the system address derived
+        //        from the configured coreUsdcIndex — binds the wallet to the
+        //        Core token the NAV reads, catching index typos with no precompile.
+        //   (b)  when the `tokenInfo` row resolves (live chain): decimals must
+        //        match (a mismatch silently mis-scales NAV by 10^|Δ| — M5), and
+        //   (c)  tokenInfo.evmContract must BE the wallet — the pull path pays
+        //        out through `tokenInfo.evmContract`, so a mismatch means push
+        //        and pull would route through different contracts. On success
+        //        the deploy emits {CoreLinkVerified} as an on-chain attestation.
+        //
+        // LEGACY MODE (cfg.coreDepositWallet == 0 — HIP-1 direct-linked assets,
+        // unit tests): pre-G2 behavior byte-for-byte — decimals hard check plus
+        // the warn-only {CoreLinkUnverified} surface when evmContract != asset().
+        // When the precompile is empty (fresh Core account, revm fork), the
+        // tokenInfo checks are skipped so deploys still work (H-1 grace posture).
         {
+            if (cfg.coreDepositWallet != address(0)) {
+                address walletToken = ICoreDepositWallet(cfg.coreDepositWallet).token();
+                if (walletToken != address(cfg.asset)) {
+                    revert CoreDepositWalletTokenMismatch(address(cfg.asset), walletToken);
+                }
+                address expectedSys = SystemAddress.forToken(cfg.coreUsdcIndex);
+                address walletSys = ICoreDepositWallet(cfg.coreDepositWallet).tokenSystemAddress();
+                if (walletSys != expectedSys) {
+                    revert CoreDepositWalletSystemAddressMismatch(expectedSys, walletSys);
+                }
+            }
             PrecompileLib.TokenInfo memory ti = PrecompileLib.tokenInfo(uint32(cfg.coreUsdcIndex));
             bool resolved = ti.weiDecimals != 0 || ti.evmContract != address(0) || bytes(ti.name).length != 0;
             if (resolved) {
                 if (ti.weiDecimals != cfg.coreUsdcDecimals) {
                     revert CoreUsdcDecimalsMismatch(cfg.coreUsdcDecimals, ti.weiDecimals);
                 }
-                if (ti.evmContract != address(cfg.asset)) {
+                if (cfg.coreDepositWallet != address(0)) {
+                    if (ti.evmContract != cfg.coreDepositWallet) {
+                        revert CoreLinkMismatch(cfg.coreDepositWallet, ti.evmContract);
+                    }
+                    emit CoreLinkVerified(address(cfg.asset), cfg.coreDepositWallet);
+                } else if (ti.evmContract != address(cfg.asset)) {
                     emit CoreLinkUnverified(address(cfg.asset), ti.evmContract);
                 }
             }
@@ -515,13 +565,17 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     }
 
     /// @notice The vault's Core spot USDC balance, normalized to the 6dp EVM-USDC
-    ///         scale. Counts as **operator-recoverable NAV**: with the configured
-    ///         Circle USDC unlinked from Core (audit C1, see {CoreLinkUnverified}
-    ///         and docs/SECURITY.md), this value is realized to idle EVM USDC via
-    ///         the Path-B route `operatorRecoverSpot → treasury → re-deposit`, not
-    ///         the (blacklisted) canonical bridge. Including it in NAV therefore
-    ///         carries an explicit ~1:1 cross-token assumption and operator-trust;
-    ///         the keeper automation of Path B is tracked as TODO-4 (out of scope).
+    ///         scale.
+    /// @dev    Audit G2 — wallet mode (the production posture): this leg is
+    ///         **bridgeable NAV**, realized to idle EVM USDC contract-to-contract
+    ///         via {pullFromCore} (the CoreDepositWallet pays native USDC from
+    ///         its reserve; see {CoreLinkVerified}). Residual trust = the
+    ///         Circle-operated wallet (pausable/upgradeable; issuer-trust class).
+    ///         Legacy mode (no wallet, asset unlinked): the pre-G2 caveat stands —
+    ///         this is operator-recoverable NAV via the Path-B route
+    ///         `operatorRecoverSpot -> treasury -> re-deposit` (see
+    ///         {CoreLinkUnverified} and docs/SECURITY.md), with its explicit ~1:1
+    ///         cross-token assumption and operator-trust.
     function coreSpotUsdc() public view returns (uint256) {
         // Audit H-1: once {navBootstrap} ends, NAV reads are strict — a precompile
         // failure surfaces instead of silently returning zero (fail-closed).
@@ -682,13 +736,32 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         emit OrderCancelByCloidSubmitted(asset_, cloid);
     }
 
+    /// @dev Audit G2: wallet mode deposits via Circle's CoreDepositWallet —
+    ///      `approve + deposit(amount, CORE_SPOT_DEX_ID)`. The spot dex is
+    ///      hardcoded deliberately: the credit lands exactly where
+    ///      {coreSpotUsdc} reads (NAV continuity), independent of the wallet's
+    ///      mutable dex-forwarding config, and free of the perp-route
+    ///      new-Core-account fee; spot->perp stays the explicit {usdSpotToPerp}.
+    ///      If Circle pauses the wallet, its `EnforcedPause` revert bubbles up
+    ///      (no pre-check: it would just add a TOCTOU'd external call). A zero
+    ///      `amount` reverts inside the wallet. The trailing zero-approve is
+    ///      defensive: today's wallet consumes the exact allowance, but it is an
+    ///      upgradeable third-party proxy — never leave an allowance standing.
     function pushToCore(uint64 amount) external onlyRole(OPERATOR_ROLE) whenNotPaused nonReentrant {
         // Audit H2: cannot deploy idle that is reserved for an overdue prioritized
         // request (Finding F) — the reserve is LP-claimable idle, not operator capital.
         uint256 avail = _availableIdle();
         if (amount > avail) revert WithdrawExceedsIdleBalance(amount, avail);
-        // ERC20 transfer to USDC bridge — Core credits 8dp wei after scaling by evmExtraWeiDecimals
-        IERC20(asset()).safeTransfer(SystemAddress.usdc(), amount);
+        address wallet = coreDepositWallet;
+        if (wallet == address(0)) {
+            // Legacy HIP-1 route (direct-linked assets only): ERC20 transfer to the
+            // token system address — Core credits 8dp wei after evmExtraWeiDecimals.
+            IERC20(asset()).safeTransfer(SystemAddress.usdc(), amount);
+        } else {
+            IERC20(asset()).forceApprove(wallet, amount);
+            ICoreDepositWallet(wallet).deposit(amount, Constants.CORE_SPOT_DEX_ID);
+            IERC20(asset()).forceApprove(wallet, 0);
+        }
         emit BridgeDeposit(amount);
     }
 
@@ -696,25 +769,32 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///      (toward LP redeemability), adding no market risk — pausing it would
     ///      freeze the refill path and strand LPs (Finding A, proven live). Pause
     ///      still blocks deposits and outbound/market-risk movers.
+    /// @dev Audit G2: the Core-side action is route-invariant. For a wallet-mode
+    ///      vault the system tx pays out via the CoreDepositWallet's
+    ///      system-guarded `transfer` (native USDC from its reserve, to this
+    ///      vault); for a legacy direct-linked asset the system address itself
+    ///      transfers the ERC20 back. Note the wallet payout is `whenNotPaused`
+    ///      on Circle's side — a paused wallet stalls the refill until unpaused
+    ///      (contingency: {operatorRecoverSpot} / {emergencyRepatriate}).
     function pullFromCore(uint64 amountWei) external onlyRole(OPERATOR_ROLE) nonReentrant {
-        // spot_send to USDC system address — system tx then transfers ERC20 back to this vault
+        // spot_send to USDC system address — the system tx then credits this vault's EVM balance
         CoreWriterLib.spotSend(SystemAddress.usdc(), coreUsdcIndex, amountWei);
         emit BridgeWithdraw(amountWei);
     }
 
-    /// @notice Send a Core spot token from the vault's Core account to any address.
-    /// @dev    Generalised escape hatch needed when the canonical EVM↔Core USDC
-    ///         bridge isn't deployed for the chosen asset (the current mainnet
-    ///         situation — Circle USDC on EVM is not linked to Core USDC). The
-    ///         operator uses this to send realised PnL or rebalancing funds to
-    ///         a treasury / re-deposit address.
+    /// @notice Send a Core spot token from the vault's Core account to an
+    ///         allowlisted address. CONTINGENCY path (audit G2).
+    /// @dev    With the official CoreDepositWallet route live for natively-minted
+    ///         USDC, the primary capital loop is {pushToCore}/{pullFromCore} and
+    ///         this is a contingency: a Circle-paused/decommissioned wallet, a
+    ///         non-USDC spot token to evacuate, or a legacy asset with no usable
+    ///         bridge (the pre-G2 Path-B treasury flow).
     ///
     ///         Note: this is `OPERATOR_ROLE` gated, not `EMERGENCY_ROLE`,
-    ///         because it's part of the normal rebalance flow when the bridge
-    ///         is non-functional. In a deployment with a functional bridge,
-    ///         `pullFromCore` is preferred and this can be considered an
-    ///         emergency-only path — operators should restrict their key
-    ///         accordingly (e.g., via a multisig).
+    ///         because in those contingencies it becomes part of the rebalance
+    ///         flow. In normal wallet-mode operation `pullFromCore` is the
+    ///         route and operators should treat this as emergency-only
+    ///         (e.g., restrict via a multisig policy).
     /// @dev   Audit C-2: `to` must be on the admin-managed `spotRecoverDest`
     ///        allowlist. A compromised OPERATOR key can no longer drain Core
     ///        spot funds to an arbitrary address — destinations must be
@@ -883,8 +963,11 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///         It deploys NO new market risk (only moves funds toward idle), and
     ///         the destination is constrained to the same C-2 allowlist as
     ///         `operatorRecoverSpot`, so a rogue EMERGENCY key cannot exfiltrate.
-    /// @param  to             spot-send destination: SystemAddress.usdc() (bridge)
-    ///                        or an allowlisted `spotRecoverDest`. Ignored if
+    /// @param  to             spot-send destination: SystemAddress.usdc() — the
+    ///                        live route in wallet mode, the CoreDepositWallet
+    ///                        pays the vault's EVM idle (audit G2) — or an
+    ///                        allowlisted `spotRecoverDest` (legacy Path-B /
+    ///                        wallet-paused contingency). Ignored if
     ///                        `spotSendWei == 0`.
     /// @param  perpToSpotNtl  6dp USD to move perp→spot first (0 = skip).
     /// @param  spotSendWei    Core-wei USDC to spot-send to `to` (0 = skip).
