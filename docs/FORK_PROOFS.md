@@ -28,7 +28,7 @@ python3 scripts/python/resolve_usdc_linkage.py
 | **E** | `fulfillWithdraw` pays from idle only; no-ops with value off-idle | `test_E_fulfillOnlyPaysFromIdle` | 🟢 PASS | fork |
 | **F** | Direct redeem races the queue (starvation) | live spike — bob direct-redeem drained idle, alice's `fulfillWithdraw` got 1 wei | 🟢 **PROVEN** | live spike |
 | **G** | Configured USDC ≠ Core-linked USDC | `resolve_usdc_linkage.py` (live precompile read) | 🟢 CONFIRMED | live read |
-| **G** | Core bridge blacklisted → `pushToCore` reverts | `test_G_pushToCoreRevertsOnBlacklistedBridge` | 🟢 PASS | fork |
+| **G** | Core bridge blacklisted → LEGACY `pushToCore` reverts (v1.5: wallet route is the fix, see §v1.5 G2) | `test_G_legacyPushRevertsOnBlacklistedBridge` | 🟢 PASS | fork |
 | **H** | Strict NAV reads default OFF; OFF fails open, ON fails closed | `test_H_strictNavReadsDefaultOffFailsOpen` | 🟢 PASS | fork |
 | **C** | Shipped config collapses roles; 0-delay timelock = no protection | `test_C_shippedConfigCollapsesRolesAndTimelock` | 🟢 PASS | fork |
 | **I** | $100 caps are real and enforced | `test_I_capsAreHundredDollarTestValues` | 🟢 PASS | fork |
@@ -61,7 +61,7 @@ tokenInfo(0) = ("USDC", [], 0, 0x0000…0000,
 **Verdict — Finding G CONFIRMED, and worse than originally written.** The vault's `asset()` is a *different* USDC than the one Core token 0 bridges to. Consequences, all now on-chain facts:
 
 1. `coreSpotUsdc()` (`HyperCoreVault.sol:351`, reads Core token 0) measures the vault's balance of a token that is **not** `asset()` — so that NAV term is not a faithful accounting of redeemable USDC.
-2. `pushToCore` / `pullFromCore` target the bridge `0x2000…0000`, which is **blacklisted** on the configured Circle USDC → both **revert** (`test_G_pushToCoreRevertsOnBlacklistedBridge`). The operator cannot deploy idle to Core *or* repatriate via the canonical bridge with this asset.
+2. `pushToCore` / `pullFromCore` target the bridge `0x2000…0000`, which is **blacklisted** on the configured Circle USDC → both **revert** (`test_G_legacyPushRevertsOnBlacklistedBridge`). The operator cannot deploy idle to Core via the LEGACY route with this asset. **(v1.5 G2: the official route is the CoreDepositWallet — see the v1.5 section below; this bullet records the pre-G2 state.)**
 3. This **resolves the README-vs-`e2e_runner.step_pull` contradiction in favour of the README/natspec** (`HyperCoreVault.sol:500-511`): the bridge is *not* usable for the shipped asset. Any prior "bridge works" observation must have used a different (linked) token or the manual `seed_vault_core.py` Core-side path — not `0xb883…630f`.
 
 Net: with the shipped configuration, the redemption queue can **never** realise Core-deployed value back into `asset()` through the canonical bridge. This is the deepest form of the liveness gap (Findings A/B/E) and a P0 blocker.
@@ -119,7 +119,7 @@ becomes the *fix* assertion).
 
 | Phase | Closes | Fork test(s) | Status |
 |---|---|---|:--:|
-| **C1 (+M5)** | G, decimals | `HyperVaultLinkage`: `test_C1_decimalsMismatchRevertsDeploy`, `test_C1_coreSpotUsdcNormalizesScale`, `…MultiplyBranch`, `test_C1_coreLinkUnverifiedFiresForShippedAsset`, `…noEventWhenLinkMatches`, `…matchingDecimalsDeploysClean` (6) | 🟢 PASS |
+| **C1 (+M5)** | G, decimals | `HyperVaultLinkage`: `test_C1_decimalsMismatchRevertsDeploy`, `test_C1_coreSpotUsdcNormalizesScale`, `…MultiplyBranch`, `test_C1_coreLinkUnverifiedFiresInLegacyMode`, `…noEventWhenLinkMatches`, `…matchingDecimalsDeploysClean` (6) | 🟢 PASS |
 | **H1** | H | `HyperVaultLiveness`: `test_H_navBootstrapGraceThenStrictFailsClosed` (flips old `test_H_strictNavReadsDefaultOffFailsOpen`), `test_H_depositRedeemWorkWhileBootstrapping` | 🟢 PASS |
 | **H2** | A, B, E, F (fairness) | `HyperVaultLiveness`: `test_A_pauseDoesNotFreezeRepatriation` (flips `test_A_pauseFreezesRefillPath`), `test_A_emergencyRepatriateWorksWhilePaused` (flips `test_A_emergencyRoleCannotRepatriate`), `test_F_overdueRequestReservesIdle`, `…prioritizeOverdueGuards`, `…fullReserveReleasedWhenNavFallsAfterPrioritize`, `…pushToCoreCannotDeployReservedIdle` | 🟢 PASS |
 | **H3** | C, I | `HyperVaultGovernance`: `test_C_shippedConfigNowDistinctWithRealDelay` (flips `test_C_shippedConfigCollapsesRolesAndTimelock`), `…factoryEnforcesTimelockFloor`, `…factoryRejectsSharedRoles`, `…factoryAcceptsCompliantConfig`, `…timelock24hGateBlocksThenAllows` | 🟢 PASS |
@@ -166,3 +166,45 @@ actors hold ~37 USDC + ~0.31 HYPE total (almost all on the deployer), which does
 support the plan's 10 independent per-phase spikes; a single consolidated spike
 sized to that budget is the fallback. See [`REDEMPTION_LIVE_RUNBOOK.md`](REDEMPTION_LIVE_RUNBOOK.md).
 Record the real tx hashes + `status==1` confirmations here once run.
+**(v1.5 note: Scenario C below subsumes the C1/Path-B item — the round trip now goes
+through the official wallet, no treasury hop — and provides the funded substrate for
+the H1 strict-read check; F/Q4 remain provable via the Core-seed method whenever a
+NAV>idle re-proof is wanted.)**
+
+## v1.5 G2 — pushToCore via Circle's CoreDepositWallet (2026-06-12)
+
+**The Finding-G narrative is corrected:** `tokenInfo(0).evmContract = 0x6B9E…0A24` is not
+a competing/broken USDC — it is **Circle's CoreDepositWallet**, the official USDC
+EVM<->Core bridge (live 2025-12-08; EIP-1967 proxy, impl `CoreDepositWallet`, deployed by
+`Circle: Deployer` 2025-11-18; holds the EVM reserve backing all Core USDC — HL's own
+backing accounting sums the Arbitrum bridge plus this contract). It reverts every ERC-20
+view *because it is not a token*; Circle blacklisted `0x2000…0000` on the USDC token to
+force the wallet path. The pre-G2 facts (legacy push reverts; `0x6B9E…0A24` not
+ERC-4626-usable as an asset) remain true and pinned by tests.
+
+v1.5 change set: `pushToCore` = `forceApprove + deposit(amount, CORE_SPOT_DEX_ID)` +
+zero-approve; `Config.coreDepositWallet` immutable with three-layer deploy validation
+(`wallet.token()`, `wallet.tokenSystemAddress()`, `tokenInfo.evmContract` →
+`CoreLinkVerified` / `CoreLinkMismatch`); `pullFromCore` byte-identical (proven below);
+legacy mode (`address(0)`) preserved.
+
+| Claim | Test | Status | Substrate |
+|---|---|:--:|---|
+| push deposits into the REAL wallet (custody + event + zero residual allowance) | `test_G2_pushDepositsViaWallet` | 🟢 PASS | fork (real wallet bytecode) |
+| wallet emits its Core-credit logs during deposit | `test_G2_pushEmitsWalletLogs` | 🟢 PASS | fork |
+| zero-amount push reverts inside the wallet | `test_G2_pushZeroAmountReverts` | 🟢 PASS | fork |
+| H2 available-idle guard fires before any wallet interaction | `test_G2_pushExceedingAvailableIdleReverts` | 🟢 PASS | fork |
+| `pullFromCore` action bytes byte-identical to v1.4 | `test_G2_pullEncodingUnchanged` | 🟢 PASS | fork |
+| wallet-mode deploy validation (token / system address / linkage, `CoreLinkVerified`) | `test_G2_walletTokenMismatchRevertsDeploy`, `test_G2_walletSystemAddressMismatchRevertsDeploy`, `test_G2_realWalletDeploysClean`, `test_G2_coreLinkMismatchRevertsDeploy`, `test_G2_coreLinkVerifiedEmitsWhenResolved` | 🟢 PASS | fork |
+| legacy route preserved + still dead for mainnet USDC | `test_G2_legacyPushStillTransfersToSystemAddress` (unit), `test_G_legacyPushRevertsOnBlacklistedBridge` (fork) | 🟢 PASS | unit + fork |
+| residual-allowance zeroing vs a misbehaving wallet | `test_G2_pushClearsResidualAllowance` | 🟢 PASS | unit |
+| Core spot credit appears after a wallet push | `test_G2_coreSpotCreditAppears_provenInLiveSpike` | ⏳ live-only | **Scenario C** |
+| wallet pays native USDC to vault idle on a Core-side send | `test_G2_walletPayoutOnPull_provenInLiveSpike` | ⏳ live-only | **Scenario C** |
+
+Post-G2 fork suite: **54 passed, 0 failed, 4 skipped** (F, Q4, and the two Scenario-C
+stubs above). Linkage read (`resolve_usdc_linkage.py`, v1.5 three-verdict version):
+**WALLET-LINKED** — wallet `token() == 0xb883…630f`, `tokenSystemAddress() ==
+0x2000…0000`, `paused() == false`, reserve ≈ $4.87B (2026-06-12).
+
+**Scenario C tx-hash table:** _pending — to be recorded here when the funded round trip
+runs (the merge gate for `fix/G2-coredepositwallet-bridge`)._

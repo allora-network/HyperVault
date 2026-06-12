@@ -1,5 +1,35 @@
 # Security Notes (Audit Prep)
 
+## v1.5 G2 — the USDC crossing is now the official CoreDepositWallet route (read first)
+
+Finding G's terminal interpretation is **superseded** (2026-06-12). `tokenInfo(0).evmContract`
+(`0x6B9E…0A24`) is not a broken ERC-20 linkage: it is **Circle's CoreDepositWallet**, the
+official USDC EVM<->Core bridge, live since 2025-12-08 and holding the EVM-side reserve that
+backs all Core USDC (Hyperliquid's own published backing accounting cites it). It is not an
+ERC-20 — all ERC-20 views revert on it by design. Circle blacklisted the system address
+`0x2000…0000` on the USDC token precisely to force the wallet path (a direct transfer would
+be a one-way burn).
+
+- **Push (EVM->Core):** `pushToCore` now runs `forceApprove + deposit(amount, CORE_SPOT_DEX_ID)`
+  against the wallet (credit lands on the vault's Core SPOT balance — the `coreSpotUsdc()` NAV
+  leg), then zeroes the allowance. `coreDepositWallet` is a per-vault **immutable** validated
+  three ways at deploy: `wallet.token() == asset()`, `wallet.tokenSystemAddress() ==
+  forToken(coreUsdcIndex)`, and `tokenInfo.evmContract == wallet` when the precompile resolves
+  (success emits `CoreLinkVerified`; mismatch reverts `CoreLinkMismatch`). `address(0)` =
+  legacy HIP-1 mode for genuinely direct-linked assets (warn-only `CoreLinkUnverified` kept).
+- **Pull (Core->EVM):** byte-identical to v1.4 — the Core-side `spot_send` to the system
+  address now triggers the wallet's system-guarded `transfer()`, paying native USDC from its
+  reserve to the vault's EVM idle.
+- **Trust model:** the wallet is Circle-operated, EIP-1967-upgradeable, and pausable —
+  issuer-trust class (the same trust as holding USDC at all). **Both directions stop while
+  the wallet is paused** (`deposit` and the payout hook are `whenNotPaused`): monitor
+  `paused()` + the implementation slot; `operatorRecoverSpot`/`emergencyRepatriate` remain
+  the contingency (Path B demotes from primary route to fallback).
+- **Proofs:** the EVM half runs against the REAL wallet bytecode on fork
+  (`test/fork/HyperVaultCoreDepositWallet.fork.t.sol`); the Core credit + payout are
+  live-only and proven by Scenario C (`REDEMPTION_LIVE_RUNBOOK.md`), recorded in
+  `FORK_PROOFS.md` §"v1.5 G2".
+
 ## v1.4 audit remediation (read first)
 
 The pre-audit review (vs the audited `Gauge4626.sol`) produced 11 findings, all
@@ -15,7 +45,9 @@ changed and which claims below are now superseded:
   an `evmContract != asset()` mismatch is non-fatal but emits `CoreLinkUnverified`).
   Realising Core value uses **Path B** (`operatorRecoverSpot → treasury → re-deposit`),
   so `coreSpotUsdc()` is **operator-recoverable NAV** carrying an explicit ~1:1
-  cross-token assumption — NOT trustless bridge value.
+  cross-token assumption — NOT trustless bridge value. **(Superseded by v1.5 G2 above:
+  `0x6b9e…0a24` turned out to be the official bridge itself; `coreSpotUsdc()` is
+  bridgeable NAV again and Path B is the contingency.)**
 - **H1 (strict NAV).** Strict precompile reads are now the **default** for a live
   vault, behind a one-way `navBootstrap` grace the admin clears (`endNavBootstrap()`)
   after Core init. Once strict, a precompile revert fails NAV **closed** (no silent
@@ -24,10 +56,11 @@ changed and which claims below are now superseded:
   longer `whenNotPaused`** (they only move funds toward idle), and `EMERGENCY_ROLE`
   gets `emergencyRepatriate(...)` — a paused / operator-dark vault can still drain
   Core→idle. Overdue withdrawal requests can be `prioritizeOverdue`-reserved against
-  racing redeems (on-chain SLA). **Honest scope:** with the bridge dead (C1), no
-  contract can *permissionlessly* pull Core→EVM; the SLA enforces fairness over
-  existing idle and surfaces operator stalls — actual repatriation still needs the
-  operator or the EMERGENCY hatch (a venue limitation, see `vaults.md` §6.3).
+  racing redeems (on-chain SLA). **Honest scope (revised by G2):** repatriation is
+  contract-to-contract again via `pullFromCore`, but it remains OPERATOR-gated; no
+  *permissionless* Core→EVM pull exists yet. The SLA enforces fairness over existing
+  idle and surfaces operator stalls — a permissionless escape-gated pull is scoped in
+  `ESCAPE_HATCH_SCOPE.md` (leg 4a), unblocked by the G2 route.
 - **H3 (governance).** Factory + `Deploy.s.sol` reject a sub-24h timelock delay and
   shared operator/emergency/feeRecipient keys on mainnet. The tier configs ship three
   distinct roles + 86400s — **production MUST replace the placeholder role addresses
@@ -82,7 +115,7 @@ changed and which claims below are now superseded:
 | `requestWithdraw`, `cancelWithdrawRequest`, `fulfillWithdraw` | anyone | `fulfillWithdraw` is keeper-friendly |
 | `placeLimitOrder` | `OPERATOR_ROLE` | `whenNotPaused`, whitelist + slippage + leverage gates |
 | `cancelOrderByCloid` | `OPERATOR_ROLE` | No gates |
-| `pushToCore` | `OPERATOR_ROLE` | `whenNotPaused` (deploys idle→Core); cannot deploy reserved idle (H2) |
+| `pushToCore` | `OPERATOR_ROLE` | `whenNotPaused` (deploys idle→Core); cannot deploy reserved idle (H2); wallet mode = approve+deposit on the CoreDepositWallet, zero residual allowance (G2) |
 | `pullFromCore` | `OPERATOR_ROLE` | **NOT** `whenNotPaused` (H2 — Core→idle refill must survive a pause) |
 | `usdSpotToPerp` | `OPERATOR_ROLE` | `whenNotPaused` (deploys into the market) |
 | `usdPerpToSpot` | `OPERATOR_ROLE` | **NOT** `whenNotPaused` (H2 — moves equity toward idle) |

@@ -68,7 +68,9 @@ tx = vault.functions.cancelOrderByCloid(asset=0, cloid=42).build_transaction(...
 ### Move funds: EVM USDC ⇄ Core spot ⇄ Perp margin
 
 ```python
-# EVM → Core spot
+# EVM → Core spot. v1.5 (G2): internally approve + deposit on Circle's
+# CoreDepositWallet (the ERC20 Transfer goes to the wallet, not 0x2000…);
+# the vault's Core SPOT balance is credited within ~1 Core block.
 vault.functions.pushToCore(amount=50_000_000000).transact()  # 50k USDC at 6dp
 
 # Core spot → perp margin
@@ -77,11 +79,17 @@ vault.functions.usdSpotToPerp(ntl=50_000_000000).transact()
 # Perp → spot
 vault.functions.usdPerpToSpot(ntl=50_000_000000).transact()
 
-# Core spot → EVM
+# Core spot → EVM. Unchanged by G2 — the Core-side send to the system address;
+# the CoreDepositWallet pays native USDC from its reserve to the vault.
 vault.functions.pullFromCore(amountWei=50_000_00000000).transact()  # 50k USDC at 8dp (Core wei)
 ```
 
 ⚠ `pullFromCore` takes **Core wei** (8dp for USDC), not EVM wei (6dp). All other operator functions use 6dp.
+
+⚠ **G2 operational notes:** the CoreDepositWallet is Circle-operated and pausable — if
+`wallet.paused()` is true, BOTH `pushToCore` and the pull payout stall until Circle
+unpauses (monitor it; `e2e_runner.py --steps wallet_status` prints it). The vault leaves
+zero standing allowance to the wallet between pushes.
 
 ## Reconciliation
 
@@ -103,7 +111,7 @@ The live runner should:
 | `OrderCancelByCloidSubmitted` | `response.data.statuses[i].success` | HL returns `{"status": "ok"}` per-cancel |
 | `OrderCancelByOidSubmitted` | same as above | Emergency path |
 | `UsdClassTransferSubmitted` | `response.status` for `usdClassTransfer` action | |
-| `BridgeDeposit` | ERC20 `Transfer` from vault → bridge address | The HL system tx that credits Core spot is opaque from EVM |
+| `BridgeDeposit` | ERC20 `Transfer` from vault → **CoreDepositWallet** (v1.5 G2; legacy mode: → bridge address) | Core spot credit driven by the wallet's synthetic Transfer log; confirm via HL API / `coreSpotUsdc()` |
 | `BridgeWithdraw` | A `spot_send` action of `(bridge, USDC, amount)` | Settled by HL within ~1 block |
 | `NavSnapshot` | computed off-chain previously | Now emitted directly |
 
