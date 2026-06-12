@@ -7,6 +7,8 @@ import {TimelockController} from "@openzeppelin/contracts/governance/TimelockCon
 
 import {HyperVaultBaseForkTest} from "./HyperVaultBase.fork.t.sol";
 import {HyperCoreVault} from "../../src/HyperCoreVault.sol";
+import {HyperCoreVaultFactory} from "../../src/HyperCoreVaultFactory.sol";
+import {HyperCoreVaultRegistry} from "../../src/HyperCoreVaultRegistry.sol";
 
 /// @title  Governance / deploy-config finding proofs (C, I)
 /// @notice Ties the findings to the ACTUAL shipped artifact: each test reads
@@ -22,6 +24,7 @@ contract HyperVaultGovernanceForkTest is HyperVaultBaseForkTest {
             asset: IERC20(USDC),
             coreUsdcIndex: 0,
             coreUsdcDecimals: 8,
+            coreDepositWallet: address(0), // governance proofs are route-orthogonal
             name: "Gov Proof Vault",
             symbol: "gpv",
             admin: admin_,
@@ -39,45 +42,157 @@ contract HyperVaultGovernanceForkTest is HyperVaultBaseForkTest {
     }
 
     // ───────────────────────────────────────────────────────────────────────
-    // Finding C — Shipped config collapses operator/emergency/feeRecipient into one key,
-    //             and the 0-delay timelock offers no protection (instant execution).
-    //   Source:  deployments/configs/mainnet-tier1.json (operator==emergencyAdmin==
-    //            feeRecipient; timelockMinDelaySec == 0).
-    //   Fork-provable: FULL (real OZ TimelockController + vault bytecode).
+    // Finding C remediation (H3) — the shipped config no longer collapses roles or
+    //   ships a 0-delay timelock, and the deploy surfaces (factory + Deploy.s.sol)
+    //   refuse to mint that footgun. Three proofs: (1) the fixed tier1 artifact,
+    //   (2) the factory floor + distinct-role guards revert on real bytecode,
+    //   (3) a real 24h TimelockController gates an admin change (blocks then allows).
     // ───────────────────────────────────────────────────────────────────────
-    function test_C_shippedConfigCollapsesRolesAndTimelock() public {
+
+    function _factory() internal returns (HyperCoreVaultFactory f) {
+        HyperCoreVaultRegistry reg = new HyperCoreVaultRegistry(address(this));
+        f = new HyperCoreVaultFactory(reg, address(this), false);
+        reg.setFactory(address(f));
+    }
+
+    function _facCfg(address op, address em, address fee) internal view returns (HyperCoreVault.Config memory cfg) {
+        cfg = HyperCoreVault.Config({
+            asset: IERC20(USDC),
+            coreUsdcIndex: 0,
+            coreUsdcDecimals: 8,
+            coreDepositWallet: address(0), // governance proofs are route-orthogonal
+            name: "Factory Vault",
+            symbol: "facv",
+            admin: address(0), // factory overwrites with the per-vault timelock
+            operator: op,
+            emergencyAdmin: em,
+            feeRecipient: fee,
+            leverageCapBps: 0,
+            slippageBandBps: 0,
+            mgmtFeeAnnualBps: 0,
+            perfFeeBps: 0,
+            depositCap: type(uint256).max,
+            maxDepositPerAddress: 0
+        });
+    }
+
+    function test_C_shippedConfigNowDistinctWithRealDelay() public {
         _skipIfNoFork();
-
-        // (1) Prove the collapse is in the SHIPPED artifact, not invented here.
         string memory json = vm.readFile(TIER1);
-        address cfgOperator = vm.parseJsonAddress(json, ".operator");
-        address cfgEmergency = vm.parseJsonAddress(json, ".emergencyAdmin");
-        address cfgFeeRecipient = vm.parseJsonAddress(json, ".feeRecipient");
-        uint256 cfgDelay = vm.parseJsonUint(json, ".timelockMinDelaySec");
-        assertEq(cfgOperator, cfgEmergency, "shipped config: operator == emergencyAdmin");
-        assertEq(cfgOperator, cfgFeeRecipient, "shipped config: operator == feeRecipient");
-        assertEq(cfgDelay, 0, "shipped config: timelockMinDelaySec == 0");
-        console2.log("C: shipped tier1 single key =", cfgOperator);
+        address op = vm.parseJsonAddress(json, ".operator");
+        address em = vm.parseJsonAddress(json, ".emergencyAdmin");
+        address fee = vm.parseJsonAddress(json, ".feeRecipient");
+        uint256 delay = vm.parseJsonUint(json, ".timelockMinDelaySec");
+        assertTrue(op != em && op != fee && em != fee, "tier1: roles now distinct (H3)");
+        assertGe(delay, 24 hours, "tier1: timelock delay now >= 24h (H3)");
+        console2.log("C PASS - shipped tier1 config: distinct roles + >=24h timelock (H3)");
+    }
 
-        // (2) Reproduce the real topology on the fork: a 0-delay timelock as admin, with the
-        //     same address holding OPERATOR + EMERGENCY + feeRecipient.
-        address[] memory selfArr = new address[](1);
-        selfArr[0] = address(this); // the "deployer" (proposer + executor), as in Deploy.s.sol
-        TimelockController tl = new TimelockController(cfgDelay, selfArr, selfArr, address(this));
-        HyperCoreVault v = _deployWithSharedKey(address(tl), cfgOperator);
+    function test_C_factoryEnforcesTimelockFloor() public {
+        _skipIfNoFork();
+        HyperCoreVaultFactory f = _factory();
+        HyperCoreVault.Config memory cfg = _facCfg(operator, emergency, feeRecipient); // distinct roles
 
-        // Role collapse: one key can trade, trigger emergency, AND receive fees.
-        assertTrue(v.hasRole(v.OPERATOR_ROLE(), cfgOperator), "single key holds OPERATOR_ROLE");
-        assertTrue(v.hasRole(v.EMERGENCY_ROLE(), cfgOperator), "single key holds EMERGENCY_ROLE");
-        assertEq(v.feeRecipient(), cfgOperator, "single key is the feeRecipient");
+        vm.expectRevert(
+            abi.encodeWithSelector(HyperCoreVaultFactory.TimelockDelayBelowFloor.selector, uint256(0), uint256(24 hours))
+        );
+        f.deployVault(cfg, 0);
 
-        // 0-delay timelock = no protection: schedule + execute a guardrail change in ONE block.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                HyperCoreVaultFactory.TimelockDelayBelowFloor.selector, uint256(23 hours), uint256(24 hours)
+            )
+        );
+        f.deployVault(cfg, 23 hours);
+
+        console2.log("C PASS - factory rejects sub-24h timelock delay (H3)");
+    }
+
+    function test_C_factoryRejectsSharedRoles() public {
+        _skipIfNoFork();
+        HyperCoreVaultFactory f = _factory();
+        address single = makeAddr("single");
+
+        vm.expectRevert(HyperCoreVaultFactory.RolesNotDistinct.selector);
+        f.deployVault(_facCfg(single, single, single), 24 hours);
+
+        // partial overlap also rejected (operator == feeRecipient)
+        vm.expectRevert(HyperCoreVaultFactory.RolesNotDistinct.selector);
+        f.deployVault(_facCfg(single, makeAddr("em"), single), 24 hours);
+
+        console2.log("C PASS - factory rejects shared operator/emergency/feeRecipient keys (H3)");
+    }
+
+    function test_C_factoryAcceptsCompliantConfig() public {
+        _skipIfNoFork();
+        HyperCoreVaultFactory f = _factory();
+        (address vaultAddr, address timelock) =
+            f.deployVault(_facCfg(operator, emergency, feeRecipient), 24 hours);
+        assertTrue(vaultAddr != address(0) && timelock != address(0), "compliant config deploys");
+        assertEq(HyperCoreVault(vaultAddr).feeRecipient(), feeRecipient, "feeRecipient wired");
+        console2.log("C PASS - factory deploys a compliant (distinct roles + 24h) config (H3)");
+    }
+
+    function test_C_timelock24hGateBlocksThenAllows() public {
+        _skipIfNoFork();
+        uint256 delay = 24 hours;
+        address[] memory self = new address[](1);
+        self[0] = address(this);
+        TimelockController tl = new TimelockController(delay, self, self, address(this));
+        // Role separation is tested above; here we isolate the TIMELOCK gate, so a
+        // single operating key under a real 24h timelock is fine for the proof.
+        HyperCoreVault v = _deployWithSharedKey(address(tl), makeAddr("single"));
+
         bytes memory data = abi.encodeCall(HyperCoreVault.setLeverageCap, (uint16(123)));
-        tl.schedule(address(v), 0, data, bytes32(0), bytes32(0), 0);
-        tl.execute(address(v), 0, data, bytes32(0), bytes32(0));
-        assertEq(v.leverageCapBps(), 123, "0-delay timelock executed an admin change with zero notice");
+        bytes32 salt = bytes32(uint256(1));
+        tl.schedule(address(v), 0, data, bytes32(0), salt, delay);
 
-        console2.log("C PASS - role collapse + 0-delay timelock execute instantly (no protection window)");
+        // Before the delay elapses, execution reverts (operation not ready).
+        vm.expectRevert();
+        tl.execute(address(v), 0, data, bytes32(0), salt);
+
+        // After 24h, the same execution succeeds.
+        vm.warp(block.timestamp + delay + 1);
+        tl.execute(address(v), 0, data, bytes32(0), salt);
+        assertEq(v.leverageCapBps(), 123, "admin change executed only after the 24h timelock");
+
+        console2.log("C PASS - real 24h TimelockController blocks before delay, allows after (H3)");
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // L4 — factory + registry use Ownable2Step: a handoff (e.g. to a multisig)
+    //   requires the new owner to explicitly accept, preventing a fat-finger
+    //   transfer to a wrong/uncontrolled address.
+    // ───────────────────────────────────────────────────────────────────────
+    function test_L4_factoryOwnershipIsTwoStep() public {
+        _skipIfNoFork();
+        HyperCoreVaultFactory f = _factory(); // owner == address(this)
+        HyperCoreVaultRegistry reg = f.registry();
+        address newOwner = makeAddr("newOwner");
+
+        // Step 1: transfer is pending, ownership unchanged.
+        f.transferOwnership(newOwner);
+        assertEq(f.owner(), address(this), "factory owner unchanged until accepted");
+        assertEq(f.pendingOwner(), newOwner, "factory pending owner set");
+
+        // A non-pending account cannot accept.
+        vm.prank(attacker);
+        vm.expectRevert();
+        f.acceptOwnership();
+
+        // Step 2: the new owner accepts.
+        vm.prank(newOwner);
+        f.acceptOwnership();
+        assertEq(f.owner(), newOwner, "factory ownership transferred only after accept");
+
+        // Registry is likewise two-step.
+        reg.transferOwnership(newOwner);
+        assertEq(reg.owner(), address(this), "registry owner unchanged until accepted");
+        vm.prank(newOwner);
+        reg.acceptOwnership();
+        assertEq(reg.owner(), newOwner, "registry ownership transferred only after accept");
+
+        console2.log("L4 PASS - factory + registry ownership handoff is two-step (Ownable2Step)");
     }
 
     // ───────────────────────────────────────────────────────────────────────

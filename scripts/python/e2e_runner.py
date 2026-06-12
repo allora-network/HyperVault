@@ -88,6 +88,9 @@ def build_ctx(args: argparse.Namespace) -> Ctx:
          "outputs": [{"type": "bool"}]},
         {"type": "function", "name": "decimals", "stateMutability": "view",
          "inputs": [], "outputs": [{"type": "uint8"}]},
+        {"type": "function", "name": "allowance", "stateMutability": "view",
+         "inputs": [{"name": "o", "type": "address"}, {"name": "s", "type": "address"}],
+         "outputs": [{"type": "uint256"}]},
     ]
     vault = w3.eth.contract(address=vault_addr, abi=vault_abi)
     usdc = w3.eth.contract(address=usdc_addr, abi=erc20_abi)
@@ -134,6 +137,34 @@ def parse_event(ctx: Ctx, receipt: TxReceipt, event_name: str) -> Optional[dict]
     if not logs:
         return None
     return dict(logs[0]["args"])
+
+
+# Minimal ABI for Circle's CoreDepositWallet (audit G2) — read-only surface.
+WALLET_ABI = [
+    {"type": "function", "name": "token", "stateMutability": "view",
+     "inputs": [], "outputs": [{"type": "address"}]},
+    {"type": "function", "name": "tokenSystemAddress", "stateMutability": "view",
+     "inputs": [], "outputs": [{"type": "address"}]},
+    {"type": "function", "name": "paused", "stateMutability": "view",
+     "inputs": [], "outputs": [{"type": "bool"}]},
+]
+
+TOKEN_INFO_PRECOMPILE = "0x000000000000000000000000000000000000080C"
+
+
+def core_deposit_wallet(ctx: Ctx):
+    """The vault's configured CoreDepositWallet contract handle, or None (legacy mode)."""
+    addr = ctx.vault.functions.coreDepositWallet().call()
+    if int(addr, 16) == 0:
+        return None
+    return ctx.w3.eth.contract(address=Web3.to_checksum_address(addr), abi=WALLET_ABI)
+
+
+def token_info_evm_contract(ctx: Ctx, token_index: int = 0) -> str:
+    """Raw tokenInfo(index).evmContract via the live precompile (word 4 of the tuple body)."""
+    data = "0x" + format(token_index, "064x")
+    ret = ctx.w3.eth.call({"to": TOKEN_INFO_PRECOMPILE, "data": data})
+    return "0x" + ret[32 + 4 * 32 + 12 : 32 + 5 * 32].hex()
 
 
 def usdc_units(human: float) -> int:
@@ -199,6 +230,32 @@ def step_preflight(ctx: Ctx) -> bool:
     if alice_bal_usdc < usdc_units(ctx.deposit_usdc):
         ctx.console.print(f"[red]alice needs ≥ {ctx.deposit_usdc} USDC — drip from faucet[/red]")
         ok = False
+
+    # Audit G2: wallet-mode vaults must agree with the live chain before any push.
+    wallet = core_deposit_wallet(ctx)
+    if wallet is not None:
+        w_token = wallet.functions.token().call()
+        w_paused = wallet.functions.paused().call()
+        w_sys = wallet.functions.tokenSystemAddress().call()
+        reserve = ctx.usdc.functions.balanceOf(wallet.address).call() / 1e6
+        linked = token_info_evm_contract(ctx, 0).lower()
+        ctx.console.print(
+            f"coreDepositWallet: {wallet.address}  paused={w_paused}  reserve={reserve:,.2f} USDC"
+        )
+        if w_token.lower() != ctx.usdc_addr.lower():
+            ctx.console.print(f"[red]wallet.token() {w_token} != asset {ctx.usdc_addr}[/red]")
+            ok = False
+        if w_paused:
+            ctx.console.print("[red]CoreDepositWallet is PAUSED — both bridge directions stalled[/red]")
+            ok = False
+        if w_sys.lower() != "0x2000000000000000000000000000000000000000":
+            ctx.console.print(f"[red]wallet.tokenSystemAddress() unexpected: {w_sys}[/red]")
+            ok = False
+        if linked != wallet.address.lower():
+            ctx.console.print(f"[red]tokenInfo(0).evmContract {linked} != wallet — push/pull would diverge[/red]")
+            ok = False
+    else:
+        ctx.console.print("[yellow]legacy-mode vault (no CoreDepositWallet) — direct system-address route[/yellow]")
     return ok
 
 
@@ -246,24 +303,63 @@ def step_core_status(ctx: Ctx) -> bool:
     return True
 
 
+def step_wallet_status(ctx: Ctx) -> bool:
+    """Read-only: the CoreDepositWallet's live state + the vault's standing
+    allowance to it (must be 0 at rest — the push leaves none behind)."""
+    ctx.console.rule("[bold]CoreDepositWallet status (audit G2)")
+    wallet = core_deposit_wallet(ctx)
+    if wallet is None:
+        ctx.console.print("[yellow]legacy-mode vault — no CoreDepositWallet configured[/yellow]")
+        return True
+    reserve = ctx.usdc.functions.balanceOf(wallet.address).call() / 1e6
+    allowance = ctx.usdc.functions.allowance(ctx.vault_addr, wallet.address).call()
+    ctx.console.print(f"wallet:            {wallet.address}")
+    ctx.console.print(f"wallet.token():    {wallet.functions.token().call()}")
+    ctx.console.print(f"wallet.paused():   {wallet.functions.paused().call()}")
+    ctx.console.print(f"wallet reserve:    {reserve:,.2f} USDC")
+    ctx.console.print(f"vault->wallet allowance: {allowance} (must be 0 at rest)")
+    if allowance != 0:
+        ctx.failures.append("wallet_status: standing allowance to the wallet is non-zero")
+        return False
+    return True
+
+
 def step_push(ctx: Ctx) -> bool:
-    ctx.console.rule("[bold]push to Core (EVM USDC → Core spot)")
+    ctx.console.rule("[bold]push to Core (EVM USDC → Core spot, via CoreDepositWallet in wallet mode)")
     push_amount = int(usdc_units(ctx.deposit_usdc) * 0.8)
 
+    wallet = core_deposit_wallet(ctx)
+    wallet_before = ctx.usdc.functions.balanceOf(wallet.address).call() if wallet else 0
     spot_before = hl.spot_balance(ctx.info, ctx.vault_addr, 0)
     receipt = send_tx(ctx, ctx.operator, ctx.vault.functions.pushToCore(push_amount))
     ev = parse_event(ctx, receipt, "BridgeDeposit")
     ctx.console.print(f"BridgeDeposit event: {ev}")
 
+    if wallet:
+        wallet_after = ctx.usdc.functions.balanceOf(wallet.address).call()
+        ctx.console.print(
+            f"wallet reserve: {wallet_before/1e6:,.2f} → {wallet_after/1e6:,.2f} "
+            f"(+{(wallet_after-wallet_before)/1e6:.6f})"
+        )
+        if wallet_after - wallet_before != push_amount:
+            ctx.failures.append("push: wallet reserve delta != pushed amount")
+        idle_after_push = ctx.usdc.functions.balanceOf(ctx.vault_addr).call()
+        ctx.console.print(f"vault idle after push: {idle_after_push/1e6:.6f}")
+
+    # First credit to a fresh Core account can take a little longer (audit G2).
     expected_spot = spot_before + push_amount / 1e6
     ok = wait_for(
         lambda: hl.spot_balance(ctx.info, ctx.vault_addr, 0) >= expected_spot - 0.001,
-        timeout_s=20, label="core spot credit",
+        timeout_s=60, label="core spot credit",
     )
     spot_after = hl.spot_balance(ctx.info, ctx.vault_addr, 0)
     ctx.console.print(f"Core spot USDC: {spot_before:.6f} → {spot_after:.6f}")
-    on_chain_spot = ctx.vault.functions.coreSpotUsdc().call() / 1e6
-    ctx.console.print(f"vault.coreSpotUsdc(): {on_chain_spot:.6f}")
+    on_chain_spot = ctx.vault.functions.coreSpotUsdc().call()
+    ctx.console.print(f"vault.coreSpotUsdc(): {on_chain_spot/1e6:.6f}")
+    # The on-chain NAV leg (precompile) must agree with the HL API view.
+    if ok and abs(on_chain_spot / 1e6 - spot_after) > 0.01:
+        ctx.failures.append("push: coreSpotUsdc() precompile disagrees with HL API spot balance")
+        ok = False
     if not ok:
         ctx.failures.append("Core spot credit did not appear within timeout")
     return ok
@@ -427,17 +523,36 @@ def step_pull(ctx: Ctx) -> bool:
         ctx.console.print("[yellow]nothing to pull[/yellow]")
         return True
 
+    # Audit G2 (wallet mode): the Core-side send to the system address triggers the
+    # CoreDepositWallet's system-guarded transfer() — native USDC paid from its
+    # reserve to the vault. Record the reserve to prove payout provenance.
+    wallet = core_deposit_wallet(ctx)
+    wallet_before = ctx.usdc.functions.balanceOf(wallet.address).call() if wallet else 0
+
     idle_before = ctx.usdc.functions.balanceOf(ctx.vault_addr).call()
     receipt = send_tx(ctx, ctx.operator, ctx.vault.functions.pullFromCore(pull_amount_wei))
     ev = parse_event(ctx, receipt, "BridgeWithdraw")
     ctx.console.print(f"BridgeWithdraw event: {ev}")
 
+    expected_evm = pull_amount_wei // 100  # Core 8dp wei -> EVM 6dp units
     ok = wait_for(
         lambda: ctx.usdc.functions.balanceOf(ctx.vault_addr).call() > idle_before,
-        timeout_s=30, label="ERC20 credit to vault from bridge",
+        timeout_s=60, label="ERC20 credit to vault from bridge",
     )
     idle_after = ctx.usdc.functions.balanceOf(ctx.vault_addr).call()
-    ctx.console.print(f"vault idle USDC: {idle_before/1e6:.6f} → {idle_after/1e6:.6f}")
+    ctx.console.print(
+        f"vault idle USDC: {idle_before/1e6:.6f} → {idle_after/1e6:.6f} "
+        f"(expected +{expected_evm/1e6:.6f})"
+    )
+    if ok and abs((idle_after - idle_before) - expected_evm) > 10_000:  # $0.01 dust tolerance
+        ctx.failures.append("pull: idle delta != floor(amountWei/100)")
+        ok = False
+    if wallet:
+        wallet_after = ctx.usdc.functions.balanceOf(wallet.address).call()
+        ctx.console.print(
+            f"wallet reserve: {wallet_before/1e6:,.2f} → {wallet_after/1e6:,.2f} "
+            f"({(wallet_after-wallet_before)/1e6:+.6f}) — payout provenance"
+        )
     if not ok:
         ctx.failures.append("bridge did not credit ERC20 within timeout")
     return ok
@@ -550,47 +665,59 @@ def step_operator_repatriate(ctx: Ctx) -> bool:
     try:
         send_tx(ctx, ctx.operator, ctx.vault.functions.pullFromCore(spot_core_wei))
     except Exception as e:
-        # Finding G: for an asset whose Core bridge address (0x2000..0000) is blacklisted
-        # (the shipped 0xb883..630f USDC), pullFromCore REVERTS — repatriation via the
-        # canonical bridge is impossible, so the queue can never be funded from Core.
-        ctx.console.print(f"[red]pullFromCore reverted — Finding G (bridge unusable for this asset): {e}[/red]")
-        ctx.failures.append(f"repatriate: pullFromCore reverted (Finding G): {e}")
+        # Audit G2: for a wallet-mode vault this should NOT revert (the Core-side
+        # send is fire-and-forget; the CoreDepositWallet pays the EVM side). A
+        # revert here is only expected for a LEGACY vault on a blacklisted asset
+        # (the original Finding-G posture) or an unrelated tx failure.
+        ctx.console.print(f"[red]pullFromCore reverted (legacy/blacklisted asset, or tx failure): {e}[/red]")
+        ctx.failures.append(f"repatriate: pullFromCore reverted: {e}")
         return False
     ok = wait_for(lambda: ctx.usdc.functions.balanceOf(ctx.vault_addr).call() > idle_before,
-                  timeout_s=30, label="bridge credit to vault idle")
+                  timeout_s=60, label="bridge credit to vault idle")
     idle_after = ctx.usdc.functions.balanceOf(ctx.vault_addr).call()
     ctx.console.print(f"vault idle USDC: {idle_before/1e6:.6f} → {idle_after/1e6:.6f}")
     if not ok:
-        ctx.failures.append("repatriate: bridge did not credit idle (Finding G)")
+        ctx.failures.append("repatriate: bridge did not credit idle (wallet paused? legacy asset?)")
     return ok
 
 
 def step_pause_freeze_check(ctx: Ctx) -> bool:
-    ctx.console.rule("[bold]pause-freeze check (Finding A: paused vault cannot repatriate)")
-    # Needs the caller to hold EMERGENCY_ROLE (the shipped single-key config has operator
-    # == emergencyAdmin). Pause, attempt pullFromCore (expect revert), then unpause.
+    ctx.console.rule("[bold]pause posture check (H2: paused vault CAN repatriate; deploy stays blocked)")
+    # Pre-H2 this step proved Finding A (pull reverting EnforcedPause, live 2026-06-03).
+    # Post-remediation the expectation FLIPS: pullFromCore (Core->EVM, no market risk)
+    # must SUCCEED while paused; usdSpotToPerp (deploys risk) must still revert.
+    # Needs the caller to hold EMERGENCY_ROLE (throwaway configs: operator == emergency).
     try:
         send_tx(ctx, ctx.operator, ctx.vault.functions.pause())
     except Exception as e:
         ctx.console.print(f"[yellow]pause failed (operator lacks EMERGENCY_ROLE?): {e}[/yellow]")
         return True
-    reverted = False
+    pull_ok = True
+    deploy_blocked = False
     try:
         send_tx(ctx, ctx.operator, ctx.vault.functions.pullFromCore(1))
+    except Exception as e:
+        pull_ok = False
+        ctx.console.print(f"[red]pullFromCore reverted while paused (H2 regression): {e}[/red]")
+    try:
+        send_tx(ctx, ctx.operator, ctx.vault.functions.usdSpotToPerp(1))
     except Exception:
-        reverted = True
+        deploy_blocked = True
     send_tx(ctx, ctx.operator, ctx.vault.functions.unpause())
-    ctx.console.print(f"pullFromCore while paused reverted: {reverted}")
-    if not reverted:
-        ctx.failures.append("pause-freeze: pullFromCore did NOT revert while paused")
-    return reverted
+    ctx.console.print(f"pullFromCore while paused succeeded: {pull_ok}")
+    ctx.console.print(f"usdSpotToPerp while paused blocked:  {deploy_blocked}")
+    if not pull_ok:
+        ctx.failures.append("pause posture: pullFromCore reverted while paused (H2 regression)")
+    if not deploy_blocked:
+        ctx.failures.append("pause posture: usdSpotToPerp was NOT blocked while paused")
+    return pull_ok and deploy_blocked
 
 
 # -----------------------------------------------------------------------------
 # Orchestration
 # -----------------------------------------------------------------------------
 
-ALL_STEPS = ["preflight", "deposit", "core_status", "push", "spot_to_perp",
+ALL_STEPS = ["preflight", "deposit", "core_status", "wallet_status", "push", "spot_to_perp",
              "place", "cancel", "fill", "perp_to_spot", "pull", "redeem"]
 
 # Redemption-loop steps — selected explicitly via --steps (not part of the default run).
@@ -644,6 +771,8 @@ def main() -> int:
                 step_deposit(ctx)
             elif step == "core_status":
                 step_core_status(ctx)
+            elif step == "wallet_status":
+                step_wallet_status(ctx)
             elif step == "push":
                 step_push(ctx)
             elif step == "spot_to_perp":

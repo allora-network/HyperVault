@@ -7,6 +7,7 @@ import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 import {HyperVaultBaseForkTest} from "./HyperVaultBase.fork.t.sol";
+import {HyperCoreVault} from "../../src/HyperCoreVault.sol";
 import {IHyperCoreVault} from "../../src/interfaces/IHyperCoreVault.sol";
 import {PrecompileLib} from "../../src/libraries/PrecompileLib.sol";
 import {Constants} from "../../src/libraries/Constants.sol";
@@ -347,17 +348,26 @@ contract HyperVaultLivenessForkTest is HyperVaultBaseForkTest {
     //         e2e_runner.step_pull contradiction in favour of the README/natspec.
     //   Fork-provable: the bridge-blacklist half is FULL; the linkage half is the live read.
     // ───────────────────────────────────────────────────────────────────────
-    function test_G_pushToCoreRevertsOnBlacklistedBridge() public {
+    function test_G_legacyPushRevertsOnBlacklistedBridge() public {
         _skipIfNoFork();
 
-        _deposit(alice, 100e6); // vault holds 100e6 idle to push
+        // Audit G2: the default vault now routes pushes via the CoreDepositWallet.
+        // This test pins the ORIGINAL Finding-G fact on an explicit LEGACY vault
+        // (no wallet): the direct ERC20-to-system-address route remains dead for
+        // natively-minted USDC — the documented reason the wallet route exists.
+        HyperCoreVault legacy = _deployVaultWithWallet(0, 0, address(0));
+        deal(USDC, alice, 100e6);
+        vm.startPrank(alice);
+        IERC20(USDC).approve(address(legacy), 100e6);
+        legacy.deposit(100e6, alice);
+        vm.stopPrank();
 
         vm.prank(operator);
         vm.expectRevert(bytes("Blacklistable: account is blacklisted"));
-        vault.pushToCore(100e6);
+        legacy.pushToCore(100e6);
 
-        console2.log("G PASS - pushToCore reverts: configured USDC blacklists the Core bridge 0x2000..0000");
-        console2.log("         => canonical EVM<->Core USDC bridge is non-functional for the shipped asset");
+        console2.log("G PASS - LEGACY pushToCore reverts: Circle USDC blacklists the bridge 0x2000..0000");
+        console2.log("         => the official route is the CoreDepositWallet (G2); see HyperVaultCoreDepositWallet suite");
     }
 
     // ───────────────────────────────────────────────────────────────────────

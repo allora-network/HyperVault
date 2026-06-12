@@ -6,6 +6,8 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {HyperVaultBaseForkTest} from "./HyperVaultBase.fork.t.sol";
 import {IHyperCoreVault} from "../../src/interfaces/IHyperCoreVault.sol";
+import {PrecompileLib} from "../../src/libraries/PrecompileLib.sol";
+import {Constants} from "../../src/libraries/Constants.sol";
 
 /// @title  Withdrawal-queue accounting proofs (forked HyperEVM mainnet, real USDC)
 /// @notice These are deterministic unit tests of the bespoke escrow queue
@@ -191,5 +193,73 @@ contract HyperVaultQueueAccountingForkTest is HyperVaultBaseForkTest {
         assertEq(_idle(), idleBefore, "no idle moved");
         assertEq(vault.pendingWithdrawalShares(bob), 0, "no request created");
         console2.log("Q7 PASS - fulfillWithdraw on an LP with no request is a clean no-op");
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // M2 — deposit/withdraw-request mutual exclusion. A deposit into an LP with an
+    //   open request would double-count the escrowed shares' basis on the fulfill
+    //   path (perf-fee over-charge). The deposit is now blocked; the LP must cancel
+    //   first, so the inconsistent-basis state is unreachable.
+    // ───────────────────────────────────────────────────────────────────────
+    function test_M2_depositBlockedWhileRequestOpen() public {
+        _skipIfNoFork();
+
+        uint256 shares = _deposit(alice, 100e6);
+        vm.startPrank(alice);
+        vault.requestWithdraw(shares); // escrow all shares -> request open
+
+        deal(USDC, alice, 10e6);
+        IERC20(USDC).approve(address(vault), 10e6);
+        vm.expectRevert(abi.encodeWithSelector(IHyperCoreVault.PendingRequestBlocksDeposit.selector, alice));
+        vault.deposit(10e6, alice);
+
+        // Cancelling the request unblocks deposits again.
+        vault.cancelWithdrawRequest();
+        vault.deposit(10e6, alice);
+        vm.stopPrank();
+
+        assertGt(vault.balanceOf(alice), shares, "deposit allowed once the request is cancelled");
+        console2.log("M2 PASS - deposit blocked while a request is open; allowed after cancel");
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // M3 — maxRedeem ERC-4626 conformance. Plain maxRedeem returns the full
+    //   balance, but redeem partial-fills below previewRedeem when idle is short,
+    //   so a naive integrator gets less than previewRedeem(maxRedeem). The cap
+    //   makes previewRedeem(maxRedeem) honored (no silent partial).
+    //
+    //   Substrate note: "idle < claim" needs NAV > idle (capital on Core), which
+    //   a fork can't serve from the precompile — but this is a pure-EVM accounting
+    //   invariant (not a Core-behaviour claim), so we mock the spotBalance read to
+    //   create NAV > idle, exactly as the C1 linkage test does for its math.
+    // ───────────────────────────────────────────────────────────────────────
+    function test_M3_maxRedeemHonorsPreviewWhenIdleShort() public {
+        _skipIfNoFork();
+        vault = _deployVault(0, 0); // no fee -> returned assets == previewRedeem exactly
+
+        uint256 aShares = _deposit(alice, 100e6); // idle = 100e6
+
+        // Mock Core spot = 100 USDC (8dp wei) -> coreSpotUsdc 100e6 -> NAV 200e6 > idle 100e6.
+        PrecompileLib.SpotBalance memory bal = PrecompileLib.SpotBalance({total: 100_000_000_00, hold: 0, entryNtl: 0});
+        vm.mockCall(Constants.SPOT_BALANCE_PRECOMPILE, abi.encode(address(vault), uint64(0)), abi.encode(bal));
+        assertEq(vault.coreSpotUsdc(), 100e6, "mocked Core balance");
+        assertEq(vault.totalAssets(), 200e6, "NAV > idle (capital parked on Core)");
+        assertEq(_idle(), 100e6, "idle is half of NAV");
+
+        uint256 mr = vault.maxRedeem(alice);
+        assertLt(mr, aShares, "maxRedeem capped below full balance when idle is short");
+        uint256 previewed = vault.previewRedeem(mr);
+        assertLe(previewed, _idle(), "previewRedeem(maxRedeem) fits within idle (no partial)");
+
+        uint256 sharesBefore = vault.balanceOf(alice);
+        uint256 usdcBefore = IERC20(USDC).balanceOf(alice);
+        vm.prank(alice);
+        uint256 got = vault.redeem(mr, alice, alice);
+
+        assertEq(sharesBefore - vault.balanceOf(alice), mr, "burned exactly maxRedeem (no partial reduction)");
+        assertEq(got, previewed, "returned exactly previewRedeem(maxRedeem) (no shortfall)");
+        assertEq(IERC20(USDC).balanceOf(alice) - usdcBefore, previewed, "received exactly the previewed assets");
+
+        console2.log("M3 PASS - maxRedeem caps so previewRedeem(maxRedeem) is honored (no silent partial)");
     }
 }

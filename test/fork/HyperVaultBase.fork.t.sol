@@ -49,6 +49,11 @@ abstract contract HyperVaultBaseForkTest is Test {
     uint256 internal constant HYPEREVM_CHAIN_ID = 999;
     /// @dev The USDC Core bridge / system address = SystemAddress.usdc() = forToken(0).
     address internal constant USDC_BRIDGE = 0x2000000000000000000000000000000000000000;
+    /// @dev Circle's CoreDepositWallet (audit G2) — the REAL mainnet bridge contract,
+    ///      `tokenInfo(0).evmContract`. Its EVM half (token(), tokenSystemAddress(),
+    ///      deposit()'s transferFrom + events) executes fully on a fork with real
+    ///      bytecode; only the Core-side credit is live-only.
+    address internal constant CORE_DEPOSIT_WALLET = 0x6B9E773128f453f5c2C60935Ee2DE2CBc5390A24;
 
     HyperCoreVault internal vault;
 
@@ -117,10 +122,25 @@ abstract contract HyperVaultBaseForkTest is Test {
     ///      (so tests can call admin setters without timelock choreography) and the supplied
     ///      fee bps. Leverage cap / slippage band are 0 (irrelevant — no trading here).
     function _deployVault(uint16 mgmtBps, uint16 perfBps) internal returns (HyperCoreVault v) {
+        // Audit G2: production posture by default — the real CoreDepositWallet.
+        // The constructor's wallet checks (token(), tokenSystemAddress()) run
+        // against real bytecode on the fork; the tokenInfo cross-check is
+        // skipped (revm precompile reads empty), matching a fresh Core account.
+        return _deployVaultWithWallet(mgmtBps, perfBps, CORE_DEPOSIT_WALLET);
+    }
+
+    /// @dev Wallet-route override — `wallet_ == address(0)` deploys a LEGACY
+    ///      (pre-G2, direct system-address transfer) vault for the tests that
+    ///      prove why the wallet route exists.
+    function _deployVaultWithWallet(uint16 mgmtBps, uint16 perfBps, address wallet_)
+        internal
+        returns (HyperCoreVault v)
+    {
         HyperCoreVault.Config memory cfg = HyperCoreVault.Config({
             asset: IERC20(USDC),
             coreUsdcIndex: 0,
             coreUsdcDecimals: 8,
+            coreDepositWallet: wallet_,
             name: "Fork Proof Vault",
             symbol: "fpv",
             admin: address(this),

@@ -2,11 +2,13 @@
 pragma solidity ^0.8.27;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 
 /// @notice On-chain directory of deployed HyperCore vaults. The frontend reads
 ///         from this to enumerate vaults without an off-chain indexer; the
 ///         factory is the only authorized writer.
-contract HyperCoreVaultRegistry is Ownable {
+/// @dev    Audit L4: Ownable2Step — two-step ownership handoff (see factory).
+contract HyperCoreVaultRegistry is Ownable2Step {
     struct VaultMetadata {
         address vault;
         address asset;
