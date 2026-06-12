@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Finding G resolver — read-only, live-node proof of the EVM<->Core USDC linkage.
+"""USDC linkage resolver — read-only, live-node proof of the EVM<->Core USDC route (G2).
 
 WHY THIS EXISTS (and is not a Foundry fork test): the EVM<->Core USDC linkage lives in
 the HyperCore `tokenInfo` precompile at 0x...080C. Foundry's revm does NOT implement the
@@ -7,34 +7,54 @@ HyperEVM precompiles, so a forge fork reads it as empty (it would falsely report
 evmContract == address(0)). A real `eth_call` to the live node DOES execute the precompile.
 This script makes that read with zero dependencies (stdlib only) and no keys/funds.
 
-It resolves the contradiction in the repo:
-  - src/HyperCoreVault.sol:500-511 natspec + README claim the configured USDC is NOT linked
-    to Core USDC (so pullFromCore/coreSpotUsdc are unreliable);
-  - scripts/python/e2e_runner.py step_pull asserts the bridge round-trip works.
-
-The decisive on-chain fact: tokenInfo(0).evmContract vs the configured asset.
+THREE POSSIBLE VERDICTS (audit G2 superseded the original Finding-G binary):
+  - WALLET-LINKED  (expected mainnet state since 2025-12-08): tokenInfo(0).evmContract is
+    Circle's CoreDepositWallet — a bridge CONTRACT, not an ERC-20 — whose `token()` is the
+    configured asset. pushToCore must use approve+deposit on the wallet; pullFromCore's
+    Core-side send pays out through the wallet's system-guarded transfer().
+  - DIRECT-LINKED  (HIP-1 pattern): evmContract IS the configured asset; the legacy
+    transfer-to-system-address route is canonical (coreDepositWallet = 0 in config).
+  - NOT-LINKED: neither — no trustless route; the pre-G2 Path-B treasury posture applies.
 
 Run:
     HYPEREVM_RPC_MAINNET=<rpc> python3 scripts/python/resolve_usdc_linkage.py
     # (falls back to the public node if the env var is unset)
 
-The bridge-blacklist corollary (pushToCore reverts because 0x2000..0000 is blacklisted on
-the configured USDC) is proven on real bytecode in
-test/fork/HyperVaultLiveness.fork.t.sol::test_G_pushToCoreRevertsOnBlacklistedBridge.
+The bridge-blacklist corollary (a LEGACY push reverts because 0x2000..0000 is blacklisted
+on the configured USDC — Circle forces the wallet path) is proven on real bytecode in
+test/fork/HyperVaultLiveness.fork.t.sol::test_G_legacyPushRevertsOnBlacklistedBridge; the
+wallet route itself in test/fork/HyperVaultCoreDepositWallet.fork.t.sol.
 """
 from __future__ import annotations
 
 import json
 import os
+import ssl
 import sys
 import urllib.request
+
+# macOS CommandLineTools python ships without root CAs; prefer certifi when
+# present (the repo .venv has it via the hyperliquid SDK), else system default.
+try:
+    import certifi
+
+    _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
+except ImportError:  # pragma: no cover
+    _SSL_CTX = ssl.create_default_context()
 
 # The configured vault asset on HyperEVM mainnet (deployments/configs/mainnet-tier1.json).
 CONFIGURED_ASSET = "0xb88339cb7199b77e23db6e890353e22632ba630f"
 # Core token index for USDC (Constants.USDC_CORE_INDEX) and the tokenInfo precompile.
 USDC_CORE_INDEX = 0
 TOKEN_INFO_PRECOMPILE = "0x000000000000000000000000000000000000080C"
+USDC_SYSTEM_ADDRESS = "0x2000000000000000000000000000000000000000"
 DEFAULT_RPC = "https://rpc.hyperliquid.xyz/evm"
+
+# 4-byte selectors (stdlib has no keccak256; values from `cast sig`).
+SEL_TOKEN = "0xfc0c546a"                 # token()
+SEL_PAUSED = "0x5c975abb"                # paused()
+SEL_TOKEN_SYSTEM_ADDRESS = "0x0d39c3fc"  # tokenSystemAddress()
+SEL_BALANCE_OF = "0x70a08231"            # balanceOf(address)
 
 
 def eth_call(rpc: str, to: str, data: str) -> bytes:
@@ -45,13 +65,40 @@ def eth_call(rpc: str, to: str, data: str) -> bytes:
         "params": [{"to": to, "data": data}, "latest"],
     }
     req = urllib.request.Request(
-        rpc, data=json.dumps(payload).encode(), headers={"content-type": "application/json"}
+        rpc,
+        data=json.dumps(payload).encode(),
+        headers={
+            "content-type": "application/json",
+            # Some public RPCs (e.g. drpc) 403 the default urllib user agent.
+            "user-agent": "hypervault-linkage-resolver/1.0",
+        },
     )
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with urllib.request.urlopen(req, timeout=20, context=_SSL_CTX) as resp:
         body = json.loads(resp.read())
     if "error" in body:
         raise RuntimeError(f"eth_call error: {body['error']}")
     return bytes.fromhex(body["result"][2:])
+
+
+def try_call_addr(rpc: str, to: str, selector: str) -> str | None:
+    """eth_call returning an address, or None if the call reverts/returns nothing."""
+    try:
+        ret = eth_call(rpc, to, selector)
+    except RuntimeError:
+        return None
+    if len(ret) < 32:
+        return None
+    return "0x" + ret[12:32].hex()
+
+
+def try_call_bool(rpc: str, to: str, selector: str) -> bool | None:
+    try:
+        ret = eth_call(rpc, to, selector)
+    except RuntimeError:
+        return None
+    if len(ret) < 32:
+        return None
+    return int.from_bytes(ret[:32], "big") != 0
 
 
 def word(ret: bytes, index: int) -> bytes:
@@ -82,28 +129,55 @@ def main() -> int:
     extra = int.from_bytes(word(ret, 7), "big")
     extra = extra - (1 << 256) if extra >= (1 << 255) else extra  # int8
 
-    linked = evm_contract.lower() == CONFIGURED_ASSET.lower()
-
     print(f"RPC:                       {rpc}")
     print(f"Core USDC (token {USDC_CORE_INDEX}) linked EVM contract: {evm_contract}")
     print(f"Core USDC weiDecimals / evmExtraWeiDecimals:   {wei_decimals} / {extra}  "
           f"(EVM side decimals = {wei_decimals + extra})")
     print(f"Configured vault asset:    {CONFIGURED_ASSET}")
     print("-" * 72)
-    if linked:
-        print("VERDICT: LINKED. The configured asset IS the Core-USDC EVM contract.")
-        print("         => pullFromCore/coreSpotUsdc are faithful; the natspec/README claim")
-        print("            of 'not linked' would be STALE. (Re-check the blacklist corollary.)")
+
+    if evm_contract.lower() == CONFIGURED_ASSET.lower():
+        print("VERDICT: DIRECT-LINKED. The configured asset IS the Core-USDC EVM contract")
+        print("         (HIP-1 pattern). Deploy with coreDepositWallet = address(0); the")
+        print("         legacy transfer-to-system-address route is canonical.")
         return 0
-    print("VERDICT: NOT LINKED (Finding G CONFIRMED).")
-    print("         The configured asset is a DIFFERENT USDC than the one Core token 0 bridges")
-    print("         to. Therefore:")
-    print("           - coreSpotUsdc() measures the vault's balance of a token that is NOT asset();")
-    print("           - pushToCore/pullFromCore target the Core bridge 0x2000..0000, which is")
-    print("             blacklisted on the configured Circle USDC -> they REVERT (see the fork")
-    print("             test test_G_pushToCoreRevertsOnBlacklistedBridge);")
-    print("           - the redemption queue can never realise Core value into asset() via the")
-    print("             canonical bridge with this configuration.")
+
+    if int(evm_contract, 16) != 0:
+        wallet_token = try_call_addr(rpc, evm_contract, SEL_TOKEN)
+        if wallet_token is not None and wallet_token.lower() == CONFIGURED_ASSET.lower():
+            paused = try_call_bool(rpc, evm_contract, SEL_PAUSED)
+            sys_addr = try_call_addr(rpc, evm_contract, SEL_TOKEN_SYSTEM_ADDRESS)
+            reserve_ret = eth_call(
+                rpc, CONFIGURED_ASSET, SEL_BALANCE_OF + evm_contract[2:].rjust(64, "0")
+            )
+            reserve = int.from_bytes(reserve_ret[:32], "big") / 1e6
+            sys_ok = sys_addr is not None and sys_addr.lower() == USDC_SYSTEM_ADDRESS
+            print("VERDICT: WALLET-LINKED (audit G2 — the expected mainnet state).")
+            print(f"         evmContract is a CoreDepositWallet, not an ERC-20:")
+            print(f"           wallet.token():             {wallet_token}  (== configured asset)")
+            print(f"           wallet.tokenSystemAddress(): {sys_addr}  "
+                  f"({'OK' if sys_ok else 'MISMATCH vs ' + USDC_SYSTEM_ADDRESS})")
+            print(f"           wallet.paused():             {paused}")
+            print(f"           wallet USDC reserve:         {reserve:,.2f} USDC")
+            print("         => deploy with coreDepositWallet = evmContract above;")
+            print("            pushToCore uses approve+deposit; pullFromCore unchanged.")
+            if paused:
+                print("         WARNING: wallet is PAUSED — both bridge directions are stalled")
+                print("                  until Circle unpauses (contingency: operatorRecoverSpot).")
+                return 3
+            if not sys_ok:
+                print("         WARNING: tokenSystemAddress mismatch — the vault constructor")
+                print("                  would (correctly) refuse this configuration.")
+                return 4
+            return 0
+
+    print("VERDICT: NOT LINKED (the original Finding-G posture).")
+    print("         The configured asset has no usable route to Core token 0:")
+    print("           - coreSpotUsdc() measures a token that is NOT asset();")
+    print("           - a LEGACY push targets the bridge 0x2000..0000, blacklisted on the")
+    print("             configured Circle USDC -> it REVERTS;")
+    print("           - the redemption queue can only realise Core value via the Path-B")
+    print("             treasury route (operatorRecoverSpot -> treasury -> re-deposit).")
     return 2
 
 
