@@ -20,13 +20,32 @@ The proof pass **confirmed** (`scripts/python/resolve_usdc_linkage.py`, and `tes
 | Risk/cost | ~3 txns, ~$0 at risk (push reverts) | deposits + Core round-trip; ~$10–100 + fees |
 | Gate | none | **first confirm `0x6B9E…0A24` exposes `decimals()`/`transfer()`** (it reverts `name()/symbol()`); if not ERC-4626-usable, F/Q4 stay deferred until the linkage is fixed |
 
+## Status (2026-06-03)
+
+The real-bytecode tests are **done and green** — the fork suite (`test/fork/HyperVault*.fork.t.sol`, 16 pass / 2 live-only skips) and the Finding-G read both ran against the `.env` RPC at block 36763664. The **funded spike was EXECUTED 2026-06-03** on throwaway vault `0x5DE26F34256f1303eCb3a3Ba70acEFD6E4f23b26` (deploy block 36824648). **F and Q4 are now PROVEN live**; full results in [`FORK_PROOFS.md`](FORK_PROOFS.md) → "Live spike — executed 2026-06-03". EVM funds were 100% recovered (≈$1 net Core-fee cost). The asset-swap "Scenario B" below was **disproven** (the linked USDC `0x6B9E…0A24` has bytecode but reverts on every standard ERC-20 read → it cannot be an ERC-4626 asset); the spike instead used the **Core-seed** method now documented in Scenario B'.
+
 ## Prerequisites
 
-- `HYPEREVM_RPC_MAINNET` (e.g. `https://rpc.hyperliquid.xyz/evm`).
-- `DEPLOYER_PRIVATE_KEY`, `OPERATOR_PRIVATE_KEY`, `ALICE_PRIVATE_KEY` (with `0x`). For the pause-freeze step the operator must also hold `EMERGENCY_ROLE` (the shipped single-key config already collapses these — Finding C).
-- `REGISTRY_MAINNET` in env (or deploy a throwaway registry).
-- A throwaway deploy config — copy `deployments/configs/mainnet-tier1.json`, keep `depositCap`/`maxDepositPerAddress` tiny, set `timelockMinDelaySec: 0` for a quick bootstrap.
-- Small USDC + HYPE for gas on the operator and alice accounts.
+- `HYPEREVM_RPC_MAINNET` — in `.env`. ✅
+- `DEPLOYER_PRIVATE_KEY` — in `.env`. ✅
+- `OPERATOR_PRIVATE_KEY` / `ALICE_PRIVATE_KEY` — generated 2026-06-03, in `.env` (gitignored). ✅
+  - **OPERATOR** `0xb0aE7D6FC5526449997193b6455ED1c9e6faB174` — fund with HYPE for gas. The vault **must** be deployed with `config.operator == this address` (else operator txns revert on `OPERATOR_ROLE`); set `config.emergencyAdmin` to it too for `pause_freeze_check`.
+  - **ALICE** `0x496aFAd2a7FC15404d406b1D82cFEF99C9e970Ba` — the test LP; fund with a little USDC + HYPE for gas.
+- `REGISTRY_MAINNET` — in `.env`. ✅
+- ⏳ **Still required before running:** (1) fund both addresses; (2) a throwaway deploy config (copy `deployments/configs/mainnet-tier1.json`, set `operator`/`emergencyAdmin`/`feeRecipient` to the OPERATOR address, tiny `depositCap`/`maxDepositPerAddress`, `timelockMinDelaySec: 0`); (3) deploy (Step 1) so `ARTIFACT` exists.
+
+## What `ARTIFACT` needs
+
+`ARTIFACT` is the path to a deployment JSON. `e2e_runner.build_ctx` reads exactly two fields:
+
+```json
+{ "vault": "0x<vault address>", "asset": "0x<USDC EVM address>" }
+```
+
+It is **produced by Step 1** — `script/Deploy.s.sol` writes a full artifact (these + timelock/registry/operator/…) to `deployments/mainnet/<config-name>.json`; then `export ARTIFACT=deployments/mainnet/<throwaway>.json`. Caveats:
+
+- The existing `deployments/mainnet/mainnet-tier{1,2,2b}.json` are **not usable**: they are pre-v1.3 (wrong px/sz scale baked in) **and** were deployed with a different `operator`, so the generated key holds no role on them.
+- The vault's `config.operator` must equal the generated OPERATOR address, or every operator step reverts.
 
 ## Step 0 — confirm Finding G live (read-only, no funds)
 
@@ -59,29 +78,35 @@ python3 scripts/python/e2e_runner.py --steps deposit,request_withdraw,fulfill_wi
 
 Expected: `push` reverts (`Blacklistable: account is blacklisted`) — the canonical EVM→Core deposit is impossible for this asset; `pause_freeze_check` shows `pullFromCore` reverts while paused; the queue escrows, fulfills from idle, and cancels cleanly. `fulfill_withdraw` here pays from idle (no Core gap), so it is **not** the F/Q4 proof.
 
-## Scenario B — F (race) + Q4 (partial fill) with a real NAV>idle gap
+## Scenario B' — F (race) + Q4 (partial fill) via **Core-seed** (the method actually used)
 
-Only meaningful with a **bridge-functional asset**. Pre-check the linked token first:
+The original "Scenario B" assumed a bridge-functional asset obtained by redeploying with the Core-linked USDC `0x6B9E…0A24`. **That is impossible:** `0x6B9E…0A24` has bytecode but reverts on `decimals()/symbol()/totalSupply()/balanceOf()`, so the ERC-4626 constructor can't even read it. Instead, manufacture the NAV>idle gap by **seeding the vault's Core spot account directly** from a Core account you control — bypassing the dead bridge. The live precompiles then read it as genuine Core value.
 
-```bash
-cast call 0x6B9E773128f453f5c2C60935Ee2DE2CBc5390A24 "decimals()(uint8)" --rpc-url "$HYPEREVM_RPC_MAINNET"
-# if this reverts, 0x6B9E…0A24 is not a standard ERC-20 -> F/Q4 stay deferred until the
-# asset/linkage is fixed (TODO-1); do not proceed with Scenario B.
-```
+> **Seeding primitive (unified accounts):** `seed_vault_core.py` uses `spot_transfer`, which HyperCore **disables for unified accounts**. Use `Exchange.send_asset(vault, "spot", "spot", "USDC", amount)` signed by the funding (deployer) key. Recover later with `operatorRecoverSpot(dest, 0, amountWei)` to a timelock-allowlisted `dest` (Core wei = human × 1e8). `operatorRecoverSpot` is fire-and-forget — **verify Core settled and retry if not**.
 
-If usable, deploy a throwaway vault with that asset and run the full loop, which creates NAV>idle for real:
+**Order of operations matters** (OZ virtual shares): a donation into an *empty* vault accrues to virtual shares, not to a depositor. **Deposit first, then seed**, so the LP's claim exceeds idle.
 
 ```bash
-export ARTIFACT=deployments/mainnet/<throwaway-linked>.json
-# deposit two LPs, deploy capital to Core (NAV > idle), then exercise the race + partial fulfill
-python3 scripts/python/e2e_runner.py \
-  --steps deposit,push,spot_to_perp,request_withdraw,fulfill_withdraw,operator_repatriate,fulfill_withdraw,cancel_withdraw
+export ARTIFACT=deployments/mainnet/mainnet-spike.json   # throwaway, shipped USDC
+# allow recovery dest once (via the 0-delay timelock): setSpotRecoverDest(deployer,true)
+
+# --- Q4 (partial fill), single LP ---
+python3 scripts/python/e2e_runner.py --steps deposit --deposit-usdc 4      # alice $4 (100%), idle $4
+#   send_asset(vault,"spot","spot","USDC",4)  -> Core $4 ; NAV $8 > idle $4
+python3 scripts/python/e2e_runner.py --steps request_withdraw,fulfill_withdraw
+#   => fulfill pays the $4 idle (minus perf fee), leaves a remainder escrowed; Core $4 untouched (E)
+
+# --- F (race), two LPs (drive bob via cast) ---
+#   alice $4 + bob $4 -> idle $8 ; send_asset $8 -> Core $8 ; NAV $16, 50/50
+#   alice requestWithdraw(all) ; bob redeem(all) DIRECT -> drains idle ; alice fulfillWithdraw -> starved
 ```
 
-- **E (live):** the first `fulfill_withdraw` (capital on Core, idle drained) is a **no-op** — alice unpaid.
-- **F (race):** with two LPs and idle < total claims, a direct `redeem` by LP2 drains the shared idle ahead of LP1's queued `fulfill` — add an LP2 `redeem` between the request and the second fulfill and observe LP1 starved until repatriation.
-- **Q4 (partial fill):** when `operator_repatriate` returns *part* of the claim, `fulfill_withdraw` partial-fills and leaves a remainder.
-- **Operator repatriate:** `usdPerpToSpot`→`pullFromCore` — for `0xb88339…630f` this reverts (Finding G); for a linked asset it credits idle and the second `fulfill_withdraw` pays alice.
+Executed result (2026-06-03): **Q4** fulfill paid **$3.70** of an $8 claim, ~2e12 shares left escrowed; **F** bob's direct redeem drained $8 idle, alice's fulfill got 1 wei. See [`FORK_PROOFS.md`](FORK_PROOFS.md) for tx hashes.
+
+- **E (live):** while value sits on Core, `fulfill_withdraw` is idle-bound — it pays only idle and never reaches Core (confirmed: `coreSpotUsdc()` unchanged across the fulfill).
+- **F (race):** the direct `redeem` path and the queue compete for the same idle with no reservation/ordering — LP2's direct redeem drains it ahead of LP1's queued request, starving LP1 until repatriation.
+- **Q4 (partial fill):** when the claim exceeds idle, `fulfill_withdraw` partial-fills to exactly idle and leaves the remainder escrowed.
+- **Repatriation reality:** by Finding G the operator **cannot** bridge Core→EVM (`pullFromCore` reverts); the only realisation path is `operatorRecoverSpot`→treasury→re-deposit (TODO-1, Path B).
 
 ## Step N — recover funds and decommission
 
@@ -96,4 +121,4 @@ Record outcomes (tx hashes + which steps reverted) in [`FORK_PROOFS.md`](FORK_PR
 
 - Step 0 prints `NOT LINKED (Finding G CONFIRMED)`.
 - Scenario A: `push` reverts on the blacklist; `pause_freeze_check` reverts while paused; queue escrow/cancel succeed.
-- Scenario B (if the linked asset is usable): E no-op → repatriate → fulfill pays; F starvation observed; Q4 partial-then-full observed. Otherwise F/Q4 are formally **deferred behind the linkage fix (TODO-1)** and recorded as such.
+- Scenario B' (Core-seed): ✅ **PASSED 2026-06-03** — Q4 partial fill ($3.70 of an $8 claim, remainder escrowed), F starvation (direct redeem drained idle, queued LP got 1 wei), E (fulfill never reached Core). All funds recovered via `operatorRecoverSpot` (C-2 allowlist). **F and Q4 are closed.** The underlying realisation gap (no faithful Core→EVM path for the shipped asset) remains **TODO-1 / Path B** — the spike proved the *queue mechanics*, not a production-ready config.
