@@ -48,6 +48,24 @@ contract Deploy is Script {
         uint256[] memory perpWhitelist = vm.parseJsonUintArray(json, ".whitelistPerps");
         uint256[] memory spotWhitelist = vm.parseJsonUintArray(json, ".whitelistSpots");
 
+        // Audit H3: refuse the "24h timelock protects LPs" footgun on mainnet —
+        // require three distinct role keys and a real (>=24h) timelock delay.
+        // The chainid != 999 path stays unguarded for testnet bootstrap; a
+        // mainnet THROWAWAY spike may set ALLOW_SHORT_TIMELOCK=1 to use a tractable
+        // short delay for an on-chain timelock-gate proof (never for production).
+        if (block.chainid == 999) {
+            require(
+                cfg.operator != cfg.emergencyAdmin && cfg.operator != cfg.feeRecipient
+                    && cfg.emergencyAdmin != cfg.feeRecipient,
+                "mainnet: operator/emergencyAdmin/feeRecipient must be distinct (H3)"
+            );
+            bool allowShort = vm.envOr("ALLOW_SHORT_TIMELOCK", false);
+            require(
+                allowShort || timelockDelay >= 24 hours,
+                "mainnet: timelockMinDelaySec must be >= 24h (set ALLOW_SHORT_TIMELOCK=1 for a throwaway spike)"
+            );
+        }
+
         vm.startBroadcast(pk);
 
         // 1. Per-vault TimelockController (proposer+executor = deployer)

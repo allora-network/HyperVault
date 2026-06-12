@@ -1,5 +1,67 @@
 # Security Notes (Audit Prep)
 
+## v1.4 audit remediation (read first)
+
+The pre-audit review (vs the audited `Gauge4626.sol`) produced 11 findings, all
+remediated as one stacked branch per finding with a green fork test each
+(see [`FORK_PROOFS.md`](FORK_PROOFS.md) §"v1.4 Audit Remediation"). Summary of what
+changed and which claims below are now superseded:
+
+- **C1/M5 (NAV linkage).** The shipped asset (`0xb883…630f`) is **NOT** Core token 0's
+  linked EVM contract (`0x6b9e…0a24`) — confirmed live. `coreSpotUsdc()` therefore
+  measures an unrelated token and the canonical bridge is blacklisted (`pushToCore`/
+  `pullFromCore` revert). Fix: Core-USDC index/decimals are now per-vault immutables
+  validated against the live `tokenInfo` at deploy (decimals-mismatch **reverts**;
+  an `evmContract != asset()` mismatch is non-fatal but emits `CoreLinkUnverified`).
+  Realising Core value uses **Path B** (`operatorRecoverSpot → treasury → re-deposit`),
+  so `coreSpotUsdc()` is **operator-recoverable NAV** carrying an explicit ~1:1
+  cross-token assumption — NOT trustless bridge value.
+- **H1 (strict NAV).** Strict precompile reads are now the **default** for a live
+  vault, behind a one-way `navBootstrap` grace the admin clears (`endNavBootstrap()`)
+  after Core init. Once strict, a precompile revert fails NAV **closed** (no silent
+  zeroing). Redemption liveness is then coupled to precompile liveness — monitor.
+- **H2 (liveness).** `pullFromCore`/`usdPerpToSpot`/`operatorRecoverSpot` are **no
+  longer `whenNotPaused`** (they only move funds toward idle), and `EMERGENCY_ROLE`
+  gets `emergencyRepatriate(...)` — a paused / operator-dark vault can still drain
+  Core→idle. Overdue withdrawal requests can be `prioritizeOverdue`-reserved against
+  racing redeems (on-chain SLA). **Honest scope:** with the bridge dead (C1), no
+  contract can *permissionlessly* pull Core→EVM; the SLA enforces fairness over
+  existing idle and surfaces operator stalls — actual repatriation still needs the
+  operator or the EMERGENCY hatch (a venue limitation, see `vaults.md` §6.3).
+- **H3 (governance).** Factory + `Deploy.s.sol` reject a sub-24h timelock delay and
+  shared operator/emergency/feeRecipient keys on mainnet. The tier configs ship three
+  distinct roles + 86400s — **production MUST replace the placeholder role addresses
+  with a real multisig** and hand the timelock proposer/executor to it post-deploy.
+- **M1 (perf fee).** An inter-LP `transfer` is now a **realization event**: the
+  transferor's perf fee on the transferred shares is crystallized by diverting
+  fee-equivalent shares to `feeRecipient` (redirect, not mint — no dilution). This
+  closes the loss-netting evasion.
+- **M2.** Deposits/mints into an LP with an open withdrawal request revert
+  (`PendingRequestBlocksDeposit`) — closes the cost-basis double-count.
+- **M3.** `maxRedeem` is capped to idle-backed shares so `previewRedeem(maxRedeem)`
+  is honored (no silent partial). **M4.** `emergencyClosePositions` gains an optional
+  wide markPx sanity band (`emergencyCloseBandBps`); `emergencyClosePositionsForce`
+  is the explicit oracle-down override. **M6.** The spot slippage band now requires a
+  calibrated `spotPxScaleFactor` (else it gave false protection). **L1–L4.** deposit
+  balance-delta (FOT) guard; dormancy mgmt-fee cap (one annual period, not nav/2);
+  `int64.min` abs guard; factory+registry `Ownable2Step`.
+
+**Two integrator notes (ERC-20 / ERC-4626 surprises — by design):**
+1. **`transfer` is a taxable event (M1).** With a non-zero perf fee, transferring a
+   *gaining* LP's shares delivers **fewer** than `value` to the recipient (the haircut
+   funds the fee) and emits a second `Transfer` to `feeRecipient`. Escrow moves
+   (`requestWithdraw`/`cancel`) and mint/burn are exempt.
+2. **`previewRedeem`/`previewWithdraw` are GROSS.** `redeem`/`withdraw`/`fulfillWithdraw`
+   pay `gross − perfFee(owner)`, which is *less* than the owner-agnostic preview when
+   the owner has a gain (the per-LP C-3 fee can't appear in an owner-agnostic preview).
+   Quote `previewRedeem(shares) − perfFee` for an exact figure.
+3. **H2 priority is not durable across a *partial* fulfill.** A partial `fulfillWithdraw`
+   releases the whole reserve and zeroes the remainder's reservation; a keeper must
+   `prioritizeOverdue` the remainder again. No fund loss — only relevant when NAV>idle.
+4. **L5 — perf-fee rate is retroactive.** `setFees` applies the new `perfFeeBps` to all
+   LPs' *existing unrealized* gains at their next realization, not just gains accrued
+   after the change.
+
 ## Threat model
 
 | Adversary | Capability | Mitigation |
@@ -20,10 +82,14 @@
 | `requestWithdraw`, `cancelWithdrawRequest`, `fulfillWithdraw` | anyone | `fulfillWithdraw` is keeper-friendly |
 | `placeLimitOrder` | `OPERATOR_ROLE` | `whenNotPaused`, whitelist + slippage + leverage gates |
 | `cancelOrderByCloid` | `OPERATOR_ROLE` | No gates |
-| `pushToCore`, `pullFromCore` | `OPERATOR_ROLE` | `whenNotPaused` |
-| `usdSpotToPerp`, `usdPerpToSpot` | `OPERATOR_ROLE` | `whenNotPaused` |
+| `pushToCore` | `OPERATOR_ROLE` | `whenNotPaused` (deploys idle→Core); cannot deploy reserved idle (H2) |
+| `pullFromCore` | `OPERATOR_ROLE` | **NOT** `whenNotPaused` (H2 — Core→idle refill must survive a pause) |
+| `usdSpotToPerp` | `OPERATOR_ROLE` | `whenNotPaused` (deploys into the market) |
+| `usdPerpToSpot` | `OPERATOR_ROLE` | **NOT** `whenNotPaused` (H2 — moves equity toward idle) |
+| `operatorRecoverSpot` | `OPERATOR_ROLE` | **NOT** `whenNotPaused` (H2); C-2 allowlisted dest |
+| `emergencyRepatriate` | `EMERGENCY_ROLE` | H2 escape hatch; works while paused; C-2 allowlisted dest |
 | `pause`, `unpause` | `EMERGENCY_ROLE` | |
-| `emergencyCancelByCloid`, `emergencyCancelByOid`, `emergencyClosePositions` | `EMERGENCY_ROLE` | |
+| `emergencyCancelByCloid`, `emergencyCancelByOid`, `emergencyClosePositions` | `EMERGENCY_ROLE` | `emergencyClosePositions` honors the M4 markPx band (`…Force` skips it) |
 | `emergencyShutdown` | `EMERGENCY_ROLE` | One-way; deposits permanently blocked |
 | `setWhitelist*`, `setLeverageCap`, `setSlippageBand`, `setFees`, `setDepositCap`, `setMaxDepositPerAddress` | `DEFAULT_ADMIN_ROLE` (timelock) | 24h delay in production |
 | `sweep` | `DEFAULT_ADMIN_ROLE` | Cannot sweep `asset()` |
@@ -53,11 +119,11 @@ These are real bugs / footguns surfaced by running the vault end-to-end on Hyper
 
 - **CoreWriter is fire-and-forget.** A rejected action does not revert the EVM tx. The vault's view of "outstanding orders" relies entirely on off-chain reconciliation.
 
-- **Decimals.** USDC EVM 6dp; USDC Core 8dp; bridge scales ×100 across. If HL ever changes Core USDC `weiDecimals`, update `Constants.USDC_CORE_DECIMALS`. The factory's `strictAssetValidation` mode catches asset address mismatches but does NOT catch decimal mismatches — add at audit time.
+- **Decimals.** USDC EVM 6dp; USDC Core 8dp; bridge scales ×100 across. **(C1/M5 update)** Core-USDC index/decimals are now per-vault immutables (`coreUsdcIndex`/`coreUsdcDecimals`) set from config and **validated against the live `tokenInfo` precompile at deploy** — a decimals mismatch now **reverts** (`CoreUsdcDecimalsMismatch`), both in the vault constructor and the factory's `strictAssetValidation` path. A wrong decimal value can no longer silently put NAV off by 10^|Δ|.
 
 - **`receive()` is omitted.** Native HYPE sent to the vault address reverts. Intentional.
 
-- **Cost basis carry on transfer.** ERC20 share transfers weighted-average the receiver's cost basis. Senders keep their cost basis on remaining shares. The vault address (when shares are escrowed via `requestWithdraw`) is excluded from cost-basis tracking; the request stores its own snapshot.
+- **Cost basis carry on transfer — UPDATED by M1.** An inter-LP `transfer` is now a **realization event**: the transferor's perf fee on the transferred shares is crystallized (fee-equivalent shares diverted to `feeRecipient`, no mint/dilution) and the receiver's transferred shares enter at the current price-per-share. This closes the loss-netting evasion (a gain could previously be routed into an underwater LP and netted away). Senders keep their basis on remaining shares; escrow moves (vault as counterparty) and mint/burn remain exempt. See integrator note 1 above — `transfer` of a gaining LP's shares delivers fewer than `value` to the recipient.
 
 - **Fee dilution math.** The dilutive-mint formula `feeAssets * supply / (nav - feeAssets)` is exact in continuous math and approximate under integer rounding. Off-by-one errors favor existing holders (under-charge by ≤ 1 wei).
 

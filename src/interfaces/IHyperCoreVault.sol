@@ -37,6 +37,20 @@ interface IHyperCoreVault is IERC4626 {
     error RequestNotOverdue(address lp);
     /// @notice {prioritizeOverdue} called on an already-prioritized request (H2).
     error RequestAlreadyPrioritized(address lp);
+    /// @notice deposit/mint into an LP (`receiver`) that has an open withdrawal
+    ///         request — would corrupt the per-LP cost basis (audit M2). The LP
+    ///         must {cancelWithdrawRequest} first.
+    error PendingRequestBlocksDeposit(address receiver);
+    /// @notice emergency-close `limitPx` deviates from the strict markPx beyond
+    ///         `emergencyCloseBandBps` (audit M4). Use {emergencyClosePositionsForce}
+    ///         only if the oracle itself is unusable.
+    error EmergencyCloseBandExceeded(uint64 limitPx, uint64 markPx, uint16 bandBps);
+    /// @notice A non-zero spot slippage band requires a calibrated, non-zero
+    ///         `spotPxScaleFactor` (audit M6) — else the band gives false protection.
+    error SpotBandRequiresScaleFactor(uint32 asset);
+    /// @notice The vault received less than `expected` on deposit/mint (audit L1) —
+    ///         the asset must be USDC-class (non-fee-on-transfer, non-rebasing).
+    error DepositAmountNotReceived(uint256 expected, uint256 received);
 
     // -------------------------------------------------------------------------
     // CoreWriter submission events — these mirror what the legacy SDK response
@@ -108,8 +122,11 @@ interface IHyperCoreVault is IERC4626 {
     /// @notice Admin ended the fresh-vault NAV grace period; NAV reads are now
     ///         strict / fail-closed (audit H-1). One-way.
     event NavBootstrapEnded(address indexed by);
-    /// @notice Admin set the spot slippage band for `asset` (audit H-3).
-    event SpotSlippageBandUpdated(uint32 indexed asset, uint16 bps);
+    /// @notice Admin set the spot slippage band + calibrated scale factor for
+    ///         `asset` (audit H-3 / M6).
+    event SpotSlippageBandUpdated(uint32 indexed asset, uint16 bps, uint64 scaleFactor);
+    /// @notice Admin updated the emergency-close sanity band (audit M4).
+    event EmergencyCloseBandUpdated(uint16 oldBps, uint16 newBps);
     /// @notice Emitted at deploy when the Core-USDC token's linked EVM contract
     ///         (`tokenInfo(coreUsdcIndex).evmContract`) is NOT the vault's
     ///         `asset()` (audit C1). Not fatal — the deliberate Path-B posture
@@ -159,10 +176,15 @@ interface IHyperCoreVault is IERC4626 {
     ///         {endNavBootstrap} has switched them to strict (audit H-1).
     function navBootstrap() external view returns (bool);
 
-    /// @notice Per-spot-asset slippage band in bps (audit H-3). 0 = no band
-    ///         (legacy / opt-out). Compared against `spotPx` from the precompile.
-    function setSpotSlippageBand(uint32 asset_, uint16 bps) external;
+    /// @notice Per-spot-asset slippage band in bps + calibrated spotPx->limitPx
+    ///         scale factor (audit H-3 / M6). 0 bps = no band; a non-zero band
+    ///         requires a non-zero scaleFactor. Compared against the NORMALIZED spotPx.
+    function setSpotSlippageBand(uint32 asset_, uint16 bps, uint64 scaleFactor) external;
     function spotSlippageBandBps(uint32 asset_) external view returns (uint16);
+    function spotPxScaleFactor(uint32 asset_) external view returns (uint64);
+    /// @notice Suggested starting scale factor (10^(2+baseSzDecimals)) for calibrating
+    ///         {setSpotSlippageBand} — guidance only; verify on a live order (audit M6).
+    function suggestedSpotPxScaleFactor(uint32 asset_) external view returns (uint64);
 
     /// @notice Withdrawal-request fulfillment SLA window in seconds (audit H2). 0
     ///         disables deadlines. Used by {requestWithdraw}/{prioritizeOverdue}.
@@ -178,7 +200,13 @@ interface IHyperCoreVault is IERC4626 {
     function emergencyCancelByCloid(uint32[] calldata assets, uint128[][] calldata cloids) external;
     function emergencyCancelByOid(uint32 asset, uint64 oid) external;
     function emergencyClosePositions(uint32[] calldata perpAssets, uint64[] calldata limitPxs) external;
+    /// @notice Emergency close that skips the {emergencyCloseBandBps} sanity band —
+    ///         explicit last-resort override when the oracle is unusable (audit M4).
+    function emergencyClosePositionsForce(uint32[] calldata perpAssets, uint64[] calldata limitPxs) external;
     function emergencyShutdown() external;
+    /// @notice Sanity band (bps) for emergency-close prices vs strict markPx (audit M4).
+    function setEmergencyCloseBand(uint16 bps) external;
+    function emergencyCloseBandBps() external view returns (uint16);
     /// @notice EMERGENCY_ROLE escape hatch to repatriate Core funds toward idle
     ///         (perp->spot and/or spot-send to the bridge or an allowlisted
     ///         treasury) even while paused / operator-dark (audit H2).
