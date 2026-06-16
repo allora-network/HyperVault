@@ -5,10 +5,13 @@
 > vault's *own* L1 account; the value of a share is computed **trustlessly on-chain** from
 > Hyperliquid's own precompiles — never reported by the operator.
 >
-> **Status:** audited core + live-proven trade path on **HyperEVM mainnet** (chain 999). The
-> redemption system is the current frontier — its end-to-end assessment closed on a live funded
-> spike (2026-06-03). One configuration blocker (Finding G) must be fixed before real LP money.
-> This page is the leadership-level picture; the engineering deep-dive is [`ARCHITECTURE.md`](ARCHITECTURE.md).
+> **Status:** audited core, plus the trade path AND the full trustless EVM/Core USDC round trip
+> live-proven on **HyperEVM mainnet** (chain 999). The redemption system is the current frontier;
+> its end-to-end assessment closed on live funded spikes (2026-06-03 and 2026-06-15/16). Finding G,
+> the old "the vault can't move USDC to Core and back" blocker, is **resolved and proven live**. The
+> residual before real LP money is operational, not a code blocker: issuer trust in Circle's bridge,
+> and a production key setup. This page is the leadership-level picture; the engineering deep-dive is
+> [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 **In one sentence:** HyperVault turns a Hyperliquid trading strategy into a composable ERC-4626
 token — gas-only to deploy, trading spot **and** perps from a smart-contract account, with NAV read
@@ -274,7 +277,7 @@ Two fees, both designed so that **the people who stay are never diluted to pay f
 | Guaranteed on-chain | Assumed (trust model) | Not yet |
 |---|---|---|
 | Share value (NAV) is computed by the contract from HL precompiles, excluding mark-price PnL | The operator trades competently (they *can* lose money on bad trades) | Production key topology — the demo collapses operator/emergency/fee into one EOA (Finding C) |
-| The operator cannot move funds to an arbitrary address — recovery destinations are admin-allowlisted (C-2) | HyperCore precompiles and CoreWriter behave as documented | A faithful Core→EVM repatriation path for the shipped asset (Finding G — the P0 blocker) |
+| The operator cannot move funds to an arbitrary address (recovery destinations are admin-allowlisted, C-2) | HyperCore precompiles and CoreWriter behave as documented; **Circle's USDC bridge stays live** (it's Circle-operated, upgradeable, pausable) | ~~Core→EVM repatriation (Finding G)~~, now **resolved: round trip proven live (v1.5 G2)** |
 | Stayers are not diluted to pay an exiting LP's performance fee (C-3) | The operator/keeper stays available to repatriate and fulfil queued exits | Keeper automation, on-chain fulfilment deadline, permissionless forced-close (P1) |
 | Redemptions are never pausable; deposits-only emergency shutdown is one-way | A multisig holds emergency powers and a real timelock governs guardrails | — |
 
@@ -282,25 +285,31 @@ The posture is a **self-custodied managed account**: trust is minimized on *valu
 explicitly placed on *trading competence* and *operator liveness* — the items on the roadmap below
 progressively reduce the liveness assumption.
 
-> **The one blocker to call out — Finding G.** On the shipped configuration the vault's USDC is **not**
-> the USDC that Hyperliquid's canonical bridge moves to Core, and that bridge address is *blacklisted*
-> on it — so the built-in `pushToCore`/`pullFromCore` path reverts. The live spike confirmed this and
-> proved the workaround (operator-recovery to an allowlisted treasury). Fixing the asset linkage /
-> repatriation path is the **must-do before real LP money**.
+> **Finding G is resolved, and proven live.** We thought the shipped USDC couldn't reach Core and back,
+> because the old bridge address is blacklisted on it. The live spike showed the real story: that
+> "blacklist" exists because the USDC now routes through **Circle's official CoreDepositWallet** bridge,
+> not the old path. So the built-in money path works once it calls the right thing: push deposits through
+> Circle's wallet, and pull uses Hyperliquid's newer `send_asset` action (the old `spot_send` is silently
+> ignored for these accounts, which is what the spike caught). The full loop, deposit to Core, trade,
+> back to EVM, withdraw, ran end to end on mainnet. Two operational notes carry forward: there's a tiny
+> withdrawal fee so you never pull the exact full Core balance, and a vault's first deposit to Core costs
+> 1 USDC in one-time activation. What's left before real LP money is operational, not a code blocker:
+> trusting Circle keeps the bridge live, and a production key setup.
 
 ---
 
 ## Status and roadmap
 
-**Where we are.** The trading and accounting core is audited and proven live on HyperEVM mainnet; the
-redemption system's end-to-end assessment is complete (closed on the 2026-06-03 funded spike). The
-next phase is *remediation*, not assessment.
+**Where we are.** The trading and accounting core is audited and proven live on HyperEVM mainnet, and
+the full trustless EVM/Core USDC round trip is now proven live too (funded spikes 2026-06-03 and
+2026-06-15/16). The redemption system's end-to-end assessment is complete. The next phase is the rest
+of *remediation* (keeper + key topology), not assessment.
 
 ```mermaid
 timeline
   title Capability roadmap
   Live now : ERC-4626 vault on HyperEVM (gas-only) : On-chain trustless NAV (precompiles) : Operator trade path — perps + spot (rested live) : Guardrails — whitelist · leverage cap · slippage band : Audit mitigations C-2 · C-3 · H-1/2/3 : Redemption queue (request · fulfil · cancel) : Per-vault timelock + registry : Proven on mainnet — G · A · queue · trade path · C-2 · partial-fill · exit-race
-  Next : Fix asset/bridge linkage (Finding G — Path B repatriation) : Production key topology (split roles · real timelock · multisig)
+  Next : Production key topology (split roles · real timelock · multisig) : Keeper service for the request-fulfil loop
   Planned : Keeper service + on-chain fulfilment deadline + forced-close : Soft barriers (cooldown · gate) documented as 4626 deviations
 ```
 
@@ -313,7 +322,7 @@ timeline
 | Redemption queue — escrow · permissionless fulfil · cancel | **Live** (proven on mainnet) |
 | Partial-fill + exit-race accounting (NAV > idle) | **Proven live** (2026-06-03 spike) |
 | Per-vault timelock + on-chain registry | **Live** |
-| Asset/bridge linkage fix (Finding G) | **P0 — next** |
+| Trustless EVM/Core USDC round trip (Finding G fix: wallet push + `send_asset` pull) | **Proven live** (2026-06-15/16 spike) |
 | Production key topology (split roles, real delay) | **P0 — next** |
 | Keeper + on-chain deadline + forced-close | **Planned (P1)** |
 | Soft barriers (cooldown / gate) | **Designed (documented 4626 deviation)** |

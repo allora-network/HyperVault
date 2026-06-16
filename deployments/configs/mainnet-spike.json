@@ -12,6 +12,9 @@
   "mgmtFeeAnnualBps": 200,
   "depositCap": "100000000",
   "maxDepositPerAddress": "100000000",
-  "whitelistPerps": [0],
-  "whitelistSpots": []
+  "whitelistPerps": [
+    0
+  ],
+  "whitelistSpots": [],
+  "coreDepositWallet": "0x6B9E773128f453f5c2C60935Ee2DE2CBc5390A24"
 }

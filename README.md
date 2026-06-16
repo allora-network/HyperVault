@@ -74,7 +74,8 @@ src/                          Solidity sources
   HyperCoreVaultRegistry.sol  On-chain directory of deployed vaults
   libraries/
     Constants.sol             Precompile addresses, CoreWriter action IDs, TIF enum, USDC indices
-    CoreWriterLib.sol         Typed wrappers for limit_order / spot_send / usd_class_transfer / cancel
+    CoreWriterLib.sol         Typed wrappers for limit_order / send_asset / spot_send / usd_class_transfer / cancel
+    VaultTradeLib.sol         External delegatecall lib: trade gate + emergency close (EIP-170 size split)
     PrecompileLib.sol         Typed reads of all L1 precompiles (position, spotBalance, oraclePx, etc.)
     AssetId.sol               Perp/spot ID encoding (spot = 10_000 + spotIdx)
     SystemAddress.sol         Token bridge-address derivation (0x20 || zero-pad || tokenIdx)
@@ -124,8 +125,8 @@ frontend/                     Vite + React + viem discovery UI
 **`HyperCoreVault.sol`** — the main contract. Per-strategy, EIP-4626-compliant. Notable surface:
 - `deposit / mint / withdraw / redeem` — standard ERC-4626 with `maxWithdraw` correctly bounded by idle USDC (no silent reverts)
 - `placeLimitOrder / cancelOrderByCloid` — operator-only, gated by asset whitelist + slippage band vs `oraclePx` + post-trade leverage cap
-- `pushToCore / pullFromCore` — operator-only EVM↔Core USDC bridging (where the bridge is linked)
-- `operatorRecoverSpot(to, token, amountWei)` — operator-only generic Core spot send; the fallback when `pullFromCore`'s bridge path isn't available
+- `pushToCore / pullFromCore` — operator-only EVM↔Core USDC bridging. **v1.5 (G2), proven live:** push goes through **Circle's CoreDepositWallet** (`approve + deposit`, the official route for natively-minted USDC; `coreDepositWallet` is a validated per-vault immutable, `address(0)` = legacy direct-linked-asset mode); pull is a CoreWriter **`send_asset` (action 13)** to the token system address (NOT the legacy `spot_send`, which unified HyperCore accounts silently drop) — the wallet then pays native USDC to the vault. A small ~0.00134 USDC withdrawal fee means the keeper must pull **under** the full Core balance; a vault's first push costs 1.0 USDC one-time activation gas
+- `operatorRecoverSpot(to, token, amountWei)` — operator-only generic Core spot send; **contingency** (e.g. Circle pauses the wallet) — no longer the primary realisation path
 - `usdSpotToPerp / usdPerpToSpot` — operator-only USD class transfers
 - `operatorSweepStranded(to)` — recovers EVM `asset()` balance when `totalSupply == 0` (the donation-to-empty-vault recovery)
 - `emergencyCancelByCloid / emergencyCancelByOid / emergencyClosePositions / emergencyShutdown / pause / unpause` — emergency-role only
@@ -138,7 +139,9 @@ frontend/                     Vite + React + viem discovery UI
 
 ### Libraries
 
-**`CoreWriterLib`** — wraps the CoreWriter system contract (`0x3333…3333`). Each typed function packs `abi.encodePacked(uint8(1), uint24(actionId), abi.encode(args))` and calls `sendRawAction`. The action set: `limit_order`, `cancel_order_by_oid`, `cancel_order_by_cloid`, `spot_send`, `usd_class_transfer`, `vault_transfer`. Encoding follows the HL CoreWriter spec — `px`/`sz` as `human × 10^8` and `tif` as `1=ALO / 2=GTC / 3=IOC` — verified live by the mainnet test harness.
+**`CoreWriterLib`** — wraps the CoreWriter system contract (`0x3333…3333`). Each typed function packs `abi.encodePacked(uint8(1), uint24(actionId), abi.encode(args))` and calls `sendRawAction`. The action set: `limit_order`, `cancel_order_by_oid`, `cancel_order_by_cloid`, `spot_send` (legacy — dropped by unified accounts), **`send_asset` (action 13 — the working Core spot move / Core→EVM withdrawal)**, `usd_class_transfer`, `vault_transfer`. Encoding follows the HL CoreWriter spec — `px`/`sz` as `human × 10^8` and `tif` as `1=ALO / 2=GTC / 3=IOC` — verified live by the mainnet test harness.
+
+**`VaultTradeLib`** — external **delegatecall** library holding the trade gate (whitelist + slippage band + leverage cap) and the emergency-close loop, factored out of the vault so its runtime fits the **EIP-170 24576-byte limit** (the vault was 26411 B; → 24237 B). Pure logic invoked under delegatecall (`address(this)` is the vault), no storage; events/errors are re-declared so logs/selectors are byte-identical to the inlined version. `Deploy.s.sol` / `forge` deploy + link it automatically.
 
 **`PrecompileLib`** — typed `staticcall` wrappers for every L1 read precompile (`0x0800–0x0810`). Returns the protocol's struct; falls back to zero-initialised struct if the precompile errors (e.g., the account has never touched that market). Used by the vault for `totalAssets` (NAV = idle + coreSpot + perpWithdrawable) and by the operator gates (oraclePx for slippage, position/markPx for leverage).
 
@@ -239,7 +242,7 @@ The vault was validated end-to-end on HyperEVM mainnet. Several bugs were found 
 **Fixed:**
 1. **`limit_order` px/sz action scale is `human × 10^8` (uniform), NOT `10^(8−szDecimals)` / `10^szDecimals`** — confirmed on mainnet (an order at the szDecimals-based scale is silently dropped; a `10^8` order rests). The `oraclePx`/`markPx` precompiles return `human × 10^(6−szDecimals)`, so the perp slippage band normalizes oraclePx by `10^(2+szDecimals)` (per-asset `szDecimals` via `perpAssetInfoStrict`), the leverage-cap notional divides by `1e10`, and `hl_helpers.encode_px/encode_sz` use `× 10^8`. (v1.2's "×100" normalization was wrong and dropped every realistic order.)
 2. **EIP-170 contract-size limit on the factory.** Inlining `type(HyperCoreVault).creationCode` pushed the factory over 24KB. Worked around by deploying the vault directly from `Deploy.s.sol` via CREATE; the factory remains in the repo for a future EIP-1167 refactor.
-3. **`operatorRecoverSpot(to, token, amountWei)` added** so the operator can move Core spot funds out of the vault when the EVM↔Core bridge for the chosen asset isn't deployed (the current mainnet state for USDC). `operatorSweepStranded(to)` added for recovering EVM `asset()` balance after `totalSupply` returns to zero.
+3. **`operatorRecoverSpot(to, token, amountWei)` added** so the operator can move Core spot funds out of the vault when no bridge route is usable. **(v1.5 G2 update: the official USDC route exists — Circle's CoreDepositWallet, live since 2025-12-08 — and `pushToCore` now uses it; `operatorRecoverSpot` demotes to a contingency.)** `operatorSweepStranded(to)` added for recovering EVM `asset()` balance after `totalSupply` returns to zero.
 
 **Resolved (v1.3) — was "HL Core does not process `limit_order` from contracts":**
 - **Root cause was the px/sz SCALE (item 1 above), confirmed on mainnet** — not an HL/contract limitation, and not (primarily) TIF. Decisive test, all `tif=1` via raw `CoreWriter.sendRawAction`: a `10^8`-scale BTC order **rested on the book** (`limitPx 72596.0, sz 0.0002`); the same order at the repo's `10^(8−szDecimals)`/`10^szDecimals` scale was **silently dropped**; and a perfectly-`tif=1`-encoded but wrong-scale order also dropped. The TIF enum was *also* off by one (`TIF_ALO=0…`; correct `1/2/3`) and is fixed — real but secondary (tif=0 still drops once scale is right). **Deployed v1.2 vaults bake in BOTH the wrong scale (band/cap math) and the wrong TIF, so they cannot place orders and must be redeployed** (this also fixes `emergencyClosePositions`, which encoded IOC as GTC).

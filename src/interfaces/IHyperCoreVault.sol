@@ -28,6 +28,18 @@ interface IHyperCoreVault is IERC4626 {
     /// @notice Configured Core-USDC decimals disagree with the live `tokenInfo`
     ///         precompile at deploy (audit C1/M5) — NAV would be off by 10^|Δ|.
     error CoreUsdcDecimalsMismatch(uint8 configured, uint8 fromPrecompile);
+    /// @notice The configured CoreDepositWallet custodies a different token than
+    ///         the vault's `asset()` (audit G2) — deposits would feed someone
+    ///         else's bridge. Checked directly against the wallet at deploy.
+    error CoreDepositWalletTokenMismatch(address asset, address walletToken);
+    /// @notice The configured CoreDepositWallet's `tokenSystemAddress()` is not
+    ///         the system address derived from `coreUsdcIndex` (audit G2) — the
+    ///         wallet and the NAV/pull leg would point at different Core tokens.
+    error CoreDepositWalletSystemAddressMismatch(address expected, address actual);
+    /// @notice `tokenInfo(coreUsdcIndex).evmContract` resolved to something other
+    ///         than the configured CoreDepositWallet (audit G2). Push and pull
+    ///         would route through different contracts — fail closed.
+    error CoreLinkMismatch(address wallet, address coreEvmContract);
     /// @notice {endNavBootstrap} called when the grace period is already over —
     ///         the transition to strict NAV reads is one-way (audit H-1).
     error NavBootstrapAlreadyEnded();
@@ -37,6 +49,20 @@ interface IHyperCoreVault is IERC4626 {
     error RequestNotOverdue(address lp);
     /// @notice {prioritizeOverdue} called on an already-prioritized request (H2).
     error RequestAlreadyPrioritized(address lp);
+    /// @notice deposit/mint into an LP (`receiver`) that has an open withdrawal
+    ///         request — would corrupt the per-LP cost basis (audit M2). The LP
+    ///         must {cancelWithdrawRequest} first.
+    error PendingRequestBlocksDeposit(address receiver);
+    /// @notice emergency-close `limitPx` deviates from the strict markPx beyond
+    ///         `emergencyCloseBandBps` (audit M4). Use {emergencyClosePositionsForce}
+    ///         only if the oracle itself is unusable.
+    error EmergencyCloseBandExceeded(uint64 limitPx, uint64 markPx, uint16 bandBps);
+    /// @notice A non-zero spot slippage band requires a calibrated, non-zero
+    ///         `spotPxScaleFactor` (audit M6) — else the band gives false protection.
+    error SpotBandRequiresScaleFactor(uint32 asset);
+    /// @notice The vault received less than `expected` on deposit/mint (audit L1) —
+    ///         the asset must be USDC-class (non-fee-on-transfer, non-rebasing).
+    error DepositAmountNotReceived(uint256 expected, uint256 received);
 
     // -------------------------------------------------------------------------
     // CoreWriter submission events — these mirror what the legacy SDK response
@@ -61,7 +87,11 @@ interface IHyperCoreVault is IERC4626 {
     event OrderCancelByCloidSubmitted(uint32 indexed asset, uint128 indexed cloid);
     event OrderCancelByOidSubmitted(uint32 indexed asset, uint64 indexed oid);
     event UsdClassTransferSubmitted(uint64 ntl, bool toPerp);
-    event BridgeDeposit(uint64 amount);  // EVM USDC -> Core spot
+    /// @notice EVM USDC -> Core spot. Wallet mode: `approve + deposit` on the
+    ///         CoreDepositWallet (the ERC20 `Transfer` goes to the wallet, not
+    ///         the system address). Legacy mode: ERC20 transfer to the system
+    ///         address. Route is fixed per-vault via {coreDepositWallet} (G2).
+    event BridgeDeposit(uint64 amount);
     event BridgeWithdraw(uint64 amountWei); // Core spot -> EVM USDC (via system address)
     event OperatorSpotRecovered(address indexed to, uint64 token, uint64 amountWei); // Core spot -> arbitrary recipient
     event StrandedSwept(address indexed to, uint256 amount); // EVM asset sweep when totalSupply==0
@@ -108,14 +138,25 @@ interface IHyperCoreVault is IERC4626 {
     /// @notice Admin ended the fresh-vault NAV grace period; NAV reads are now
     ///         strict / fail-closed (audit H-1). One-way.
     event NavBootstrapEnded(address indexed by);
-    /// @notice Admin set the spot slippage band for `asset` (audit H-3).
-    event SpotSlippageBandUpdated(uint32 indexed asset, uint16 bps);
-    /// @notice Emitted at deploy when the Core-USDC token's linked EVM contract
+    /// @notice Admin set the spot slippage band + calibrated scale factor for
+    ///         `asset` (audit H-3 / M6).
+    event SpotSlippageBandUpdated(uint32 indexed asset, uint16 bps, uint64 scaleFactor);
+    /// @notice Admin updated the emergency-close sanity band (audit M4).
+    event EmergencyCloseBandUpdated(uint16 oldBps, uint16 newBps);
+    /// @notice LEGACY MODE ONLY (no CoreDepositWallet configured): emitted at
+    ///         deploy when the Core-USDC token's linked EVM contract
     ///         (`tokenInfo(coreUsdcIndex).evmContract`) is NOT the vault's
-    ///         `asset()` (audit C1). Not fatal — the deliberate Path-B posture
-    ///         keeps the unlinked Circle USDC as the share asset — but the
-    ///         mismatch is surfaced on-chain rather than silently trusted.
+    ///         `asset()` (audit C1). Not fatal — the pre-G2 Path-B posture keeps
+    ///         the unlinked asset as the share asset — but the mismatch is
+    ///         surfaced on-chain rather than silently trusted. Wallet-mode vaults
+    ///         hard-revert on a mismatch instead ({CoreLinkMismatch}).
     event CoreLinkUnverified(address indexed asset, address indexed coreEvmContract);
+    /// @notice WALLET MODE: emitted at deploy when the live `tokenInfo` row
+    ///         confirms the configured CoreDepositWallet IS the Core-USDC linked
+    ///         EVM contract (audit G2) — the on-chain attestation that push and
+    ///         pull route through the same official bridge. Absent on substrates
+    ///         where the precompile is empty (fresh Core account, revm fork).
+    event CoreLinkVerified(address indexed asset, address indexed coreDepositWallet);
 
     // -------------------------------------------------------------------------
     // Operator surface
@@ -159,10 +200,15 @@ interface IHyperCoreVault is IERC4626 {
     ///         {endNavBootstrap} has switched them to strict (audit H-1).
     function navBootstrap() external view returns (bool);
 
-    /// @notice Per-spot-asset slippage band in bps (audit H-3). 0 = no band
-    ///         (legacy / opt-out). Compared against `spotPx` from the precompile.
-    function setSpotSlippageBand(uint32 asset_, uint16 bps) external;
+    /// @notice Per-spot-asset slippage band in bps + calibrated spotPx->limitPx
+    ///         scale factor (audit H-3 / M6). 0 bps = no band; a non-zero band
+    ///         requires a non-zero scaleFactor. Compared against the NORMALIZED spotPx.
+    function setSpotSlippageBand(uint32 asset_, uint16 bps, uint64 scaleFactor) external;
     function spotSlippageBandBps(uint32 asset_) external view returns (uint16);
+    function spotPxScaleFactor(uint32 asset_) external view returns (uint64);
+    /// @notice Suggested starting scale factor (10^(2+baseSzDecimals)) for calibrating
+    ///         {setSpotSlippageBand} — guidance only; verify on a live order (audit M6).
+    function suggestedSpotPxScaleFactor(uint32 asset_) external view returns (uint64);
 
     /// @notice Withdrawal-request fulfillment SLA window in seconds (audit H2). 0
     ///         disables deadlines. Used by {requestWithdraw}/{prioritizeOverdue}.
@@ -178,7 +224,13 @@ interface IHyperCoreVault is IERC4626 {
     function emergencyCancelByCloid(uint32[] calldata assets, uint128[][] calldata cloids) external;
     function emergencyCancelByOid(uint32 asset, uint64 oid) external;
     function emergencyClosePositions(uint32[] calldata perpAssets, uint64[] calldata limitPxs) external;
+    /// @notice Emergency close that skips the {emergencyCloseBandBps} sanity band —
+    ///         explicit last-resort override when the oracle is unusable (audit M4).
+    function emergencyClosePositionsForce(uint32[] calldata perpAssets, uint64[] calldata limitPxs) external;
     function emergencyShutdown() external;
+    /// @notice Sanity band (bps) for emergency-close prices vs strict markPx (audit M4).
+    function setEmergencyCloseBand(uint16 bps) external;
+    function emergencyCloseBandBps() external view returns (uint16);
     /// @notice EMERGENCY_ROLE escape hatch to repatriate Core funds toward idle
     ///         (perp->spot and/or spot-send to the bridge or an allowlisted
     ///         treasury) even while paused / operator-dark (audit H2).
@@ -194,6 +246,9 @@ interface IHyperCoreVault is IERC4626 {
     function coreUsdcIndex() external view returns (uint64);
     /// @notice Core wei decimals for {coreUsdcIndex}, validated at deploy (audit C1/M5).
     function coreUsdcDecimals() external view returns (uint8);
+    /// @notice Circle's CoreDepositWallet used by {pushToCore} (audit G2);
+    ///         `address(0)` = legacy HIP-1 route. Immutable; validated at deploy.
+    function coreDepositWallet() external view returns (address);
     function idleUsdc() external view returns (uint256);
     /// @notice Idle not reserved for overdue prioritized requests (audit H2).
     function availableIdleUsdc() external view returns (uint256);

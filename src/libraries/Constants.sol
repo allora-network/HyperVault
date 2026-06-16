@@ -106,6 +106,13 @@ library Constants {
     /// @dev    Matches the EVM ERC20 decimals — no scaling needed when adding to NAV.
     uint8 internal constant PERP_USD_DECIMALS = 6;
 
+    /// @notice CoreDepositWallet `destinationDex` value for the Core SPOT dex
+    ///         (audit G2). The wallet credits the depositor's Core spot balance
+    ///         directly — the leg `coreSpotUsdc()` reads — with no dependence on
+    ///         the wallet's mutable dex-forwarding config and no new-Core-account
+    ///         fee (both apply only to dex-forwarded deposits, e.g. perps = 0).
+    uint32 internal constant CORE_SPOT_DEX_ID = type(uint32).max;
+
     // -------------------------------------------------------------------------
     // Bridge address prefix
     // -------------------------------------------------------------------------

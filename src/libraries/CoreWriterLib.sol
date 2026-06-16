@@ -91,6 +91,35 @@ library CoreWriterLib {
         ICoreWriter(Constants.CORE_WRITER).sendRawAction(data);
     }
 
+    /// @notice Move a Core asset via the unified-account `send_asset` action
+    ///         (id 13). Audit G2: REQUIRED instead of {spotSend} (id 6) for
+    ///         unified HyperCore accounts — `spot_send`/`spot_transfer` is
+    ///         SILENTLY DROPPED there (proven live 2026-06-15: the EVM tx
+    ///         succeeds, fire-and-forget, but Core never debits and no ledger
+    ///         entry appears). To bridge balance back to the EVM-side token, set
+    ///         `recipient` to that token's system address — the HyperCore system
+    ///         then invokes the linked EVM contract (for native USDC, Circle's
+    ///         CoreDepositWallet `transfer`, paying native USDC from its reserve).
+    /// @dev    Payload matches Circle's CoreDepositWallet `_sendAsset` byte-for-byte:
+    ///         abi.encode(recipient, subAccount=address(0), sourceDex,
+    ///         destinationDex, tokenIndex, amount). `amount` is in Core wei (8dp
+    ///         for USDC). subAccount is always address(0) (subaccounts unused).
+    /// @param recipient       Core recipient, or the token system address to withdraw to EVM.
+    /// @param sourceDex       Dex the funds sit on (Core Spot = type(uint32).max).
+    /// @param destinationDex  Destination dex.
+    /// @param token           Core token index.
+    /// @param amountWei       Amount in Core wei (8dp for USDC).
+    function sendAsset(address recipient, uint32 sourceDex, uint32 destinationDex, uint64 token, uint64 amountWei)
+        internal
+    {
+        bytes memory data = abi.encodePacked(
+            Constants.CORE_WRITER_VERSION,
+            uint24(Constants.ACTION_SEND_ASSET),
+            abi.encode(recipient, address(0), sourceDex, destinationDex, token, amountWei)
+        );
+        ICoreWriter(Constants.CORE_WRITER).sendRawAction(data);
+    }
+
     // -------------------------------------------------------------------------
     // usd_class_transfer (action id 7)
     // -------------------------------------------------------------------------

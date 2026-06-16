@@ -68,7 +68,9 @@ tx = vault.functions.cancelOrderByCloid(asset=0, cloid=42).build_transaction(...
 ### Move funds: EVM USDC ⇄ Core spot ⇄ Perp margin
 
 ```python
-# EVM → Core spot
+# EVM → Core spot. v1.5 (G2): internally approve + deposit on Circle's
+# CoreDepositWallet (the ERC20 Transfer goes to the wallet, not 0x2000…);
+# the vault's Core SPOT balance is credited within ~1 Core block.
 vault.functions.pushToCore(amount=50_000_000000).transact()  # 50k USDC at 6dp
 
 # Core spot → perp margin
@@ -77,11 +79,30 @@ vault.functions.usdSpotToPerp(ntl=50_000_000000).transact()
 # Perp → spot
 vault.functions.usdPerpToSpot(ntl=50_000_000000).transact()
 
-# Core spot → EVM
-vault.functions.pullFromCore(amountWei=50_000_00000000).transact()  # 50k USDC at 8dp (Core wei)
+# Core spot → EVM. The Core-side action is CoreWriter `send_asset` (action 13) to the
+# USDC system address; HyperCore debits the vault's Core spot and the CoreDepositWallet
+# pays native USDC from its reserve to the CALLER (this vault). NEVER pass the exact full
+# Core balance — see the fee note below.
+vault.functions.pullFromCore(amountWei=49_900_00000000).transact()  # ~49.9k at 8dp (under the balance)
 ```
 
 ⚠ `pullFromCore` takes **Core wei** (8dp for USDC), not EVM wei (6dp). All other operator functions use 6dp.
+
+⚠ **Never pull the EXACT full Core balance.** HyperCore deducts a small withdrawal fee
+(~0.00134 USDC, proven live) from the Core account *on top of* the requested amount. If you
+request the full balance there is nothing to cover the fee and HyperCore **silently drops**
+the `send_asset` (the EVM tx still succeeds and emits `BridgeWithdraw` — fire-and-forget — but
+Core never debits). Pull strictly under the balance (the keeper loop uses `balance × 0.998`).
+A vault's **first** push also costs a one-time **1.0 USDC** account-activation gas.
+
+⚠ **`spot_send` (action 6) does NOT work** for these accounts — unified HyperCore accounts
+silently drop it. The vault uses `send_asset` (action 13) for every Core-side move
+(`pullFromCore`, `operatorRecoverSpot`, `emergencyRepatriate`).
+
+⚠ **G2 operational notes:** the CoreDepositWallet is Circle-operated and pausable — if
+`wallet.paused()` is true, BOTH `pushToCore` and the pull payout stall until Circle
+unpauses (monitor it; `e2e_runner.py --steps wallet_status` prints it). The vault leaves
+zero standing allowance to the wallet between pushes.
 
 ## Reconciliation
 
@@ -103,8 +124,8 @@ The live runner should:
 | `OrderCancelByCloidSubmitted` | `response.data.statuses[i].success` | HL returns `{"status": "ok"}` per-cancel |
 | `OrderCancelByOidSubmitted` | same as above | Emergency path |
 | `UsdClassTransferSubmitted` | `response.status` for `usdClassTransfer` action | |
-| `BridgeDeposit` | ERC20 `Transfer` from vault → bridge address | The HL system tx that credits Core spot is opaque from EVM |
-| `BridgeWithdraw` | A `spot_send` action of `(bridge, USDC, amount)` | Settled by HL within ~1 block |
+| `BridgeDeposit` | ERC20 `Transfer` from vault → **CoreDepositWallet** (v1.5 G2; legacy mode: → bridge address) | Core spot credit driven by the wallet's synthetic Transfer log; confirm via HL API / `coreSpotUsdc()` |
+| `BridgeWithdraw` | A `send_asset` action (id 13) of `(systemAddr, spot→spot, USDC, amount)` | Settled by HL within ~1 block — but DROPPED if `amount` == full Core balance (fee uncovered) |
 | `NavSnapshot` | computed off-chain previously | Now emitted directly |
 
 ## Reading NAV / position state on-chain
@@ -147,9 +168,10 @@ vault.functions.emergencyCancelByCloid([asset_id_array], [[cloid_array_per_asset
 # 3. Close positions at mark ± slippage (caller-supplied limit pxs)
 vault.functions.emergencyClosePositions([asset_id_array], [limit_px_array]).transact()
 
-# 4. Rebalance everything to EVM idle USDC
+# 4. Rebalance everything to EVM idle USDC. Pull UNDER the Core balance so the
+#    ~0.00134 USDC withdrawal fee is covered (full balance is silently dropped).
 vault.functions.usdPerpToSpot(total_perp).transact()
-vault.functions.pullFromCore(total_core_wei).transact()
+vault.functions.pullFromCore(int(core_spot_wei * 0.998)).transact()  # send_asset, leave fee buffer
 
 # 5. (Optional) one-way emergencyShutdown — blocks deposits forever
 vault.functions.emergencyShutdown().transact()

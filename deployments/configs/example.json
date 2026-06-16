@@ -7,6 +7,7 @@
   "usdcAddress": "0x0000000000000000000000000000000000000000",
   "coreUsdcIndex": 0,
   "coreUsdcDecimals": 8,
+  "coreDepositWallet": "0x6B9E773128f453f5c2C60935Ee2DE2CBc5390A24",
   "timelockMinDelaySec": 86400,
   "leverageCapBps": 30000,
   "slippageBandBps": 100,
@@ -14,6 +15,10 @@
   "mgmtFeeAnnualBps": 200,
   "depositCap": "10000000000000",
   "maxDepositPerAddress": "1000000000000",
-  "whitelistPerps": [0, 1, 2],
+  "whitelistPerps": [
+    0,
+    1,
+    2
+  ],
   "whitelistSpots": []
 }

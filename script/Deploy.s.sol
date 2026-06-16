@@ -32,6 +32,7 @@ contract Deploy is Script {
         cfg.asset                = IERC20(vm.parseJsonAddress(json, ".usdcAddress"));
         cfg.coreUsdcIndex        = uint64(vm.parseJsonUint(json, ".coreUsdcIndex"));
         cfg.coreUsdcDecimals     = uint8(vm.parseJsonUint(json, ".coreUsdcDecimals"));
+        cfg.coreDepositWallet    = vm.parseJsonAddress(json, ".coreDepositWallet");
         cfg.name                 = vm.parseJsonString(json, ".name");
         cfg.symbol               = vm.parseJsonString(json, ".symbol");
         cfg.operator             = vm.parseJsonAddress(json, ".operator");
@@ -47,6 +48,32 @@ contract Deploy is Script {
         uint256 timelockDelay = vm.parseJsonUint(json, ".timelockMinDelaySec");
         uint256[] memory perpWhitelist = vm.parseJsonUintArray(json, ".whitelistPerps");
         uint256[] memory spotWhitelist = vm.parseJsonUintArray(json, ".whitelistSpots");
+
+        // Audit H3: refuse the "24h timelock protects LPs" footgun on mainnet —
+        // require three distinct role keys and a real (>=24h) timelock delay.
+        // The chainid != 999 path stays unguarded for testnet bootstrap; a
+        // mainnet THROWAWAY spike may set ALLOW_SHORT_TIMELOCK=1 to use a tractable
+        // short delay for an on-chain timelock-gate proof (never for production).
+        if (block.chainid == 999) {
+            require(
+                cfg.operator != cfg.emergencyAdmin && cfg.operator != cfg.feeRecipient
+                    && cfg.emergencyAdmin != cfg.feeRecipient,
+                "mainnet: operator/emergencyAdmin/feeRecipient must be distinct (H3)"
+            );
+            bool allowShort = vm.envOr("ALLOW_SHORT_TIMELOCK", false);
+            require(
+                allowShort || timelockDelay >= 24 hours,
+                "mainnet: timelockMinDelaySec must be >= 24h (set ALLOW_SHORT_TIMELOCK=1 for a throwaway spike)"
+            );
+            // Audit G2: mainnet Core-USDC (index 0) MUST use the official
+            // CoreDepositWallet route — the legacy system-address transfer is
+            // proven dead for natively-minted USDC (Finding G: bridge blacklisted).
+            bool allowLegacyBridge = vm.envOr("ALLOW_LEGACY_BRIDGE", false);
+            require(
+                allowLegacyBridge || cfg.coreUsdcIndex != 0 || cfg.coreDepositWallet != address(0),
+                "mainnet: coreUsdcIndex 0 requires coreDepositWallet (set ALLOW_LEGACY_BRIDGE=1 to override)"
+            );
+        }
 
         vm.startBroadcast(pk);
 
@@ -157,7 +184,8 @@ contract Deploy is Script {
             "  \"vault\": \"", vm.toString(vaultAddr), "\",\n",
             "  \"timelock\": \"", vm.toString(timelockAddr), "\",\n",
             "  \"registry\": \"", vm.toString(registryAddr), "\",\n",
-            "  \"asset\": \"", vm.toString(address(cfg.asset)), "\",\n"
+            "  \"asset\": \"", vm.toString(address(cfg.asset)), "\",\n",
+            "  \"coreDepositWallet\": \"", vm.toString(cfg.coreDepositWallet), "\",\n"
         );
         string memory body = string.concat(
             "  \"operator\": \"", vm.toString(cfg.operator), "\",\n",

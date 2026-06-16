@@ -1,0 +1,18 @@
+{
+  "chainId": 999,
+  "vault": "0xDE6A0c9371aCBC95fd3AC6B8A3598780013ec777",
+  "timelock": "0x1866964076676d41751fc005B1d1A89Ab21F9d36",
+  "registry": "0xA430c24f63BB3245723242c7843b2E07BA220ba8",
+  "asset": "0xb88339CB7199b77E23DB6E890353E22632Ba630f",
+  "coreDepositWallet": "0x6B9E773128f453f5c2C60935Ee2DE2CBc5390A24",
+  "operator": "0xb0aE7D6FC5526449997193b6455ED1c9e6faB174",
+  "feeRecipient": "0x200342145Ae3A0c1da9AdE8571EC0ff23c2b753A",
+  "name": "Allora Mainnet Spike G2",
+  "symbol": "amg2",
+  "deployBlock": 37906569,
+  "leverageCapBps": 30000,
+  "perfFeeBps": 0,
+  "mgmtFeeAnnualBps": 0,
+  "whitelistPerps": [0],
+  "whitelistSpots": []
+}
