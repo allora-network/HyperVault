@@ -40,6 +40,8 @@ from web3.types import TxReceipt
 
 import hl_helpers as hl
 from hl_helpers import PerpAssetMeta
+# SOLU-3368 (TODO-10 part 2): Core-settlement reconciliation for fire-and-forget sends.
+from reconcile import core_wei_to_human, reconcile_core_send
 
 
 # -----------------------------------------------------------------------------
@@ -62,6 +64,10 @@ class Ctx:
     network: str
     console: Console = field(default_factory=Console)
     failures: list[str] = field(default_factory=list)
+    # SOLU-3368 (TODO-10 part 2): reconcile-after-recover controls. Live funded send is a
+    # HUMAN GATE — default off (the reconcile step runs read-only/DRY-RUN unless enabled).
+    reconcile_live: bool = False
+    reconcile_dest: Optional[str] = None
 
 
 def load_abi(name: str) -> list[dict]:
@@ -101,12 +107,20 @@ def build_ctx(args: argparse.Namespace) -> Ctx:
     info = hl.make_info(args.network)
     asset_meta = hl.get_perp_meta(info, args.asset)
 
+    # SOLU-3368: reconcile-after-recover dest (checksummed if provided). getattr keeps this
+    # robust if the arg is absent on a differently-parsed invocation.
+    reconcile_dest = getattr(args, "reconcile_dest", None)
+    if reconcile_dest:
+        reconcile_dest = Web3.to_checksum_address(reconcile_dest)
+
     return Ctx(
         w3=w3, info=info, vault=vault, usdc=usdc,
         vault_addr=vault_addr, usdc_addr=usdc_addr,
         operator=operator, alice=alice,
         asset_idx=args.asset, asset_meta=asset_meta,
         deposit_usdc=args.deposit_usdc, network=args.network,
+        reconcile_live=bool(getattr(args, "reconcile_live", False)),
+        reconcile_dest=reconcile_dest,
     )
 
 
@@ -688,6 +702,85 @@ def step_operator_repatriate(ctx: Ctx) -> bool:
     return ok
 
 
+def step_reconcile_after_recover(ctx: Ctx) -> bool:
+    """SOLU-3368 (TODO-10 part 2): reconcile Core state after the fire-and-forget
+    `operatorRecoverSpot` (or any Core-side send) and signal a retry if Core never settled.
+
+    CoreWriter actions are fire-and-forget — the EVM tx succeeds and `OperatorSpotRecovered`
+    fires *even if HyperCore drops the action* (fee uncovered, wallet paused, wrong action id).
+    A keeper therefore can't trust the receipt; it must read the vault's Core USDC balance, send,
+    then poll until the Core balance actually falls by ~the sent amount. If it doesn't, the action
+    was dropped and the keeper must RETRY (recorded into ctx.failures here).
+
+    Read-only / DRY-RUN by default (the harness default): observes the vault's live Core balance
+    and logs the intended reconciliation WITHOUT moving funds, so it's fully exercisable now.
+    Live funded execution is a HUMAN GATE — pass `--reconcile-live` (and an allowlisted
+    `--reconcile-dest`) to actually submit `operatorRecoverSpot` and reconcile its settlement.
+    """
+    dry_run = not ctx.reconcile_live
+    mode = "DRY-RUN (read-only)" if dry_run else "LIVE (funded send)"
+    ctx.console.rule(f"[bold]reconcile after operatorRecoverSpot — fire-and-forget settlement [{mode}]")
+
+    # The vault's Core USDC, normalized to 6dp human (reads the spotBalance precompile on-chain).
+    read_core = lambda: ctx.vault.functions.coreSpotUsdc().call() / 1e6
+    core_now = read_core()
+    ctx.console.print(f"vault.coreSpotUsdc(): {core_now:,.6f} USDC (Core spot, 6dp-normalized)")
+
+    # Recover a small slice — bounded under the balance so the ~0.00134 USDC withdrawal fee is
+    # always covered (a send of the EXACT balance is silently dropped — see docs/INTEGRATION.md).
+    recover_human = min(ctx.deposit_usdc * 0.5, core_now * 0.5)
+    amount_wei = core_wei_usdc(recover_human)  # Core 8dp wei
+    expected_dec = core_wei_to_human(amount_wei)  # human USDC the send should remove from Core
+
+    if dry_run:
+        res = reconcile_core_send(
+            read_core_usdc=read_core, expected_decrease_usdc=expected_dec,
+            send=None, wait_for=wait_for, log=ctx.console.print,
+            label="operatorRecoverSpot", dry_run=True,
+        )
+        ctx.console.print(
+            f"[cyan]intended live action:[/cyan] operatorRecoverSpot(dest, token=0, "
+            f"amountWei={amount_wei}) → would reconcile a Core decrease of ~{expected_dec:,.6f} USDC"
+        )
+        ctx.console.print(
+            "[yellow]DRY-RUN — no funds moved. Re-run with --reconcile-live --reconcile-dest <allowlisted "
+            "addr> to submit + reconcile for real (HUMAN GATE).[/yellow]"
+        )
+        ctx.console.print(f"[dim]{res.note}[/dim]")
+        return True
+
+    # ---- LIVE path (human-gated) ----
+    dest = ctx.reconcile_dest
+    if not dest:
+        ctx.console.print("[red]--reconcile-live requires --reconcile-dest <allowlisted address>[/red]")
+        ctx.failures.append("reconcile: live mode requested without --reconcile-dest")
+        return False
+    if not ctx.vault.functions.spotRecoverDest(dest).call():
+        ctx.console.print(f"[red]{dest} is NOT on the spotRecoverDest allowlist (C-2) — would revert[/red]")
+        ctx.failures.append("reconcile: dest not allowlisted (spotRecoverDest)")
+        return False
+    if amount_wei == 0:
+        ctx.console.print("[yellow]nothing on Core to recover — skipping live reconcile[/yellow]")
+        return True
+
+    def _send() -> None:
+        receipt = send_tx(ctx, ctx.operator,
+                          ctx.vault.functions.operatorRecoverSpot(dest, 0, amount_wei))
+        ev = parse_event(ctx, receipt, "OperatorSpotRecovered")
+        ctx.console.print(f"OperatorSpotRecovered event (intent, not settlement): {ev}")
+
+    res = reconcile_core_send(
+        read_core_usdc=read_core, expected_decrease_usdc=expected_dec,
+        send=_send, wait_for=wait_for, log=ctx.console.print,
+        timeout_s=60, poll_s=2.0, label="operatorRecoverSpot", dry_run=False,
+    )
+    if res.needs_retry:
+        ctx.failures.append(
+            "reconcile: operatorRecoverSpot did not settle on Core within timeout — fire-and-forget "
+            "action dropped; keeper must RETRY")
+    return res.settled
+
+
 def step_pause_freeze_check(ctx: Ctx) -> bool:
     ctx.console.rule("[bold]pause posture check (H2: paused vault CAN repatriate; deploy stays blocked)")
     # Pre-H2 this step proved Finding A (pull reverting EnforcedPause, live 2026-06-03).
@@ -729,7 +822,7 @@ ALL_STEPS = ["preflight", "deposit", "core_status", "wallet_status", "push", "sp
 
 # Redemption-loop steps — selected explicitly via --steps (not part of the default run).
 QUEUE_STEPS = ["request_withdraw", "fulfill_withdraw", "operator_repatriate",
-               "cancel_withdraw", "pause_freeze_check"]
+               "reconcile_after_recover", "cancel_withdraw", "pause_freeze_check"]
 
 # Steps that require a real EVM-side USDC ↔ Core bridge. Skipped automatically
 # when the asset has no linked bridge (testnet MockUSDC case).
@@ -752,6 +845,14 @@ def main() -> int:
                              "operator_repatriate, cancel_withdraw, pause_freeze_check)")
     parser.add_argument("--skip-bridge", action="store_true",
                         help="omit push/pull steps (use for testnet MockUSDC)")
+    # SOLU-3368 (TODO-10 part 2): reconcile_after_recover defaults to read-only/DRY-RUN.
+    # Live funded send is a HUMAN GATE — must be explicitly enabled.
+    parser.add_argument("--reconcile-live", action="store_true",
+                        help="reconcile_after_recover: actually submit operatorRecoverSpot and "
+                             "reconcile Core settlement (HUMAN GATE; default is read-only DRY-RUN)")
+    parser.add_argument("--reconcile-dest", default=os.environ.get("RECONCILE_DEST"),
+                        help="reconcile_after_recover: allowlisted (spotRecoverDest) destination "
+                             "for the live operatorRecoverSpot send")
     args = parser.parse_args()
 
     if not args.artifact:
@@ -805,6 +906,8 @@ def main() -> int:
                 step_fulfill_withdraw(ctx)
             elif step == "operator_repatriate":
                 step_operator_repatriate(ctx)
+            elif step == "reconcile_after_recover":
+                step_reconcile_after_recover(ctx)
             elif step == "cancel_withdraw":
                 step_cancel_withdraw(ctx)
             elif step == "pause_freeze_check":

@@ -154,6 +154,35 @@ LPs can request an exit via `requestWithdraw(shares)`. The shares move to the va
 
 The fulfillment is permissionless — anyone (including the LP themselves) can call it. Keepers welcome.
 
+### Keeper edge cases (TODO-10)
+
+**1. Partial fulfill → re-prioritize the remainder.** When a request is overdue (its `fulfillmentDeadline` has lapsed), a keeper calls `prioritizeOverdue(lp)` to reserve that request's claim on idle ahead of racing direct redeems (Finding F). If idle is short, the matching `fulfillWithdraw(lp)` is a **partial** fill: it pays the LP from the reserve, then releases the **entire** reserve (`_reservedIdle -= reservedAssets`) and writes back a remainder request with `shares = original - filled`, `reservedAssets = 0`, **and the original `fulfillmentDeadline` preserved**. Because `reservedAssets` is reset to 0, the remainder is **immediately re-prioritizable** — a keeper can call `prioritizeOverdue(lp)` again on it without hitting `RequestAlreadyPrioritized`, reserving the remainder's new claim against freshly-repatriated idle. There is **no lock-out and no stranded idle**: the remainder is never starved. Keeper loop:
+
+```text
+on overdue(lp):
+    prioritizeOverdue(lp)              # reserve current claim (capped at available idle)
+    pullFromCore(...)                  # repatriate Core → idle if the reserve was idle-capped
+    fulfillWithdraw(lp)                # full clear, or PARTIAL (reserve released, remainder kept)
+    if pendingWithdrawalShares(lp) > 0 and requestIsOverdue(lp):
+        prioritizeOverdue(lp)          # RE-prioritize the remainder — does NOT revert; reserves anew
+        ... repeat until pendingWithdrawalShares(lp) == 0
+```
+
+This is proven on real HyperEVM bytecode in `test/fork/HyperVaultKeeperEdge.fork.t.sol` (K1: the remainder keeps its deadline, `reservedAssets == 0`, `_reservedIdle` fully released, and the re-`prioritizeOverdue` succeeds and reserves a positive new claim; K2: the loop terminates with nothing stranded). No contract change was needed — the shipped queue already supports this.
+
+**2. Reconcile Core after a fire-and-forget recover (`operatorRecoverSpot` / `pullFromCore`).** These Core-side sends are fire-and-forget (§Reconciliation): the EVM tx succeeds and the event fires even if HyperCore drops the action (fee uncovered, wallet paused, wrong action id). A keeper must therefore not trust the receipt — it should read the vault's Core balance (`coreSpotUsdc()`, 6dp-normalized) **before** the send, submit, then poll until the Core balance falls by ~the sent amount (the ~0.00134 USDC withdrawal fee may make the drop slightly larger; never request the exact full balance). If Core hasn't moved within a timeout, the action was dropped and the keeper **must retry**. The reusable primitive is `scripts/python/reconcile.py:reconcile_core_send(...)` (runner-agnostic; `needs_retry` is the retry signal), wired into the live harness as the `reconcile_after_recover` step:
+
+```bash
+# read-only DRY-RUN (default; observes live Core state, logs the intended reconcile, moves nothing):
+ARTIFACT=deployments/mainnet/<strategy>.json HYPEREVM_RPC_MAINNET=<rpc> \
+  OPERATOR_PRIVATE_KEY=... ALICE_PRIVATE_KEY=... \
+  python scripts/python/e2e_runner.py --steps reconcile_after_recover
+
+# live funded send + settlement reconcile (HUMAN GATE — submits operatorRecoverSpot):
+python scripts/python/e2e_runner.py --steps reconcile_after_recover \
+  --reconcile-live --reconcile-dest <allowlisted spotRecoverDest address>
+```
+
 ## Emergency runbook
 
 If the strategy must be shut down (operator key suspected compromised, market dislocation, contract bug suspected):
