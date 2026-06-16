@@ -63,6 +63,55 @@ interface IHyperCoreVault is IERC4626 {
     /// @notice The vault received less than `expected` on deposit/mint (audit L1) —
     ///         the asset must be USDC-class (non-fee-on-transfer, non-rebasing).
     error DepositAmountNotReceived(uint256 expected, uint256 received);
+    /// @notice A deposit/mint or market-deploying mover was attempted while the
+    ///         vault is latched into ESCAPE mode (M5 — escape hatch §4). Entering a
+    ///         forced unwind is wrong-way risk for a depositor; deploy paths are off.
+    error EscapeModeActive();
+    /// @notice An escape crank was called while the vault is NOT in ESCAPE mode
+    ///         (M5 §4) — the cranks only run while the brake is armed.
+    error EscapeModeNotActive();
+    /// @notice An escape crank was called before the per-interval cooldown elapsed
+    ///         (M5 §4) — bounds HyperCore action-rate exposure / forced-unwind grief.
+    error EscapeCooldownActive(uint64 nextAllowedTs);
+    /// @notice {exitEscape} called while an overdue-unfillable request still remains
+    ///         (M5 §1) — the brake clears only once the backlog that armed it is gone.
+    error EscapeBacklogRemains(address lp);
+    /// @notice A cloid passed to {escapeCancelOrders} is not one the vault has issued
+    ///         (>= the live `_cloidCounter`), so it cannot name a vault-placed resting
+    ///         order (M5 §2 leg 1).
+    error EscapeCloidOutOfRange(uint128 cloid, uint128 cloidCounter);
+    /// @notice The trigger condition for {triggerEscape} (the permissionless
+    ///         staleness gate — `escapeGraceSeconds` + overdue-AND-claim>idle) is
+    ///         completed in SOLU-3371; in this issue entry is admin-gated (M5 §1).
+    error EscapeTriggerNotWired();
+
+    // -------------------------------------------------------------------------
+    // Shared structs
+    // -------------------------------------------------------------------------
+
+    /// @notice One pending withdrawal request per LP (audit H2). Declared on the
+    ///         interface so the vault and {VaultEscapeLib} share ONE struct type
+    ///         across the M5 delegatecall boundary (the queue mapping is threaded
+    ///         into the library by storage reference — same single-source-of-truth
+    ///         posture as the `EnumerableSet.UintSet`s shared with {VaultTradeLib}).
+    struct WithdrawalRequest {
+        uint256 shares; // shares escrowed at the vault
+        uint256 costBasisAtRequest; // 1e18-fixed snapshot of LP's cb at request time
+        uint64 fulfillmentDeadline; // 0 = no SLA; else unix ts after which the request is overdue (H2)
+        uint256 reservedAssets; // idle assets reserved for this overdue request (H2 priority over redeem)
+    }
+
+    /// @notice Escape-hatch latch + cooldown state (M5 §1/§4). Declared on the
+    ///         interface so the vault and {VaultEscapeLib} share ONE struct type:
+    ///         the vault threads it into the library by storage reference
+    ///         (delegatecall: same slots), so the latch/cooldown bookkeeping AND the
+    ///         crank loops both live in the library, out of the vault's EIP-170
+    ///         budget. `active` is the ESCAPE-mode latch the deposit/trade gates read;
+    ///         `lastCrankTs` backs the per-interval crank cooldown.
+    struct EscapeState {
+        bool active;
+        uint64 lastCrankTs;
+    }
 
     // -------------------------------------------------------------------------
     // CoreWriter submission events — these mirror what the legacy SDK response
@@ -126,6 +175,18 @@ interface IHyperCoreVault is IERC4626 {
     ///         is dark/compromised (audit H2). Works while paused.
     event EmergencyRepatriated(address indexed to, uint64 perpToSpotNtl, uint64 spotSendWei);
 
+    /// @notice The permissionless escape-hatch brake latched ON (M5 §1) — the vault
+    ///         entered ESCAPE mode: deposits/mints and market-deploying movers are
+    ///         blocked, only the risk-reducing escape cranks + redemption run. `lp`
+    ///         is the request that armed the brake (or `address(0)` for an admin arm).
+    event EscapeActivated(address indexed by, address indexed lp);
+    /// @notice The escape brake cleared (M5 §1) — ESCAPE mode lifted once no
+    ///         overdue-unfillable request remained.
+    event EscapeDeactivated(address indexed by);
+    /// @notice An escape crank (leg 1 cancel / leg 2 flatten / leg 3 consolidate)
+    ///         ran while latched (M5 §2) — surfaces the permissionless unwind on-chain.
+    event EscapeCrankRun(address indexed by, uint8 indexed leg);
+
     event LeverageCapUpdated(uint16 oldCap, uint16 newCap);
     event SlippageBandUpdated(uint16 oldBand, uint16 newBand);
     event FeesUpdated(uint16 mgmtBps, uint16 perfBps);
@@ -162,14 +223,9 @@ interface IHyperCoreVault is IERC4626 {
     // Operator surface
     // -------------------------------------------------------------------------
 
-    function placeLimitOrder(
-        uint32 asset,
-        bool isBuy,
-        uint64 limitPx,
-        uint64 sz,
-        bool reduceOnly,
-        uint8 tif
-    ) external returns (uint128 cloid);
+    function placeLimitOrder(uint32 asset, bool isBuy, uint64 limitPx, uint64 sz, bool reduceOnly, uint8 tif)
+        external
+        returns (uint128 cloid);
 
     function cancelOrderByCloid(uint32 asset, uint128 cloid) external;
 
@@ -279,4 +335,36 @@ interface IHyperCoreVault is IERC4626 {
     function pendingWithdrawalReserved(address lp) external view returns (uint256);
     /// @notice True iff `lp` has a request whose deadline has lapsed (audit H2).
     function requestIsOverdue(address lp) external view returns (bool);
+
+    // -------------------------------------------------------------------------
+    // Escape hatch — permissionless "dead man's brake" Phase 1 (M5)
+    //
+    // docs/ESCAPE_HATCH_SCOPE.md §2/§4/§7. While `escapeActive`, the vault is in
+    // ESCAPE mode: deposits/mints + market-deploying movers are blocked, and the
+    // three risk-reducing cranks below run permissionlessly (latch-gated +
+    // nonReentrant + a per-interval cooldown), with all redemption paths unaffected.
+    // -------------------------------------------------------------------------
+
+    /// @notice True while the escape brake is armed and the vault is in ESCAPE mode (M5).
+    function escapeActive() external view returns (bool);
+    /// @notice Per-interval escape-crank cooldown in seconds (M5 §4).
+    function escapeCrankInterval() external view returns (uint64);
+
+    /// @notice Arm the escape brake (M5 §1). INTERIM: admin-gated in this issue; the
+    ///         permissionless staleness trigger (`escapeGraceSeconds` + overdue-AND-
+    ///         claim>idle) is completed in SOLU-3371. `lp` is recorded in the event.
+    function triggerEscape(address lp) external;
+    /// @notice Permissionlessly clear the brake (M5 §1) — succeeds only when no
+    ///         overdue-unfillable request remains. `lps` is the set of LPs to check.
+    function exitEscape(address[] calldata lps) external;
+
+    /// @notice Leg 1 (M5 §2) — permissionlessly cancel the vault's resting orders on
+    ///         `asset` by cloid while latched. Each cloid must be vault-issued.
+    function escapeCancelOrders(uint32 asset, uint128[] calldata cloids) external;
+    /// @notice Leg 2 (M5 §2) — permissionlessly flatten perps via reduce-only IOC
+    ///         while latched, with the M4 markPx band MANDATORY (no force variant).
+    function escapeFlattenPerps(uint32[] calldata perpAssets, uint64[] calldata limitPxs) external;
+    /// @notice Leg 3 (M5 §2) — permissionlessly move all perp `withdrawable` equity
+    ///         to Core spot while latched. Amount read on-chain (conservative).
+    function escapeConsolidateToSpot() external;
 }
