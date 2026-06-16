@@ -4,14 +4,21 @@ Closes the residuals the forked-mainnet suite cannot reach (see [`FORK_PROOFS.md
 
 > **This runbook moves real funds and deploys a real contract. It is operator-driven — run it yourself with your keys; nothing here is executed automatically.** Keep the deposit cap tiny ($10–100). The deployed tier1/2/2b vaults are pre-v1.3 and cannot place orders — deploy a **fresh throwaway v1.3 vault**.
 
-## ⚠️ Read first — Finding G changes what's provable with the shipped USDC
+## ⚠️ Read first — Finding G is RESOLVED (v1.5 G2, round trip proven live 2026-06-15/16)
 
-The proof pass **confirmed** (`scripts/python/resolve_usdc_linkage.py`, and `test_G_legacyPushRevertsOnBlacklistedBridge`):
+> **The section below (Scenarios A/B and the "bridge reverts" framing) is HISTORICAL — pre-G2.**
+> The live G2 spike disproved the "bridge is dead" reading: the EVM↔Core USDC round trip works in
+> both directions with the shipped asset. Push goes through **Circle's CoreDepositWallet** (`deposit`);
+> pull uses CoreWriter **`send_asset` (action 13)**, NOT the legacy `spot_send` (which unified accounts
+> silently drop). See **Scenario C** below and `FORK_PROOFS.md` §"v1.5 G2 — live spike" for tx hashes.
+> So a real NAV>idle gap CAN now be made by pushing to Core, and F/Q4 are reachable that way.
 
-- the configured asset `0xb88339…630f` is **not** the Core-linked USDC (`tokenInfo(0).evmContract = 0x6B9E…0A24`);
-- the Core bridge `0x2000…0000` is **blacklisted** on that USDC, so **`pushToCore`/`pullFromCore` revert**.
+The pre-G2 proof pass had **confirmed** (`scripts/python/resolve_usdc_linkage.py`, and `test_G_legacyPushRevertsOnBlacklistedBridge`):
 
-⇒ With the shipped asset you **cannot** create a real NAV>idle gap (capital can't reach Core via the bridge), so **F and Q4 cannot be demonstrated end-to-end with `0xb88339…630f`.** Two scenarios follow.
+- the configured asset `0xb88339…630f`'s `tokenInfo(0).evmContract = 0x6B9E…0A24` (then read as "not the Core-linked USDC" — actually it is the bridge);
+- the *legacy* Core bridge path `0x2000…0000` (a raw ERC20 transfer) is **blacklisted** on that USDC, so the **legacy** push reverts (the wallet route is the replacement).
+
+⇒ Pre-G2, with the legacy path you could not create a real NAV>idle gap; **with the v1.5 wallet route you can.** The historical two-scenario framing follows.
 
 | | Scenario A — shipped USDC (cheap, do first) | Scenario B — bridge-functional asset (proves F/Q4) |
 |---|---|---|
@@ -20,13 +27,15 @@ The proof pass **confirmed** (`scripts/python/resolve_usdc_linkage.py`, and `tes
 | Risk/cost | ~3 txns, ~$0 at risk (push reverts) | deposits + Core round-trip; ~$10–100 + fees |
 | Gate | none | **first confirm `0x6B9E…0A24` exposes `decimals()`/`transfer()`** (it reverts `name()/symbol()`); if not ERC-4626-usable, F/Q4 stay deferred until the linkage is fixed |
 
-> **v1.5 G2 update (2026-06-12): Scenario B (asset swap) is permanently CLOSED, and that's fine.**
+> **v1.5 G2 update (2026-06-12; round trip PROVEN LIVE 2026-06-15/16): Scenario B (asset swap) is permanently CLOSED, and that's fine.**
 > `0x6B9E…0A24` reverts ERC-20 reads because it was never a token — it is **Circle's
 > CoreDepositWallet, the official USDC EVM<->Core bridge** (live 2025-12-08). The "gate"
 > failing was the expected behavior of a bridge contract, not a broken linkage. v1.5 routes
-> `pushToCore` through it (approve+deposit), `pullFromCore` is unchanged, and the shipped
-> Circle USDC stays the vault asset. The G2 round trip is **Scenario C** below; the
-> Core-seed method (Scenario B') remains useful for manufacturing NAV>idle without trading.
+> `pushToCore` through it (approve+deposit); **`pullFromCore` was reworked to CoreWriter
+> `send_asset` (action 13)** — the original `spot_send` (action 6) is silently dropped by
+> unified accounts (the spike caught this). The shipped Circle USDC stays the vault asset.
+> The G2 round trip ran and closed in both directions (**Scenario C** below); the Core-seed
+> method (Scenario B') remains useful for manufacturing NAV>idle without trading.
 
 ## Status (2026-06-03)
 
@@ -116,13 +125,23 @@ Executed result (2026-06-03): **Q4** fulfill paid **$3.70** of an $8 claim, ~2e1
 - **E (live):** while value sits on Core, `fulfill_withdraw` is idle-bound — it pays only idle and never reaches Core (confirmed: `coreSpotUsdc()` unchanged across the fulfill).
 - **F (race):** the direct `redeem` path and the queue compete for the same idle with no reservation/ordering — LP2's direct redeem drains it ahead of LP1's queued request, starving LP1 until repatriation.
 - **Q4 (partial fill):** when the claim exceeds idle, `fulfill_withdraw` partial-fills to exactly idle and leaves the remainder escrowed.
-- **Repatriation reality (as of that 2026-06-03 run; superseded by G2):** the v1.3 spike vault could not bridge Core→EVM; the realisation path used was `operatorRecoverSpot`→treasury→re-deposit (Path B). **v1.5: `pullFromCore` is the faithful route via the CoreDepositWallet (Scenario C); Path B is the contingency.**
+- **Repatriation reality (as of that 2026-06-03 run; superseded by G2):** the v1.3 spike vault could not bridge Core→EVM; the realisation path used was `operatorRecoverSpot`→treasury→re-deposit (Path B). **v1.5: `pullFromCore` is the faithful route via the CoreDepositWallet — emitting CoreWriter `send_asset` (action 13), proven live in Scenario C; Path B is the contingency.**
 
-## Scenario C — v1.5 G2: official CoreDepositWallet round trip (the merge gate)
+## Scenario C — v1.5 G2: official CoreDepositWallet round trip ✅ PROVEN LIVE 2026-06-15/16
+
+> **DONE.** The round trip ran end-to-end on a fresh vault (`0xDE6A0c…c777`) and closed in both
+> directions: push via the wallet credits Core, and pull via **`send_asset` (action 13)** debits Core
+> and the wallet pays the vault. Tx hashes in `FORK_PROOFS.md` §"v1.5 G2 — live spike". It also caught
+> two things a fork can't: the vault needed an **EIP-170 split** (`VaultTradeLib`) to deploy, and the
+> pull was using the wrong action (`spot_send` is silently dropped; the fix is `send_asset`). Two
+> operational rules below are now baked in: **never pull the exact full Core balance** (a ~0.00134 USDC
+> fee is taken on top, so a full-balance request is dropped — pull `balance × 0.998`), and a vault's
+> **first push costs 1.0 USDC** account-activation gas.
 
 Proves the two live-only G2 stubs (`test_G2_coreSpotCreditAppears_provenInLiveSpike`,
 `test_G2_walletPayoutOnPull_provenInLiveSpike`): the wallet route works end-to-end for a
-CONTRACT account, with real funds, no treasury hop anywhere.
+CONTRACT account, with real funds, no treasury hop anywhere. The deploy now also deploys + links
+`VaultTradeLib` (forge auto-handles it, or pre-deploy and pass `--libraries`).
 
 Throwaway v1.5 vault, tiny caps, `ALLOW_SHORT_TIMELOCK=1`, big-blocks opt-in for the
 deploy (~9M gas). The deploy config MUST carry `"coreDepositWallet":
@@ -149,16 +168,20 @@ python3 scripts/python/e2e_runner.py \
   --deposit-usdc 10
 ```
 
-**PASS criteria (all required):**
+**PASS criteria (all required) — met in the 2026-06-15/16 run:**
 - every tx `status == 1`; **no `operatorRecoverSpot` / treasury hop anywhere**;
-- push: wallet reserve `+$8`, HL API spot and on-chain `coreSpotUsdc()` agree at `$8`
-  within 60s (first push = fresh Core account: record any unexpected fee);
-- pull: vault idle `+floor(amountWei/100)` (±$0.01 dust), wallet reserve `−same`;
+- push: wallet reserve `+$8`; HL API spot and on-chain `coreSpotUsdc()` agree within 60s — but at
+  `$8 − 1.0` on a vault's **first** push (the one-time account-activation gas; `accountActivationGas`
+  in the ledger). The `e2e_runner` push assertion expects the full amount, so it flags this first-push
+  case — that's the activation fee, not a bridge failure;
+- pull: vault idle `+floor(amountWei/100)` (±$0.01 dust); **pull UNDER the Core balance** — a
+  ~0.00134 USDC withdrawal fee is deducted from Core on top of the amount, so requesting the exact full
+  balance is silently dropped (`send_asset` never debits). The runner pulls `balance × 0.998`;
 - `wallet_status`: vault→wallet allowance is 0 at rest, before and after;
-- alice recovers ≥ deposit − trade fees − $0.05.
+- alice recovers ≥ deposit − trade fees − the one-time $1 activation gas.
 
-Record the tx-hash table in [`FORK_PROOFS.md`](FORK_PROOFS.md) §"v1.5 G2" and flip the two
-`_provenInLiveSpike` stubs' status rows. Optional H1 residual while funded: timelock-execute
+Tx-hash table is recorded in [`FORK_PROOFS.md`](FORK_PROOFS.md) §"v1.5 G2 — live spike" and the two
+`_provenInLiveSpike` stubs are marked proven there. Optional H1 residual while funded: timelock-execute
 `endNavBootstrap()`, then read `coreSpotUsdc()` strict against the real precompile.
 
 ## Step N — recover funds and decommission
@@ -174,5 +197,5 @@ Record outcomes (tx hashes + which steps reverted) in [`FORK_PROOFS.md`](FORK_PR
 
 - Step 0 (historical, pre-G2 runs): printed `NOT LINKED (Finding G CONFIRMED)`. **v1.5: expect `WALLET-LINKED`.**
 - Scenario A (historical, v1.3 vault): `push` reverted on the blacklist; `pause_freeze_check` showed `pullFromCore` reverting while paused (pre-H2). **v1.5: a wallet-mode `push` succeeds; `pause_freeze_check` now asserts the H2 posture (pull succeeds while paused, `usdSpotToPerp` blocked).** The blacklist fact is pinned by the fork test `test_G_legacyPushRevertsOnBlacklistedBridge`.
-- Scenario B' (Core-seed): ✅ **PASSED 2026-06-03** — Q4 partial fill ($3.70 of an $8 claim, remainder escrowed), F starvation (direct redeem drained idle, queued LP got 1 wei), E (fulfill never reached Core). All funds recovered via `operatorRecoverSpot` (C-2 allowlist). **F and Q4 are closed.** The realisation-gap caveat in that run is superseded by G2: the faithful Core→EVM path exists (the CoreDepositWallet); Scenario C proves it.
-- Scenario C (v1.5 G2): ⏳ pending — the merge gate for `fix/G2-coredepositwallet-bridge`.
+- Scenario B' (Core-seed): ✅ **PASSED 2026-06-03** — Q4 partial fill ($3.70 of an $8 claim, remainder escrowed), F starvation (direct redeem drained idle, queued LP got 1 wei), E (fulfill never reached Core). All funds recovered via `operatorRecoverSpot` (C-2 allowlist). **F and Q4 are closed.** The realisation-gap caveat in that run is superseded by G2: the faithful Core→EVM path exists (the CoreDepositWallet, via `send_asset`); Scenario C proved it live (✅ 2026-06-15/16).
+- Scenario C (v1.5 G2): ✅ **PASSED 2026-06-15/16** — full round trip on fresh vault `0xDE6A0c…c777`: wallet push credits Core, **`send_asset` (action 13)** pull debits Core and the wallet pays the vault, redeem returns the funds. Caught + fixed the EIP-170 size blocker (`VaultTradeLib` split) and the `spot_send`→`send_asset` bug. Caveats baked in: never pull the full Core balance (~0.00134 USDC fee), 1.0 USDC first-push activation gas. Tx hashes in `FORK_PROOFS.md` §"v1.5 G2 — live spike". The merge gate for `fix/G2-coredepositwallet-bridge` is satisfied.

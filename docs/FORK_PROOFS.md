@@ -185,8 +185,9 @@ ERC-4626-usable as an asset) remain true and pinned by tests.
 v1.5 change set: `pushToCore` = `forceApprove + deposit(amount, CORE_SPOT_DEX_ID)` +
 zero-approve; `Config.coreDepositWallet` immutable with three-layer deploy validation
 (`wallet.token()`, `wallet.tokenSystemAddress()`, `tokenInfo.evmContract` →
-`CoreLinkVerified` / `CoreLinkMismatch`); `pullFromCore` byte-identical (proven below);
-legacy mode (`address(0)`) preserved.
+`CoreLinkVerified` / `CoreLinkMismatch`); `pullFromCore` was byte-identical at 06-12 but the
+06-15 live spike reworked it to CoreWriter `send_asset` (action 13) — see the live-spike
+section below; legacy mode (`address(0)`) preserved.
 
 | Claim | Test | Status | Substrate |
 |---|---|:--:|---|

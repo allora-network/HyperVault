@@ -1,7 +1,7 @@
 # HyperVault — Architecture
 
-> **Status:** audited core (7 critical/high mitigations baked in) · trade path + redemption queue **proven on HyperEVM mainnet** · redemption hardening in progress · one P0 config blocker (Finding G).
-> **As of:** 2026-06-03 · **Toolchain:** Solidity `0.8.27` (EVM `cancun`), OpenZeppelin Contracts v5, Foundry (optimizer 200, `bytecode_hash=none`) · Python live-runner. **Chain:** HyperEVM mainnet, chainId 999.
+> **Status:** audited core (7 critical/high mitigations baked in) · trade path + redemption queue + **the trustless EVM⇄Core USDC round trip proven on HyperEVM mainnet** · redemption hardening in progress · Finding G **RESOLVED** (v1.5 G2, proven live 2026-06-15/16).
+> **As of:** 2026-06-16 · **Toolchain:** Solidity `0.8.27` (EVM `cancun`), OpenZeppelin Contracts v5, Foundry (optimizer 200, `bytecode_hash=none`) · Python live-runner. **Chain:** HyperEVM mainnet, chainId 999.
 > This is the authoritative technical reference. For the leadership picture see [`ARCHITECTURE_EXECUTIVE.md`](ARCHITECTURE_EXECUTIVE.md); for the redemption review see [`REDEMPTION_ASSESSMENT.md`](REDEMPTION_ASSESSMENT.md); for the mainnet evidence see [`FORK_PROOFS.md`](FORK_PROOFS.md); for integration see [`INTEGRATION.md`](INTEGRATION.md).
 
 ---
@@ -104,18 +104,19 @@ write-and-guarded; the depositor's surface (value, exit) is computed by the cont
 
 ## 3. Contract reference
 
-Three contracts in `src/`, plus five libraries in `src/libraries/`. solc `0.8.27`, EVM `cancun`, OZ v5.
+Three contracts in `src/`, plus six libraries in `src/libraries/`. solc `0.8.27`, EVM `cancun`, OZ v5.
 
 | Contract (file) | Role | Key surface |
 |---|---|---|
 | **`HyperCoreVault`** (`HyperCoreVault.sol`) | The vault. `is IHyperCoreVault, ERC4626, AccessControl, Pausable, ReentrancyGuard` | deposit/withdraw/redeem, the request queue, trading, NAV, fees, guardrails (full surface below) |
 | **`HyperCoreVaultFactory`** (`HyperCoreVaultFactory.sol`) | CREATE2 factory, one per chain. Deploys a **per-vault `TimelockController`** + the vault, registers it | `deployVault(cfg, timelockMinDelaySec)`, `vaultSalt`, `setStrictAssetValidation` |
 | **`HyperCoreVaultRegistry`** (`HyperCoreVaultRegistry.sol`) | On-chain directory the frontend reads | `register` (factory/owner only), `getAllVaults`, `count`, `isRegistered` |
-| `libraries/CoreWriterLib` | Typed CoreWriter actions (limit order, spot send, USD class transfer, cancels) | — |
+| `libraries/CoreWriterLib` | Typed CoreWriter actions (limit order, **`send_asset` (id 13)** for Core⇄EVM, USD class transfer, cancels; legacy `spot_send` (id 6) kept but unused — dropped by unified accounts) | — |
 | `libraries/PrecompileLib` | L1 read precompiles, lenient + `…Strict` variants | — |
 | `libraries/AssetId` | Encode/decode perp (`index`) vs spot (`10_000 + index`) asset ids | — |
 | `libraries/SystemAddress` | Per-token bridge/system address (`0x20 ‖ 11×0x00 ‖ tokenIndex`) | — |
 | `libraries/Constants` | Compile-time addresses, action ids, TIF enum, decimals | — |
+| **`libraries/VaultTradeLib`** | **External (delegatecall) library — EIP-170 split (v1.5 G2).** Holds the trade gate (whitelist + slippage band + leverage cap) + the emergency-close loop so the vault fits the 24576-byte limit. Pure logic, no storage; events/errors re-declared to keep topics/selectors identical | must be deployed + linked |
 
 ### 3.1 `HyperCoreVault` — constructor config
 
@@ -172,6 +173,13 @@ hand them to multisig/governance post-deploy*.
 > **Note:** the testnet/mainnet deploy script (`script/Deploy.s.sol`) bypasses the factory's CREATE2
 > path (EIP-170 init-code size) and deploys the timelock + vault directly, registering via the registry's
 > owner-writer path. The factory remains the canonical production primitive.
+>
+> **EIP-170 (v1.5 G2):** the vault's runtime bytecode (26411 B) exceeds HyperEVM's enforced 24576-byte
+> contract-size limit, so the trade gate (whitelist + slippage band + leverage cap) and the
+> emergency-close loop were extracted into an external **`VaultTradeLib`** (delegatecall) — vault now
+> 24237 B. The library must be deployed and linked before the vault; `forge` / `Deploy.s.sol` handle
+> this automatically (or pre-deploy it and pass `--libraries`). Behaviour is identical (events/errors
+> re-declared so log topics + revert selectors match; fork 54/0/4, unit 10/10).
 
 ### 3.4 `HyperCoreVaultRegistry`
 
@@ -365,8 +373,8 @@ The operator moves USDC across three locations: **idle (EVM)** → **Core spot**
 
 ```mermaid
 flowchart LR
-  IDLE["idle USDC (EVM, 6dp)"] -->|"pushToCore — ERC20.transfer to USDC system addr"| SPOT["Core spot USDC (8dp)"]
-  SPOT -->|"pullFromCore — CoreWriter spot_send to system addr"| IDLE
+  IDLE["idle USDC (EVM, 6dp)"] -->|"pushToCore — CoreDepositWallet.deposit (G2; legacy: ERC20.transfer to system addr)"| SPOT["Core spot USDC (8dp)"]
+  SPOT -->|"pullFromCore — CoreWriter send_asset (action 13) to system addr (G2; NOT spot_send)"| IDLE
   SPOT -->|"usdSpotToPerp — class transfer"| PERP["perp USD margin (6dp)"]
   PERP -->|"usdPerpToSpot — class transfer"| SPOT
   SPOT -->|"operatorRecoverSpot(to, token, amtWei) — to an ALLOWLISTED dest (C-2)"| TRE["treasury / re-deposit"]
@@ -375,21 +383,27 @@ flowchart LR
 The USDC bridge / system address is `0x2000…0000` (token index 0 in the last 8 bytes, big-endian;
 `SystemAddress`).
 
-> ### Finding G — the P0 blocker (confirmed live)
-> On the **shipped configuration** the vault's `asset()` (`0xb883…630f`) is **not** the USDC that Core
-> token 0 bridges to (`tokenInfo(0).evmContract = 0x6B9E…0A24`), and the bridge `0x2000…0000` is
-> **blacklisted** on the shipped Circle USDC. Consequences, all now on-chain facts:
-> 1. `pushToCore` / `pullFromCore` **revert** (`Blacklistable: account is blacklisted`) — the canonical
->    EVM↔Core bridge is unusable for this asset.
-> 2. `coreSpotUsdc()` measures a token that is **not** `asset()` — that NAV term is unfaithful.
-> 3. The linked USDC `0x6B9E…0A24` has bytecode but **reverts on every standard ERC-20 read**, so you
->    **cannot** simply redeploy with it (it can't back an ERC-4626).
+> ### Finding G — RESOLVED in v1.5 G2 (round trip proven live 2026-06-15/16)
+> The 2026-06-03 observations were right but the interpretation was wrong. `tokenInfo(0).evmContract =
+> 0x6B9E…0A24` is **Circle's CoreDepositWallet** — the official USDC EVM⇄Core bridge — **not** a competing
+> token. It reverts every ERC-20 read because it is not a token; Circle blacklisted `0x2000…0000` on the
+> USDC token to force the wallet path. So the shipped `asset()` (`0xb883…630f`) **is** the right USDC, and
+> `coreSpotUsdc()` is faithful (the wallet bridges Core token 0 to it 1:1). What changed in code:
+> 1. **Push:** `pushToCore` = `approve + deposit(amount, CORE_SPOT_DEX_ID)` on the wallet (not the legacy
+>    `transfer` to the system address, which is genuinely dead for native USDC).
+> 2. **Pull:** `pullFromCore`/`operatorRecoverSpot`/`emergencyRepatriate` emit CoreWriter **`send_asset`
+>    (action 13)** to the token system address — **NOT** the legacy `spot_send` (action 6), which unified
+>    HyperCore accounts silently drop (the EVM tx succeeds but Core never debits). The wallet then pays the
+>    caller (the vault) native USDC = `amount/100`.
+> 3. **Fees / caveats:** a ~0.00134 USDC withdrawal fee is taken from Core on top of the amount, so the
+>    keeper must **never request the exact full Core balance** (it gets dropped) — pull under it. A vault's
+>    first push costs a one-time **1.0 USDC** account-activation gas.
 >
-> ⇒ The only realisation path is **Path B repatriation: `operatorRecoverSpot` → treasury → re-deposit**
-> (proven live on 2026-06-03 — and note `operatorRecoverSpot` is fire-and-forget, so a keeper must
-> reconcile Core state and retry). Fixing the asset linkage + wiring Path B is the **must-do before real
-> LP money**. `operatorSweepStranded` recovers EVM `asset()` only when `totalSupply == 0` (the
-> donate-to-empty-vault trap).
+> The trustless deposit→Core→trade→back→withdraw loop is now proven live in both directions (tx hashes in
+> `FORK_PROOFS.md` §"v1.5 G2 — live spike"). **Path B** (`operatorRecoverSpot` → treasury → re-deposit)
+> demotes to a **contingency** for a Circle-paused/changed wallet (the wallet is Circle-operated,
+> upgradeable, pausable; both directions pause together). `operatorSweepStranded` recovers EVM `asset()`
+> only when `totalSupply == 0` (the donate-to-empty-vault trap).
 
 ---
 
@@ -402,8 +416,10 @@ The USDC bridge / system address is `0x2000…0000` (token index 0 in the last 8
 | `EMERGENCY_ROLE` | Multisig (e.g. 2-of-3) | `pause`/`unpause`, `emergencyCancelByCloid`/`ByOid`, `emergencyClosePositions`, `emergencyShutdown` (one-way) |
 | `feeRecipient` | Multisig | Receives mgmt-fee shares + perf fee in USDC; **immutable**, set at construction |
 
-**Pause semantics (important):** the Core→EVM movers (`pullFromCore`, `usdSpotToPerp`/`usdPerpToSpot`,
-`operatorRecoverSpot`) are `whenNotPaused`, so **pausing freezes the refill path** (Finding A) — while
+**Pause semantics (important):** audit **H2** makes the Core→EVM refill movers (`pullFromCore`,
+`usdPerpToSpot`, `operatorRecoverSpot`) **NOT** `whenNotPaused` — they only move funds toward
+redeemable idle, so a pause must never freeze them (this closed the original **Finding A**, where
+pausing stranded LPs). Only the risk-deploying movers (`usdSpotToPerp`, `pushToCore`) stay paused;
 **redemptions are never pausable**. `emergencyShutdown` blocks new deposits but leaves exits open.
 `emergencyClosePositions` scales perp size from Core units to action units (ultrareview `bug_009`).
 
@@ -497,7 +513,7 @@ wrapper (the vault *is* its own Core account).
 
 | Priority | Item |
 |---|---|
-| **P0** | **Finding G** — wire Path B repatriation (`operatorRecoverSpot`→treasury→re-deposit) + reconcile the `coreSpotUsdc` NAV term; **Finding C** — production key topology |
+| **P0** | ~~**Finding G**~~ — ✅ RESOLVED + proven live (v1.5 G2: wallet push + `send_asset` pull, full round trip); **Finding C** — production key topology (split roles · real timelock · multisig) remains |
 | **P0** | **A+B** — make repatriation reachable under emergency / a permissionless forced-close so capital always reaches LPs |
 | **P1** | **D** — keeper service (watch `WithdrawalRequested` → repatriate → fulfil); **E** — on-chain `fulfillmentDeadline`; **F** — fairness policy between the two exit paths; soft barriers (cooldown/gate) documented as 4626 deviations |
 | **P2** | Flip `strictNavReads` / `strictAssetValidation` on after Core init; production caps; expand the Foundry queue coverage |

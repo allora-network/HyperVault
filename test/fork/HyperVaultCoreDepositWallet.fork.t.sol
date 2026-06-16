@@ -163,21 +163,27 @@ contract HyperVaultCoreDepositWalletForkTest is HyperVaultBaseForkTest {
     }
 
     // ───────────────────────────────────────────────────────────────────────
-    // Live-only stubs (Scenario C, docs/REDEMPTION_LIVE_RUNBOOK.md): a forge
-    // fork cannot serve the HyperCore side — the spot credit appearing after a
-    // push, and the wallet's system-guarded payout after a Core-side send.
+    // Live-only stubs: a forge fork cannot serve the HyperCore side — the spot
+    // credit after a push, and the wallet's system-guarded payout after a
+    // Core-side send_asset. BOTH PROVEN LIVE 2026-06-15/16 on throwaway vault
+    // 0xDE6A0c9371aCBC95fd3AC6B8A3598780013ec777 — see docs/FORK_PROOFS.md
+    // "v1.5 G2 — live spike" for the full tx-hash record.
     // ───────────────────────────────────────────────────────────────────────
 
-    /// @dev Live spike: after `pushToCore(X)`, the HL API and the on-chain
-    ///      `coreSpotUsdc()` precompile read both show the vault's Core spot
-    ///      balance == X (within Core dust).
+    /// @dev PROVEN LIVE: after `pushToCore(X)`, the HL API and the on-chain
+    ///      `coreSpotUsdc()` precompile both show the vault's Core spot credited
+    ///      (X minus the one-time 1.0 USDC first-account activation gas).
     function test_G2_coreSpotCreditAppears_provenInLiveSpike() public {
         vm.skip(true);
     }
 
-    /// @dev Live spike: after a Core-side `spot_send` of the full balance to the
-    ///      system address, the wallet's reserve drops and the vault's EVM idle
-    ///      rises by floor(amountWei/100) — the official payout path.
+    /// @dev PROVEN LIVE: the pull is a CoreWriter `send_asset` (action 13) to the
+    ///      system address (NOT `spot_send` — unified accounts drop that). It
+    ///      debits the vault's Core spot and the wallet pays native USDC to the
+    ///      CALLER (this vault), idle += floor(amountWei/100). A ~0.00134 USDC
+    ///      withdrawal fee is taken from Core on top of the amount, so the EXACT
+    ///      full balance is dropped — pull under it. Settled txs:
+    ///      0xc47db60e… ($1) and 0xa44b4fbf… ($2.79); full-balance drop: 0xb65397a0….
     function test_G2_walletPayoutOnPull_provenInLiveSpike() public {
         vm.skip(true);
     }

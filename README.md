@@ -74,7 +74,8 @@ src/                          Solidity sources
   HyperCoreVaultRegistry.sol  On-chain directory of deployed vaults
   libraries/
     Constants.sol             Precompile addresses, CoreWriter action IDs, TIF enum, USDC indices
-    CoreWriterLib.sol         Typed wrappers for limit_order / spot_send / usd_class_transfer / cancel
+    CoreWriterLib.sol         Typed wrappers for limit_order / send_asset / spot_send / usd_class_transfer / cancel
+    VaultTradeLib.sol         External delegatecall lib: trade gate + emergency close (EIP-170 size split)
     PrecompileLib.sol         Typed reads of all L1 precompiles (position, spotBalance, oraclePx, etc.)
     AssetId.sol               Perp/spot ID encoding (spot = 10_000 + spotIdx)
     SystemAddress.sol         Token bridge-address derivation (0x20 || zero-pad || tokenIdx)
@@ -124,7 +125,7 @@ frontend/                     Vite + React + viem discovery UI
 **`HyperCoreVault.sol`** — the main contract. Per-strategy, EIP-4626-compliant. Notable surface:
 - `deposit / mint / withdraw / redeem` — standard ERC-4626 with `maxWithdraw` correctly bounded by idle USDC (no silent reverts)
 - `placeLimitOrder / cancelOrderByCloid` — operator-only, gated by asset whitelist + slippage band vs `oraclePx` + post-trade leverage cap
-- `pushToCore / pullFromCore` — operator-only EVM↔Core USDC bridging. **v1.5 (G2):** push goes through **Circle's CoreDepositWallet** (`approve + deposit`, the official route for natively-minted USDC; `coreDepositWallet` is a validated per-vault immutable, `address(0)` = legacy direct-linked-asset mode); pull is the unchanged Core-side send that the wallet pays out
+- `pushToCore / pullFromCore` — operator-only EVM↔Core USDC bridging. **v1.5 (G2), proven live:** push goes through **Circle's CoreDepositWallet** (`approve + deposit`, the official route for natively-minted USDC; `coreDepositWallet` is a validated per-vault immutable, `address(0)` = legacy direct-linked-asset mode); pull is a CoreWriter **`send_asset` (action 13)** to the token system address (NOT the legacy `spot_send`, which unified HyperCore accounts silently drop) — the wallet then pays native USDC to the vault. A small ~0.00134 USDC withdrawal fee means the keeper must pull **under** the full Core balance; a vault's first push costs 1.0 USDC one-time activation gas
 - `operatorRecoverSpot(to, token, amountWei)` — operator-only generic Core spot send; **contingency** (e.g. Circle pauses the wallet) — no longer the primary realisation path
 - `usdSpotToPerp / usdPerpToSpot` — operator-only USD class transfers
 - `operatorSweepStranded(to)` — recovers EVM `asset()` balance when `totalSupply == 0` (the donation-to-empty-vault recovery)
@@ -138,7 +139,9 @@ frontend/                     Vite + React + viem discovery UI
 
 ### Libraries
 
-**`CoreWriterLib`** — wraps the CoreWriter system contract (`0x3333…3333`). Each typed function packs `abi.encodePacked(uint8(1), uint24(actionId), abi.encode(args))` and calls `sendRawAction`. The action set: `limit_order`, `cancel_order_by_oid`, `cancel_order_by_cloid`, `spot_send`, `usd_class_transfer`, `vault_transfer`. Encoding follows the HL CoreWriter spec — `px`/`sz` as `human × 10^8` and `tif` as `1=ALO / 2=GTC / 3=IOC` — verified live by the mainnet test harness.
+**`CoreWriterLib`** — wraps the CoreWriter system contract (`0x3333…3333`). Each typed function packs `abi.encodePacked(uint8(1), uint24(actionId), abi.encode(args))` and calls `sendRawAction`. The action set: `limit_order`, `cancel_order_by_oid`, `cancel_order_by_cloid`, `spot_send` (legacy — dropped by unified accounts), **`send_asset` (action 13 — the working Core spot move / Core→EVM withdrawal)**, `usd_class_transfer`, `vault_transfer`. Encoding follows the HL CoreWriter spec — `px`/`sz` as `human × 10^8` and `tif` as `1=ALO / 2=GTC / 3=IOC` — verified live by the mainnet test harness.
+
+**`VaultTradeLib`** — external **delegatecall** library holding the trade gate (whitelist + slippage band + leverage cap) and the emergency-close loop, factored out of the vault so its runtime fits the **EIP-170 24576-byte limit** (the vault was 26411 B; → 24237 B). Pure logic invoked under delegatecall (`address(this)` is the vault), no storage; events/errors are re-declared so logs/selectors are byte-identical to the inlined version. `Deploy.s.sol` / `forge` deploy + link it automatically.
 
 **`PrecompileLib`** — typed `staticcall` wrappers for every L1 read precompile (`0x0800–0x0810`). Returns the protocol's struct; falls back to zero-initialised struct if the precompile errors (e.g., the account has never touched that market). Used by the vault for `totalAssets` (NAV = idle + coreSpot + perpWithdrawable) and by the operator gates (oraclePx for slippage, position/markPx for leverage).
 
