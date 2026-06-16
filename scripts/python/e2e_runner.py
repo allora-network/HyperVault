@@ -720,6 +720,27 @@ def step_pause_freeze_check(ctx: Ctx) -> bool:
     return pull_ok and deploy_blocked
 
 
+def step_keeper(ctx: Ctx, args: argparse.Namespace) -> bool:
+    """Assessment TODO-4: automated redemption-fulfillment keeper loop.
+
+    Watches WithdrawalRequested, repatriates the material pending claim via the
+    fee-guarded send_asset pull (Core->EVM), then calls fulfillWithdraw — recording
+    fulfilled LPs + residuals and monitoring the CoreDepositWallet paused() state.
+    DRY-RUN by default (reads live state, logs intended actions, sends nothing);
+    --keeper-execute opts into the tx-sending (funded, human-gated) mode. The loop
+    lives in keeper.py to keep this file focused; it reuses send_tx/wait_for/parse_event.
+    """
+    import keeper
+    config = keeper.KeeperConfig(
+        execute=args.keeper_execute,
+        poll_s=args.keeper_poll,
+        max_iterations=args.keeper_max_iter,
+        timeout_s=args.keeper_timeout,
+        start_block=args.keeper_start_block,
+    )
+    return keeper.run_keeper(ctx, config)
+
+
 # -----------------------------------------------------------------------------
 # Orchestration
 # -----------------------------------------------------------------------------
@@ -728,8 +749,9 @@ ALL_STEPS = ["preflight", "deposit", "core_status", "wallet_status", "push", "sp
              "place", "cancel", "fill", "perp_to_spot", "pull", "redeem"]
 
 # Redemption-loop steps — selected explicitly via --steps (not part of the default run).
+# `keeper` (TODO-4) is the automated fulfillment loop; dry-run by default, --keeper-execute to send.
 QUEUE_STEPS = ["request_withdraw", "fulfill_withdraw", "operator_repatriate",
-               "cancel_withdraw", "pause_freeze_check"]
+               "cancel_withdraw", "pause_freeze_check", "keeper"]
 
 # Steps that require a real EVM-side USDC ↔ Core bridge. Skipped automatically
 # when the asset has no linked bridge (testnet MockUSDC case).
@@ -749,9 +771,25 @@ def main() -> int:
     parser.add_argument("--steps", default=",".join(ALL_STEPS),
                         help="comma-separated step names or 'all' (lifecycle steps; plus "
                              "redemption-queue steps: request_withdraw, fulfill_withdraw, "
-                             "operator_repatriate, cancel_withdraw, pause_freeze_check)")
+                             "operator_repatriate, cancel_withdraw, pause_freeze_check; and "
+                             "'keeper' = the TODO-4 automated fulfillment loop, dry-run unless "
+                             "--keeper-execute)")
     parser.add_argument("--skip-bridge", action="store_true",
                         help="omit push/pull steps (use for testnet MockUSDC)")
+    # Keeper loop (Assessment TODO-4) — runs via `--steps keeper`. DRY-RUN by default:
+    # it reads live state and logs intended actions WITHOUT sending txs. Sending txs
+    # (the funded battle-test) is a human gate behind the explicit --keeper-execute flag.
+    parser.add_argument("--keeper-execute", action="store_true",
+                        help="keeper: actually SEND repatriation/fulfill txs (default: dry-run "
+                             "reads + logs only). The funded run is human-gated — use with care.")
+    parser.add_argument("--keeper-poll", type=float, default=5.0,
+                        help="keeper: seconds between passes (default 5)")
+    parser.add_argument("--keeper-max-iter", type=int, default=12,
+                        help="keeper: max passes before stopping (0 = until --keeper-timeout)")
+    parser.add_argument("--keeper-timeout", type=int, default=600,
+                        help="keeper: overall wall-clock bound in seconds (default 600)")
+    parser.add_argument("--keeper-start-block", type=int, default=None,
+                        help="keeper: WithdrawalRequested scan start block (default: head - 5000)")
     args = parser.parse_args()
 
     if not args.artifact:
@@ -809,6 +847,8 @@ def main() -> int:
                 step_cancel_withdraw(ctx)
             elif step == "pause_freeze_check":
                 step_pause_freeze_check(ctx)
+            elif step == "keeper":
+                step_keeper(ctx, args)
             else:
                 ctx.console.print(f"[yellow]unknown step: {step}[/yellow]")
         except Exception as e:
