@@ -411,4 +411,12 @@ interface IHyperCoreVault is IERC4626 {
     /// @notice Leg 3 (M5 §2) — permissionlessly move all perp `withdrawable` equity
     ///         to Core spot while latched. Amount read on-chain (conservative).
     function escapeConsolidateToSpot() external;
+    /// @notice Leg 4a (M5 §2 leg 4 / §3 option 4a / §7 Phase 2, SOLU-3370) —
+    ///         permissionlessly pull the vault's Core spot USDC back to EVM idle while
+    ///         latched, in `maxChunkWei`-bounded chunks (Core wei, 8dp). Fee-aware
+    ///         (sends 99.8% of the balance — never the exact full balance, which the
+    ///         ~0.00134 USDC withdrawal fee would drop). Called repeatedly,
+    ///         cooldown-spaced, to drain the Core balance; {fulfillWithdraw} then drains
+    ///         the LP queue as idle lands. The escape-mode twin of {pullFromCore}.
+    function escapePullToEvm(uint64 maxChunkWei) external;
 }

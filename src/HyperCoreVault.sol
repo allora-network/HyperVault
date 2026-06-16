@@ -12,7 +12,6 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {IHyperCoreVault} from "./interfaces/IHyperCoreVault.sol";
 import {ICoreDepositWallet} from "./interfaces/ICoreDepositWallet.sol";
-import {CoreWriterLib} from "./libraries/CoreWriterLib.sol";
 import {PrecompileLib} from "./libraries/PrecompileLib.sol";
 import {SystemAddress} from "./libraries/SystemAddress.sol";
 import {AssetId} from "./libraries/AssetId.sol";
@@ -752,9 +751,12 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         );
     }
 
+    /// @dev Audit G2 (EIP-170): the cancel dispatch + emit live in
+    ///      {VaultEscapeLib.cancelOrderByCloid} (delegatecall) to reclaim the vault's
+    ///      24576-byte budget after M5's leg 4a. The role gate + `nonReentrant` stay
+    ///      here; the {OrderCancelByCloidSubmitted} log is byte-identical.
     function cancelOrderByCloid(uint32 asset_, uint128 cloid) external onlyRole(OPERATOR_ROLE) nonReentrant {
-        CoreWriterLib.cancelOrderByCloid(asset_, cloid);
-        emit OrderCancelByCloidSubmitted(asset_, cloid);
+        VaultEscapeLib.cancelOrderByCloid(asset_, cloid);
     }
 
     /// @dev Audit G2: wallet mode deposits via Circle's CoreDepositWallet —
@@ -859,21 +861,26 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         VaultEmergencyLib.operatorSweepStranded(to);
     }
 
+    /// @dev Audit G2 (EIP-170): the `usd_class_transfer` encode + emit live in
+    ///      {VaultEscapeLib.usdClassTransfer} (delegatecall) to reclaim the vault's
+    ///      24576-byte budget after M5's leg 4a. The role gate + `whenNotPaused` +
+    ///      `nonReentrant` + the ESCAPE-mode check stay here; the
+    ///      {UsdClassTransferSubmitted} log is byte-identical across the boundary.
     function usdSpotToPerp(uint64 ntl) external onlyRole(OPERATOR_ROLE) whenNotPaused nonReentrant {
         // M5 §4: ESCAPE mode blocks spot->perp — it ADDS market exposure, the
         // opposite of an unwind. (perp->spot, {usdPerpToSpot}, stays open — it's
         // risk-reducing and is leg 3's own primitive.)
         if (_escape.active) revert EscapeModeActive();
-        CoreWriterLib.usdClassTransfer(ntl, true);
-        emit UsdClassTransferSubmitted(ntl, true);
+        VaultEscapeLib.usdClassTransfer(ntl, true);
     }
 
     /// @dev Audit H2: NOT `whenNotPaused` — perp->spot moves equity toward
     ///      redeemable idle (no new market risk). `usdSpotToPerp` (spot->perp,
     ///      which DOES add exposure) deliberately stays paused.
+    /// @dev Audit G2 (EIP-170): body in {VaultEscapeLib.usdClassTransfer}
+    ///      (delegatecall); the {UsdClassTransferSubmitted} log is unchanged.
     function usdPerpToSpot(uint64 ntl) external onlyRole(OPERATOR_ROLE) nonReentrant {
-        CoreWriterLib.usdClassTransfer(ntl, false);
-        emit UsdClassTransferSubmitted(ntl, false);
+        VaultEscapeLib.usdClassTransfer(ntl, false);
     }
 
     // -------------------------------------------------------------------------
@@ -1105,6 +1112,33 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     function escapeConsolidateToSpot() external nonReentrant {
         _accrueMgmtFee();
         VaultEscapeLib.escapeConsolidateToSpot(_escape, navBootstrap);
+    }
+
+    /// @notice Leg 4a (M5 §2 leg 4 / §3 option 4a / §7 Phase 2, SOLU-3370) —
+    ///         permissionlessly pull the vault's Core spot USDC back to EVM idle while
+    ///         latched, in `maxChunkWei`-bounded chunks. The escape-mode twin of
+    ///         {pullFromCore}: it repatriates Core USDC toward redeemable idle (no new
+    ///         market risk), so it belongs to the pull family the H2 design keeps
+    ///         UNBLOCKED during escape.
+    /// @dev    PERMISSIONLESS + nonReentrant + PAUSE-IMMUNE (no `whenNotPaused`,
+    ///         mirroring {pullFromCore} and the other H2 refill movers — freezing the
+    ///         repatriation path on pause would strand LPs, Finding A). The
+    ///         latch+cooldown gate, the lenient/strict Core-balance read (per
+    ///         {navBootstrap}, matching {coreSpotUsdc}), the FEE-AWARE `balance*998/1000`
+    ///         guard (never the exact full balance — the ~0.00134 USDC withdrawal fee
+    ///         drops an exact-full send, proven in the G2 spike), the `maxChunkWei`
+    ///         chunk cap, and the `send_asset` (action 13) dispatch all live in
+    ///         {VaultEscapeLib.escapePullToEvm} (vault EIP-170 budget; `coreUsdcIndex`
+    ///         threaded by value, an immutable unreachable from a delegatecall library).
+    ///         The {BridgeWithdraw} log is byte-identical to {pullFromCore}'s.
+    ///
+    ///         Anyone (keeper/LP) calls this REPEATEDLY, cooldown-spaced, to drain the
+    ///         Core balance toward EVM idle; {fulfillWithdraw} (already permissionless)
+    ///         then drains the LP queue as the pulled idle lands. NO mgmt-fee accrual:
+    ///         Core->EVM is NAV-neutral (both legs count in {totalAssets}), matching
+    ///         {pullFromCore} (and unlike leg 3's consolidate, which converges NAV).
+    function escapePullToEvm(uint64 maxChunkWei) external nonReentrant {
+        VaultEscapeLib.escapePullToEvm(_escape, coreUsdcIndex, navBootstrap, maxChunkWei);
     }
 
     // -------------------------------------------------------------------------

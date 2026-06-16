@@ -6,14 +6,16 @@ import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {IHyperCoreVault} from "../interfaces/IHyperCoreVault.sol";
 import {CoreWriterLib} from "./CoreWriterLib.sol";
 import {PrecompileLib} from "./PrecompileLib.sol";
+import {SystemAddress} from "./SystemAddress.sol";
 import {Constants} from "./Constants.sol";
 
 /// @title  VaultEscapeLib — externalized permissionless escape-hatch logic (M5)
-/// @notice Phase 1 of the "dead man's brake" (docs/ESCAPE_HATCH_SCOPE.md §2,§4,§7):
-///         the latch + cooldown machinery and the three risk-reducing cranks that
-///         run while the vault is latched into ESCAPE mode — cancel resting orders
-///         (leg 1), flatten perps via reduce-only IOC (leg 2), and consolidate perp
-///         equity to Core spot (leg 3). Like {VaultTradeLib} these are EXTERNAL
+/// @notice Phases 1-2 of the "dead man's brake" (docs/ESCAPE_HATCH_SCOPE.md §2,§4,§7):
+///         the latch + cooldown machinery and the risk-reducing / repatriating cranks
+///         that run while the vault is latched into ESCAPE mode — cancel resting orders
+///         (leg 1), flatten perps via reduce-only IOC (leg 2), consolidate perp
+///         equity to Core spot (leg 3), and pull Core spot USDC back to EVM idle
+///         (leg 4a — Phase 2, SOLU-3370). Like {VaultTradeLib} these are EXTERNAL
 ///         functions invoked by the vault via DELEGATECALL, so `address(this)` is
 ///         the vault: CoreWriter sees the vault as the order's sender, the precompile
 ///         reads resolve the vault's own Core positions, and — crucially for M5 — the
@@ -78,6 +80,10 @@ library VaultEscapeLib {
     event OrderCancelByCloidSubmitted(uint32 indexed asset, uint128 indexed cloid);
     /// @notice A leg-3 perp->spot move (mirrors {IHyperCoreVault.UsdClassTransferSubmitted}).
     event UsdClassTransferSubmitted(uint64 ntl, bool toPerp);
+    /// @notice A leg-4a Core spot USDC -> EVM idle pull (mirrors
+    ///         {IHyperCoreVault.BridgeWithdraw} / {VaultEmergencyLib.BridgeWithdraw}), so
+    ///         the escape pull is logged byte-identically to {HyperCoreVault.pullFromCore}.
+    event BridgeWithdraw(uint64 amountWei);
 
     /// @notice Mirrors {VaultTradeLib.EmergencyCloseBandExceeded}: a flatten
     ///         `limitPx` deviates from the strict markPx beyond the mandatory band.
@@ -351,5 +357,118 @@ library VaultEscapeLib {
             emit UsdClassTransferSubmitted(movedNtl, false);
         }
         emit EscapeCrankRun(msg.sender, 3);
+    }
+
+    // -------------------------------------------------------------------------
+    // Shared USD class-transfer primitive (used by {HyperCoreVault.usdSpotToPerp} /
+    // {usdPerpToSpot}). Externalized here (delegatecall) so the vault no longer inlines
+    // the CoreWriter `usd_class_transfer` encode + the emit on those movers, reclaiming
+    // EIP-170 budget for leg 4a (SOLU-3370). The access-control gate, `whenNotPaused`
+    // posture, `nonReentrant`, and the M5 ESCAPE-mode check stay on the vault wrappers;
+    // the {UsdClassTransferSubmitted} log is byte-identical across the boundary.
+    // -------------------------------------------------------------------------
+
+    /// @notice Move USD between Core spot and perp margin classes (`toPerp`: spot->perp
+    ///         when true, perp->spot when false) and emit {UsdClassTransferSubmitted}.
+    function usdClassTransfer(uint64 ntl, bool toPerp) external {
+        CoreWriterLib.usdClassTransfer(ntl, toPerp);
+        emit UsdClassTransferSubmitted(ntl, toPerp);
+    }
+
+    /// @notice Cancel a single resting order by client order id and emit
+    ///         {OrderCancelByCloidSubmitted}. Body of {HyperCoreVault.cancelOrderByCloid}
+    ///         (the OPERATOR cancel), externalized here (delegatecall) for the same
+    ///         EIP-170 reason — the role gate + `nonReentrant` stay on the vault wrapper
+    ///         and the log is byte-identical. (Distinct from leg 1's permissionless,
+    ///         latch-gated, cloid-validated {escapeCancelOrders} loop.)
+    function cancelOrderByCloid(uint32 asset, uint128 cloid) external {
+        CoreWriterLib.cancelOrderByCloid(asset, cloid);
+        emit OrderCancelByCloidSubmitted(asset, cloid);
+    }
+
+    // -------------------------------------------------------------------------
+    // Leg 4a — pull Core spot USDC back to EVM idle (§2 leg 4, §3 option 4a, §7 Phase 2)
+    // -------------------------------------------------------------------------
+
+    /// @dev Fee-aware send numerator/denominator (PULL_FEE_NUM/PULL_FEE_DEN =
+    ///      998/1000 = 99.8%). A Core->EVM withdrawal takes a ~0.00134 USDC fee FROM
+    ///      Core on TOP of the requested amount, so requesting the EXACT full balance
+    ///      is silently DROPPED (the fee cannot be covered) — proven live in the G2
+    ///      spike (2026-06-15/16). Sending `balance * 998 / 1000` leaves a 0.2% cushion
+    ///      that dwarfs the fixed fee for any non-trivial balance and rounds DOWN toward
+    ///      zero for dust (so the send can never exceed the balance). This mirrors the
+    ///      keeper's `balance * 0.998` and {HyperCoreVault.pullFromCore}'s documented
+    ///      "pull under the full balance". (NB: a dedicated 998/1000 — NOT
+    ///      {Constants.BPS}'s 1/10_000 scale — so the cushion is 0.2%, not 9.98%.)
+    uint64 internal constant PULL_FEE_NUM = 998;
+    uint64 internal constant PULL_FEE_DEN = 1000;
+
+    /// @notice PERMISSIONLESS, escape-gated, CHUNKED pull of the vault's Core spot USDC
+    ///         back to EVM idle while latched (M5 §2 leg 4 / §3 option 4a / §7 Phase 2,
+    ///         SOLU-3370) — the escape-mode twin of {HyperCoreVault.pullFromCore},
+    ///         re-targeting funds toward LP redeemability. Moves Core USDC toward idle
+    ///         (no new market risk), so it belongs to the pull family the H2 design
+    ///         keeps UNBLOCKED during escape; the only gate is the latch + cooldown.
+    /// @dev    Repatriation crank (anyone can run it; keepers/LPs spam it). The Core
+    ///         balance is read ON-CHAIN (caller supplies nothing but the chunk cap), so
+    ///         the crank can never move more than the vault actually holds on Core:
+    ///           1. {_gate} — latch armed + the per-interval cooldown ({CRANK_INTERVAL});
+    ///              this IS the required cooldown that spaces successive chunks.
+    ///           2. read the vault's Core USDC spot balance (8dp Core wei), lenient/strict
+    ///              per `navBootstrap`, mirroring {HyperCoreVault.coreSpotUsdc} — a strict
+    ///              read fails the crank CLOSED on a precompile outage (never pulls 0).
+    ///           3. FEE-AWARE: take `balance * PULL_FEE_NUM / PULL_FEE_DEN` (= 99.8%),
+    ///              never the exact full balance (the ~0.00134 USDC withdrawal fee would
+    ///              drop an exact-full send — G2 spike). See {PULL_FEE_NUM}.
+    ///           4. CHUNK: bound the send to `maxChunkWei` (caller-supplied) so a large
+    ///              balance is repatriated in bounded chunks across cooldown-spaced
+    ///              cranks. The send amount = `min(feeAwareAmount, maxChunkWei)`.
+    ///         The send is a `send_asset` (action 13, spot->spot) to the USDC system
+    ///         address — byte-identical to {VaultEmergencyLib.pullFromCore}; the
+    ///         legacy `spot_send` (action 6) is silently dropped for unified accounts
+    ///         (audit G2). HyperCore debits the vault's Core spot and the linked
+    ///         CoreDepositWallet pays native USDC to the caller (this vault, under
+    ///         delegatecall — `address(this)` is the vault) at amount/100 (8dp Core ->
+    ///         6dp EVM). {fulfillWithdraw} (already permissionless) then drains the LP
+    ///         queue as the pulled idle lands. No-ops the send (but still runs the gate
+    ///         + emits the crank event) when the fee-aware/chunked amount is zero (dust
+    ///         or empty balance), exactly like leg 3's zero-withdrawable branch. NOT
+    ///         NAV-mutating (Core->EVM is NAV-neutral — both legs count in
+    ///         {totalAssets}), so — like {pullFromCore} and unlike leg 3 — no mgmt-fee
+    ///         accrual is needed.
+    /// @param  s             The vault's escape latch/cooldown state (by reference).
+    /// @param  coreUsdcIndex The vault's immutable Core USDC token index (by value).
+    /// @param  navBootstrap  The vault's NAV-read mode (lenient while bootstrapping).
+    /// @param  maxChunkWei   Per-crank send cap in Core wei (8dp); bounds the chunk.
+    function escapePullToEvm(
+        IHyperCoreVault.EscapeState storage s,
+        uint64 coreUsdcIndex,
+        bool navBootstrap,
+        uint64 maxChunkWei
+    ) external {
+        _gate(s);
+        // Audit H-1: lenient/strict per navBootstrap, mirroring {coreSpotUsdc}. A strict
+        // read fails the crank closed on a precompile outage rather than pulling zero.
+        uint64 balance = navBootstrap
+            ? PrecompileLib.spotBalance(address(this), coreUsdcIndex).total
+            : PrecompileLib.spotBalanceStrict(address(this), coreUsdcIndex).total;
+        // Fee-aware (never the exact full balance) then chunk-capped. Widen to uint256
+        // for the multiply (balance and PULL_FEE_NUM are uint64; the product can exceed
+        // uint64); the quotient <= balance <= uint64.max, so the cast back is safe.
+        uint64 amount = uint64((uint256(balance) * PULL_FEE_NUM) / PULL_FEE_DEN);
+        if (amount > maxChunkWei) amount = maxChunkWei;
+        if (amount != 0) {
+            // send_asset (action 13) to the USDC system address — verbatim
+            // {VaultEmergencyLib.pullFromCore}; spot->spot, 8dp.
+            CoreWriterLib.sendAsset(
+                SystemAddress.forToken(coreUsdcIndex),
+                Constants.CORE_SPOT_DEX_ID,
+                Constants.CORE_SPOT_DEX_ID,
+                coreUsdcIndex,
+                amount
+            );
+            emit BridgeWithdraw(amount);
+        }
+        emit EscapeCrankRun(msg.sender, 4);
     }
 }
