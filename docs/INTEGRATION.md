@@ -154,6 +154,85 @@ LPs can request an exit via `requestWithdraw(shares)`. The shares move to the va
 
 The fulfillment is permissionless — anyone (including the LP themselves) can call it. Keepers welcome.
 
+## Soft redemption barriers (explicit ERC-4626 deviations)
+
+> **STATUS (M4 / SOLU-3366):** SHIPPED. The barriers are stacked on the M5
+> emergency-extraction split (SOLU-3369), where the vault has headroom, and fit under
+> the EIP-170 24576-byte limit (vault **23,569 B, +1,007 B margin**). Proven on real
+> HyperEVM bytecode (`test/fork/HyperVaultBarriers.fork.t.sol`, B0-B9, 10/10). To fit,
+> the three on-chain barrier-state **view getters were dropped** — integrators read the
+> state off-chain instead (see below). The state + branchy logic live in the external
+> delegatecall library `src/libraries/VaultBarrierLib.sol`.
+
+The vault supports four **admin-configured soft barriers** that add *friction* to the
+**synchronous** exit paths (`withdraw` / `redeem`). They are `require`-checks, set via a
+single timelock call:
+
+```python
+# admin (TimelockController): lockup seconds, cooldown seconds, gate bps (of NAV)
+vault.functions.setRedemptionBarriers(7*24*3600, 24*3600, 5000).transact()
+# Each call emits RedemptionBarriersUpdated(lockup, cooldown, gateBps) — index that
+# event for the live config (all 0 = OFF, the deploy default).
+```
+
+**Reading barrier state off-chain (the view getters were dropped — EIP-170).** To keep
+the vault under the 24576-byte limit, the on-chain getters `redemptionBarriers()`,
+`lastDepositAt(lp)`, and `lastRedeemAt(lp)` are **not** exposed. The state is unchanged —
+it lives in `VaultBarrierLib`'s ERC-7201 namespaced slot — so read it with
+`eth_getStorageAt` (or index `RedemptionBarriersUpdated`):
+
+```python
+SLOT = 0x77baf71947acbe45a89d2c84006fb2f1cbe1654c8023f6853f43b8e463ccc600  # VaultBarrierLib.SLOT
+# config word at SLOT: lockup = bits[0:64], cooldown = [64:128], gateBps = [128:144]
+word = int.from_bytes(w3.eth.get_storage_at(vault.address, SLOT), "big")
+lockup, cooldown, gateBps = word & (2**64-1), (word >> 64) & (2**64-1), (word >> 128) & (2**16-1)
+# per-LP clocks (uint64 unix ts, 0 = none): mapping(address=>uint64) at SLOT+1 / SLOT+2
+last_deposit = int.from_bytes(w3.eth.get_storage_at(vault.address, w3.keccak(abi.encode(["address","uint256"], [lp, SLOT+1]))), "big")
+last_redeem  = int.from_bytes(w3.eth.get_storage_at(vault.address, w3.keccak(abi.encode(["address","uint256"], [lp, SLOT+2]))), "big")
+```
+
+**They all default to 0 (OFF).** A vault that never calls `setRedemptionBarriers` behaves
+**exactly** as a vault without this feature — the sync paths are unchanged. They are
+explicitly **NOT** a freeze and **NOT** pausability: redeems are never pausable, and the
+barriers gate the *instant* path only. The `requestWithdraw` queue, the emergency surface
+(`pause`, `emergencyClosePositions`, `emergencyShutdown`, `emergencyRepatriate`), and every
+Core→EVM repatriation mover (`pullFromCore`, `usdPerpToSpot`, `operatorRecoverSpot`) are
+**never barrier-gated**, so deployed-capital liveness (assessment Findings A/B) is preserved.
+
+Each is a deliberate deviation from a strict drop-in ERC-4626 that an integrator (router /
+money-market adapter / aggregator) MUST account for. The sync view functions (`maxWithdraw`,
+`maxRedeem`, `previewRedeem`) are already best-effort once capital is on Core (see above);
+the barriers add timing/size states they do not express:
+
+| Barrier | Knob | What it gates (sync `withdraw`/`redeem` only) | Reverts with | ERC-4626 deviation an integrator must handle |
+|---|---|---|---|---|
+| **Lockup** | `lockupPeriod` (seconds) | A sync exit is blocked until `lastDepositAt[owner] + lockupPeriod`. The clock is keyed on the **share owner** and stamped on **every deposit/mint**, so the **most-recent** deposit governs — a re-deposit **refreshes** the lockup on the whole position (simplest, safest; a dust top-up cannot dodge the lockup). | `LockupNotElapsed(unlockAt)` | `withdraw`/`redeem` revert for a freshly-deposited owner even when `maxWithdraw`/`maxRedeem` are positive. `maxRedeem` does **not** subtract a locked balance. Route via `requestWithdraw` (never lockup-gated). |
+| **Cooldown** | `redeemCooldown` (seconds) | After a successful sync exit, the owner's next sync exit is blocked until `lastRedeemAt[owner] + redeemCooldown`. Stamped on every value-moving `withdraw`/`redeem`. | `RedeemCooldownActive(readyAt)` | A second `withdraw`/`redeem` in the cooldown window reverts even though the owner still holds redeemable shares. Not reflected in `maxRedeem`. Use the queue for the rest. |
+| **Gate** | `redeemGateBps` (bps of NAV) | A **single** sync exit may move at most `redeemGateBps * totalAssets() / 10000`. The bound is on the **requested gross** (pre-partial-fill), so it cannot be dodged by relying on a partial fill. It is **per-transaction**, NOT a global/rolling cap — it does not aggregate across txs or LPs (splitting across txs is throttled by the cooldown instead). | `RedeemGateExceeded(requested, cap)` | A large `withdraw`/`redeem` reverts even with ample idle. `maxWithdraw`/`maxRedeem` do **not** cap to the gate. Split into ≤cap chunks (subject to cooldown) or route the remainder via `requestWithdraw`. |
+| **Notice** | *(no new timer)* | "Notice" is expressed via the **existing `requestWithdraw` queue**, not a separate barrier. Exits blocked by lockup/cooldown/gate, or simply larger than current idle, go through `requestWithdraw` → `fulfillWithdraw`, which carries the on-chain `fulfillmentDeadline` SLA (`setRequestFulfillmentWindow`) and the permissionless `prioritizeOverdue` fairness crank. | — | The queue is the always-available, **ungated** escape and the documented "notice period" mechanism. Reusing it (rather than a second timer) keeps the vault's scarce EIP-170 bytecode for the checks that need it. |
+
+**Why express notice via the queue (not a new timer):** the queue already *is* a notice
+path — it escrows shares, carries an SLA deadline, and is permissionless to fulfill. Adding
+a distinct notice timer would duplicate that machinery and cost bytecode the vault does not
+have. So "give notice for a large/blocked exit" == "call `requestWithdraw`".
+
+**Barriers are keyed on the share `owner`, not `msg.sender`.** A router or approved spender
+redeeming on an owner's behalf inherits that owner's lockup/cooldown. The gate is global
+(a fraction of NAV) and applies to whoever calls.
+
+**Implementation note (EIP-170):** the barrier state + comparison logic live in the external
+delegatecall library `src/libraries/VaultBarrierLib.sol` (ERC-7201 namespaced storage),
+mirroring the audit-G2 `VaultTradeLib` split — the vault carries only thin wrappers
+(`setRedemptionBarriers` → `VaultBarrierLib.setBarriers`; the per-exit `enforce`) plus the
+inline deposit/mint lockup stamp. Stacked on the M5 emergency-extraction split (SOLU-3369)
+the feature fits with **+1,007 B** of runtime-size margin, after two trims: (1) the three
+on-chain barrier-state **view getters were dropped** (read the namespaced slot / events
+off-chain, as above — they cost ~235 B the vault did not have); and (2) the audit-M6
+`suggestedSpotPxScaleFactor` calibration helper was hoisted into `VaultTradeLib` (its
+`10 ** x` had dragged the full runtime-exponentiation routine, ~1.2 KB, into the vault;
+the library already carries that routine, so the move is behaviour-identical and frees
+the room). Neither trim changes any barrier semantics or any value-moving path.
+
 ## Emergency runbook
 
 If the strategy must be shut down (operator key suspected compromised, market dislocation, contract bug suspected):
