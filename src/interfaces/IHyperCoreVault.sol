@@ -80,10 +80,21 @@ interface IHyperCoreVault is IERC4626 {
     ///         (>= the live `_cloidCounter`), so it cannot name a vault-placed resting
     ///         order (M5 §2 leg 1).
     error EscapeCloidOutOfRange(uint128 cloid, uint128 cloidCounter);
-    /// @notice The trigger condition for {triggerEscape} (the permissionless
-    ///         staleness gate — `escapeGraceSeconds` + overdue-AND-claim>idle) is
-    ///         completed in SOLU-3371; in this issue entry is admin-gated (M5 §1).
-    error EscapeTriggerNotWired();
+    /// @notice {triggerEscape} called for an `lp` whose request does NOT meet the
+    ///         permissionless staleness gate (M5 §1, SOLU-3371): either there is no
+    ///         escrowed request, the request has no SLA deadline (`fulfillmentDeadline
+    ///         == 0` — a vault with no {requestFulfillmentWindow} has no armable
+    ///         brake), the request is not yet overdue by `escapeGraceSeconds` BEYOND
+    ///         its deadline, or its remaining claim does not exceed {availableIdleUsdc}
+    ///         (an honored/honorable request can never arm the brake). Replaces the
+    ///         interim {EscapeTriggerNotWired} placeholder.
+    error EscapeConditionNotMet(address lp);
+    /// @notice {setEscapeGraceSeconds} called with a value outside the compile-time
+    ///         hard bounds [`ESCAPE_GRACE_MIN`, `ESCAPE_GRACE_MAX`] (M5 §1, SOLU-3371).
+    ///         The bounds are constants so the timelock cannot quietly disable the
+    ///         permissionless brake (set it absurdly long) nor make it hair-trigger
+    ///         (set it ~0) — fail-closed, matching the repo's posture.
+    error EscapeGraceOutOfRange(uint64 lo, uint64 hi);
 
     // -------------------------------------------------------------------------
     // Shared structs
@@ -111,6 +122,15 @@ interface IHyperCoreVault is IERC4626 {
     struct EscapeState {
         bool active;
         uint64 lastCrankTs;
+        /// @dev Permissionless-trigger grace window (M5 §1, SOLU-3371): seconds a
+        ///      request must stay overdue BEYOND its SLA deadline before
+        ///      {triggerEscape} arms the brake. Held INSIDE the escape struct (not a
+        ///      standalone vault slot) so {VaultEscapeLib} reads/writes it by the same
+        ///      storage reference it already threads — the governance setter
+        ///      ({setEscapeGraceSeconds} -> {VaultEscapeLib.setGrace}) and the trigger
+        ///      gate ({triggerIfStale}) both live in the library, out of the vault's
+        ///      EIP-170 budget. Default 8h; bounded [4h, 30d] (the library constants).
+        uint64 graceSeconds;
     }
 
     // -------------------------------------------------------------------------
@@ -186,6 +206,11 @@ interface IHyperCoreVault is IERC4626 {
     /// @notice An escape crank (leg 1 cancel / leg 2 flatten / leg 3 consolidate)
     ///         ran while latched (M5 §2) — surfaces the permissionless unwind on-chain.
     event EscapeCrankRun(address indexed by, uint8 indexed leg);
+    /// @notice Admin updated the permissionless-trigger grace window (M5 §1,
+    ///         SOLU-3371). `newGrace` is the seconds a request must stay overdue
+    ///         BEYOND its SLA deadline before the brake is armable; always within the
+    ///         compile-time hard bounds [`ESCAPE_GRACE_MIN`, `ESCAPE_GRACE_MAX`].
+    event EscapeGraceSecondsUpdated(uint64 newGrace);
 
     event LeverageCapUpdated(uint16 oldCap, uint16 newCap);
     event SlippageBandUpdated(uint16 oldBand, uint16 newBand);
@@ -271,6 +296,14 @@ interface IHyperCoreVault is IERC4626 {
     function setRequestFulfillmentWindow(uint64 window) external;
     function requestFulfillmentWindow() external view returns (uint64);
 
+    /// @notice Set the permissionless-trigger grace window in seconds (M5 §1,
+    ///         SOLU-3371) — how long a request must stay overdue BEYOND its SLA
+    ///         deadline before {triggerEscape} can arm the brake. REVERTS
+    ///         {EscapeGraceOutOfRange} outside the compile-time hard bounds
+    ///         [`ESCAPE_GRACE_MIN`, `ESCAPE_GRACE_MAX`] (fail-closed — the timelock
+    ///         cannot disable the brake). Emits {EscapeGraceSecondsUpdated}.
+    function setEscapeGraceSeconds(uint64 newGrace) external;
+
     // -------------------------------------------------------------------------
     // Emergency surface
     // -------------------------------------------------------------------------
@@ -349,10 +382,21 @@ interface IHyperCoreVault is IERC4626 {
     function escapeActive() external view returns (bool);
     /// @notice Per-interval escape-crank cooldown in seconds (M5 §4).
     function escapeCrankInterval() external view returns (uint64);
+    /// @notice Seconds a withdrawal request must stay overdue BEYOND its SLA deadline
+    ///         before {triggerEscape} can arm the brake on it (M5 §1, SOLU-3371). The
+    ///         grace STACKS on top of {requestFulfillmentWindow} so escape composes
+    ///         with, and never preempts, the normal H2 priority flow. Default 8h;
+    ///         admin-tunable within the hard bounds [`ESCAPE_GRACE_MIN`,
+    ///         `ESCAPE_GRACE_MAX`] via {setEscapeGraceSeconds}.
+    function escapeGraceSeconds() external view returns (uint64);
 
-    /// @notice Arm the escape brake (M5 §1). INTERIM: admin-gated in this issue; the
-    ///         permissionless staleness trigger (`escapeGraceSeconds` + overdue-AND-
-    ///         claim>idle) is completed in SOLU-3371. `lp` is recorded in the event.
+    /// @notice PERMISSIONLESS (M5 §1, SOLU-3371): arm the escape brake for `lp` when
+    ///         its request is (a) overdue by AT LEAST {escapeGraceSeconds} beyond its
+    ///         SLA deadline AND (b) has a remaining claim exceeding {availableIdleUsdc}.
+    ///         The security is in the CONDITION, not the caller (anyone can deposit
+    ///         dust and wait — §1 anti-grief). Reverts {EscapeConditionNotMet} when the
+    ///         gate is unmet (including a request with no SLA deadline). `lp` is the
+    ///         request that armed the brake (recorded in {EscapeActivated}).
     function triggerEscape(address lp) external;
     /// @notice Permissionlessly clear the brake (M5 §1) — succeeds only when no
     ///         overdue-unfillable request remains. `lps` is the set of LPs to check.

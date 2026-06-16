@@ -4,7 +4,6 @@ pragma solidity 0.8.27;
 import {console2} from "forge-std/console2.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
-import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 import {HyperVaultBaseForkTest} from "./HyperVaultBase.fork.t.sol";
 import {HyperCoreVault} from "../../src/HyperCoreVault.sol";
@@ -50,6 +49,40 @@ contract HyperVaultEscapeForkTest is HyperVaultBaseForkTest {
     event OrderCancelByCloidSubmitted(uint32 indexed asset, uint128 indexed cloid);
     event UsdClassTransferSubmitted(uint64 ntl, bool toPerp);
 
+    /// @dev A dedicated, dominant arming LP — independent of alice/bob so this never
+    ///      collides with a test's own actors (one open request per LP). Its claim
+    ///      dominates any test deposit so {prioritizeOverdue} zeroes the rest of
+    ///      `availableIdle` (see {_armEscape}).
+    address internal escapeArmer = makeAddr("escapeArmer");
+
+    /// @dev SOLU-3371: the interim admin {triggerEscape} is now the PERMISSIONLESS
+    ///      staleness trigger. The SOLU-3369 tests below only need "the brake is
+    ///      armed" as a precondition, so this helper manufactures the real arming
+    ///      condition (overdue by `escapeGraceSeconds` beyond the SLA deadline AND
+    ///      claim > availableIdle) on a fork-faithful basis and arms via the real path:
+    ///        1. ensure an SLA window is set (deadline != 0 — else not armable, §8 Q1);
+    ///        2. a DOMINANT armer deposits + requests (its claim >= any other idle);
+    ///        3. warp PAST deadline + grace;
+    ///        4. {prioritizeOverdue} reserves the armer's claim, capped at availableIdle,
+    ///           which zeroes availableIdle WITHOUT collapsing NAV (the fork-faithful way
+    ///           to make claim > availableIdle — draining idle would also drop NAV since
+    ///           coreSpotUsdc reads 0 on a fork, collapsing the claim too);
+    ///        5. {triggerEscape} now arms (both legs of the condition hold).
+    ///      Returns the armer so the caller can resolve it in {exitEscape} flows.
+    function _armEscape() internal returns (address armer) {
+        armer = escapeArmer;
+        if (vault.requestFulfillmentWindow() == 0) vault.setRequestFulfillmentWindow(1 hours);
+        uint64 window = vault.requestFulfillmentWindow();
+        uint256 sh = _deposit(armer, 1_000_000e6); // dominant claim
+        vm.prank(armer);
+        vault.requestWithdraw(sh);
+        vm.warp(block.timestamp + window + vault.escapeGraceSeconds() + 1);
+        vm.prank(keeper);
+        vault.prioritizeOverdue(armer); // reserve -> availableIdle drops below the claim
+        vault.triggerEscape(armer); // permissionless: condition (a)+(b) hold
+        require(vault.escapeActive(), "armed via the permissionless staleness trigger");
+    }
+
     // ───────────────────────────────────────────────────────────────────────
     // Latch + the six ESCAPE-mode gates (M5 §4)
     //   Claim: while escapeActive, deposit/mint revert + maxDeposit==0, and the
@@ -68,10 +101,9 @@ contract HyperVaultEscapeForkTest is HyperVaultBaseForkTest {
         uint256 shares = _deposit(alice, 100e6);
         assertGt(vault.maxDeposit(bob), 0, "deposits open before arming");
 
-        // Arm the brake (interim admin entry; admin == address(this)).
-        vm.expectEmit(true, true, false, true, address(vault));
-        emit EscapeActivated(address(this), alice);
-        vault.triggerEscape(alice);
+        // Arm the brake via the SOLU-3371 permissionless staleness trigger (a dominant
+        // overdue-unfillable armer request). Independent of alice.
+        _armEscape();
         assertTrue(vault.escapeActive(), "latched into ESCAPE mode");
 
         // (1) maxDeposit / maxMint collapse to 0.
@@ -121,7 +153,10 @@ contract HyperVaultEscapeForkTest is HyperVaultBaseForkTest {
     }
 
     /// @dev Regression: arming does NOT touch the redemption queue's existing
-    ///      accounting — a fulfill against idle still pays out while latched.
+    ///      accounting — a fulfill against idle still pays out while latched. Alice's
+    ///      request is NOT the one that armed the brake (the dominant {_armEscape}
+    ///      armer is); her claim stays honorable from the un-reserved idle, so fulfill
+    ///      pays it in full even while ESCAPE mode is on.
     function test_latchLeavesFulfillAgainstIdleWorking() public {
         _skipIfNoFork();
         vm.etch(Constants.CORE_WRITER, type(MockCoreWriter).runtimeCode);
@@ -130,40 +165,49 @@ contract HyperVaultEscapeForkTest is HyperVaultBaseForkTest {
         vm.prank(alice);
         vault.requestWithdraw(shares);
 
-        vault.triggerEscape(alice);
+        _armEscape(); // permissionless staleness arm via an independent dominant armer
         assertTrue(vault.escapeActive(), "latched");
 
+        // Alice's claim is backed by idle NOT reserved for the armer (her request is
+        // unprioritized; the armer reserve carved out only its own claim).
+        uint256 aliceClaim = vault.previewRedeem(shares);
+        assertLe(aliceClaim, vault.availableIdleUsdc(), "alice honorable from un-reserved idle");
         uint256 aliceBefore = IERC20(USDC).balanceOf(alice);
         vm.prank(keeper);
-        vault.fulfillWithdraw(alice); // idle fully backs the request -> full payout
-        assertEq(IERC20(USDC).balanceOf(alice) - aliceBefore, 100e6, "fulfilled from idle while latched");
+        vault.fulfillWithdraw(alice); // idle fully backs HER request -> full payout
+        assertEq(IERC20(USDC).balanceOf(alice) - aliceBefore, aliceClaim, "fulfilled in full while latched");
         assertEq(vault.pendingWithdrawalShares(alice), 0, "request cleared while latched");
 
         console2.log("M5 PASS - fulfillWithdraw against idle pays out normally while latched");
     }
 
     // ───────────────────────────────────────────────────────────────────────
-    // triggerEscape access control (M5 §1, interim)
+    // triggerEscape — SOLU-3371: PERMISSIONLESS + condition-gated + idempotent.
+    //   (The full condition matrix — grace not elapsed, fillable claim, deadline==0 —
+    //   lives in HyperVaultEscapeTrigger.fork.t.sol; this is the SOLU-3369 successor.)
     // ───────────────────────────────────────────────────────────────────────
-    function test_triggerEscapeIsAdminGatedInterim() public {
+    function test_triggerEscapeIsPermissionlessAndIdempotent() public {
         _skipIfNoFork();
-        bytes32 adminRole = vault.DEFAULT_ADMIN_ROLE();
+        vm.etch(Constants.CORE_WRITER, type(MockCoreWriter).runtimeCode);
 
-        // Non-admin cannot arm (the interim entry is admin-gated; SOLU-3371 widens it).
+        // The onlyRole gate is GONE: an arbitrary caller arming an LP whose condition
+        // is NOT met reverts EscapeConditionNotMet (NOT AccessControlUnauthorized) —
+        // proving the access widening AND that the security is the condition.
         vm.prank(attacker);
-        vm.expectRevert(
-            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, attacker, adminRole)
-        );
-        vault.triggerEscape(attacker);
-        assertFalse(vault.escapeActive(), "not armed by a non-admin");
-
-        // Idempotent: re-arming by the admin is a no-op (no spurious second event).
+        vm.expectRevert(abi.encodeWithSelector(IHyperCoreVault.EscapeConditionNotMet.selector, alice));
         vault.triggerEscape(alice);
-        assertTrue(vault.escapeActive(), "armed");
-        vault.triggerEscape(alice); // no revert, no state change
-        assertTrue(vault.escapeActive(), "still armed (idempotent)");
+        assertFalse(vault.escapeActive(), "no spurious arm when the condition is unmet");
 
-        console2.log("M5 PASS - triggerEscape is admin-gated (interim) + idempotent");
+        // Arm via the real staleness condition (dominant overdue-unfillable armer).
+        address armer = _armEscape();
+        assertTrue(vault.escapeActive(), "armed");
+
+        // Idempotent: a SECOND trigger on the still-overdue-unfillable armer is a no-op
+        // (no revert, no state change, no spurious second EscapeActivated).
+        vault.triggerEscape(armer);
+        assertTrue(vault.escapeActive(), "still armed (idempotent re-arm)");
+
+        console2.log("M5 PASS - triggerEscape is permissionless + condition-gated + idempotent (SOLU-3371)");
     }
 
     // ───────────────────────────────────────────────────────────────────────
@@ -176,7 +220,7 @@ contract HyperVaultEscapeForkTest is HyperVaultBaseForkTest {
     function test_leg1_cancelRejectsOutOfRangeCloid() public {
         _skipIfNoFork();
         vm.etch(Constants.CORE_WRITER, type(MockCoreWriter).runtimeCode);
-        vault.triggerEscape(alice);
+        _armEscape();
 
         uint128 counter = vault.nextCloid(); // next free cloid; every issued id is < counter
         uint128[] memory bad = new uint128[](1);
@@ -210,7 +254,7 @@ contract HyperVaultEscapeForkTest is HyperVaultBaseForkTest {
         assertEq(cloid, 1, "first issued cloid is 1");
         assertLt(cloid, vault.nextCloid(), "cloid 1 is now in range (< nextCloid==2)");
 
-        vault.triggerEscape(alice);
+        _armEscape();
 
         // CoreWriter is fire-and-forget so cancelling a (possibly already-gone) order
         // by an in-range cloid is a safe Core no-op.
@@ -261,7 +305,7 @@ contract HyperVaultEscapeForkTest is HyperVaultBaseForkTest {
         uint32 perp = 0;
         uint16 band = 1000; // 10% — set wide (admin == address(this))
         vault.setEmergencyCloseBand(band);
-        vault.triggerEscape(alice);
+        _armEscape();
 
         // Inject a non-flat position so the band branch is reached, plus szDecimals
         // and a markPx for the comparison. (Fork cannot serve these precompiles; this
@@ -324,7 +368,7 @@ contract HyperVaultEscapeForkTest is HyperVaultBaseForkTest {
     function test_cooldown_secondCrankWithinIntervalReverts() public {
         _skipIfNoFork();
         vm.etch(Constants.CORE_WRITER, type(MockCoreWriter).runtimeCode);
-        vault.triggerEscape(alice);
+        _armEscape();
 
         uint64 interval = vault.escapeCrankInterval();
         assertEq(interval, 60, "interval is the fixed 60s envelope");
@@ -362,14 +406,22 @@ contract HyperVaultEscapeForkTest is HyperVaultBaseForkTest {
         _skipIfNoFork();
         vm.etch(Constants.CORE_WRITER, type(MockCoreWriter).runtimeCode);
 
-        // Admin arm with no overdue request at all -> exitEscape clears immediately.
-        vault.triggerEscape(alice);
+        // SOLU-3371: arming now REQUIRES an overdue-unfillable request (no bare admin
+        // arm), so we arm via the staleness condition, then RESOLVE the armer (cancel
+        // its request -> releases its reserve -> no backlog remains) and prove exit
+        // clears. cancelWithdrawRequest is permissionless + ungated by ESCAPE mode.
+        address armer = _armEscape();
         assertTrue(vault.escapeActive(), "armed");
 
-        address[] memory none = new address[](0);
+        vm.prank(armer);
+        vault.cancelWithdrawRequest(); // no request -> the armer no longer holds the brake
+        assertEq(vault.pendingWithdrawalShares(armer), 0, "armer request resolved");
+
+        address[] memory lps = new address[](1);
+        lps[0] = armer;
         vm.expectEmit(true, false, false, true, address(vault));
         emit EscapeDeactivated(address(this));
-        vault.exitEscape(none);
+        vault.exitEscape(lps);
         assertFalse(vault.escapeActive(), "cleared (no backlog to clear)");
 
         console2.log("M5 PASS - exitEscape clears the latch when no overdue-unfillable request remains");
@@ -379,27 +431,33 @@ contract HyperVaultEscapeForkTest is HyperVaultBaseForkTest {
         _skipIfNoFork();
         vm.etch(Constants.CORE_WRITER, type(MockCoreWriter).runtimeCode);
 
-        // Stamp an SLA, escrow a request, let it lapse, then RESERVE its claim via
-        // prioritizeOverdue. The reserve carves the whole idle pool out of
-        // availableIdle WITHOUT collapsing NAV (so previewRedeem stays at the full
-        // claim) -> previewRedeem(shares) > availableIdle == "overdue-unfillable", the
-        // exact arming condition. (Draining idle would also drop NAV on a fork — where
-        // coreSpotUsdc reads 0 — collapsing the claim too; the reserve keeps NAV intact
-        // and is the fork-faithful way to make claim > availableIdle.)
+        // Stamp an SLA, escrow a request, let it lapse PAST deadline + grace, then
+        // RESERVE its claim via prioritizeOverdue. The reserve carves the whole idle
+        // pool out of availableIdle WITHOUT collapsing NAV (so previewRedeem stays at
+        // the full claim) -> previewRedeem(shares) > availableIdle == "overdue-
+        // unfillable", the EXACT arming condition the permissionless triggerEscape
+        // checks. (Draining idle would also drop NAV on a fork — where coreSpotUsdc
+        // reads 0 — collapsing the claim too; the reserve keeps NAV intact and is the
+        // fork-faithful way to make claim > availableIdle.) Here ALICE is the armer.
         vault.setRequestFulfillmentWindow(1 hours);
-        uint256 shares = _deposit(alice, 100e6);
+        uint256 shares = _deposit(alice, 100e6); // sole depositor: her claim == idle
         vm.prank(alice);
         vault.requestWithdraw(shares);
-        vm.warp(block.timestamp + 1 hours + 1);
+        // SOLU-3371: overdue by AT LEAST escapeGraceSeconds BEYOND the deadline.
+        vm.warp(block.timestamp + 1 hours + vault.escapeGraceSeconds() + 1);
         assertTrue(vault.requestIsOverdue(alice), "overdue");
 
-        vault.triggerEscape(alice);
-
+        // Reserve FIRST so claim > availableIdle holds when we arm (the trigger checks
+        // previewRedeem(shares) > _availableIdle()). prioritizeOverdue is permissionless.
         vm.prank(keeper);
         vault.prioritizeOverdue(alice);
         assertGt(vault.pendingWithdrawalReserved(alice), 0, "alice's claim reserved");
         assertEq(vault.availableIdleUsdc(), 0, "reserve carves idle out of availableIdle");
         assertGt(vault.previewRedeem(shares), vault.availableIdleUsdc(), "claim > availableIdle (unfillable)");
+
+        // Now the permissionless staleness trigger arms on alice (both legs hold).
+        vault.triggerEscape(alice);
+        assertTrue(vault.escapeActive(), "armed on alice's overdue-unfillable request");
 
         // exitEscape with Alice still overdue-unfillable -> reverts, latch held.
         address[] memory lps = new address[](1);
@@ -487,7 +545,7 @@ contract HyperVaultEscapeForkTest is HyperVaultBaseForkTest {
     function test_leg3_consolidateRunsGateAndEventWhenNothingWithdrawable() public {
         _skipIfNoFork();
         vm.etch(Constants.CORE_WRITER, type(MockCoreWriter).runtimeCode);
-        vault.triggerEscape(alice);
+        _armEscape();
 
         // withdrawable reads 0 on the fork (lenient, no precompile) -> no perp->spot
         // action, but the gate runs and the crank event fires.
