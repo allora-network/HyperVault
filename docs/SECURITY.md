@@ -17,9 +17,19 @@ be a one-way burn).
   forToken(coreUsdcIndex)`, and `tokenInfo.evmContract == wallet` when the precompile resolves
   (success emits `CoreLinkVerified`; mismatch reverts `CoreLinkMismatch`). `address(0)` =
   legacy HIP-1 mode for genuinely direct-linked assets (warn-only `CoreLinkUnverified` kept).
-- **Pull (Core->EVM):** byte-identical to v1.4 — the Core-side `spot_send` to the system
-  address now triggers the wallet's system-guarded `transfer()`, paying native USDC from its
-  reserve to the vault's EVM idle.
+- **Pull (Core->EVM):** the Core-side action is CoreWriter **`send_asset` (action 13)** to the
+  USDC system address — **NOT** the legacy `spot_send` (action 6), which unified HyperCore
+  accounts silently drop (proven live 2026-06-15). HyperCore debits the vault's Core spot and
+  triggers the wallet's system-guarded `transfer()`, paying native USDC from its reserve to the
+  caller (the vault). `operatorRecoverSpot` / `emergencyRepatriate` use the same primitive.
+  **Operational guard:** a ~0.00134 USDC withdrawal fee is taken from Core on top of the amount,
+  so the keeper must never request the exact full balance (it would be dropped) — pull under it.
+- **EIP-170 (size):** the trade gate (whitelist + slippage band + leverage cap) and
+  emergency-close loop live in an external **`VaultTradeLib`** (delegatecall) so the vault fits
+  the 24576-byte limit HyperEVM enforces. The library is pure logic invoked under delegatecall
+  (`address(this)` is the vault); it holds no storage and adds no privileged surface — events
+  and errors are re-declared to keep log topics and revert selectors identical to the inlined
+  version (fork 54/0/4, unit 10/10 unchanged).
 - **Trust model:** the wallet is Circle-operated, EIP-1967-upgradeable, and pausable —
   issuer-trust class (the same trust as holding USDC at all). **Both directions stop while
   the wallet is paused** (`deposit` and the payout hook are `whenNotPaused`): monitor

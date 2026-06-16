@@ -17,6 +17,9 @@ import {PrecompileLib} from "./libraries/PrecompileLib.sol";
 import {SystemAddress} from "./libraries/SystemAddress.sol";
 import {AssetId} from "./libraries/AssetId.sol";
 import {Constants} from "./libraries/Constants.sol";
+// Audit G2 (EIP-170): trade-gate + emergency-close logic lives in an external
+// delegatecall library so the vault's runtime bytecode fits the 24576-byte limit.
+import {VaultTradeLib} from "./libraries/VaultTradeLib.sol";
 
 /// @title  HyperCoreVault — EIP-4626 vault that trades on HyperCore via CoreWriter
 /// @notice One vault per strategy. Operator runs trades; depositors hold tokenized shares.
@@ -673,62 +676,32 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ) external onlyRole(OPERATOR_ROLE) whenNotPaused nonReentrant returns (uint128 cloid) {
         _accrueMgmtFee();
 
-        // 1. Whitelist gate
-        if (AssetId.isPerp(asset_)) {
-            if (!_whitelistedPerps.contains(asset_)) revert AssetNotWhitelisted(asset_);
-        } else {
-            if (!_whitelistedSpots.contains(asset_)) revert AssetNotWhitelisted(asset_);
-        }
-
-        // 2. Slippage band — perps use oraclePx, spots use spotPx (audit H-3, H-4).
-        //    Scale reconciliation (verified on HyperEVM mainnet):
-        //      oraclePx precompile        = human * 10^(6 - szDecimals)
-        //      limit_order action limitPx = human * 10^8   (UNIFORM; NOT szDecimals-based)
-        //    Normalize oraclePx UP to the 10^8 action scale before comparing:
-        //      factor = 10^(8 - (6 - szDecimals)) = 10^(2 + szDecimals).
-        //    Audit H-4: oraclePx AND szDecimals are read strictly — a zero /
-        //    reverting oracle, or a failed asset-info read, fails the trade
-        //    closed rather than silently mis-scaling or skipping the check.
-        if (AssetId.isPerp(asset_) && slippageBandBps > 0) {
-            uint64 oraclePxRaw = PrecompileLib.oraclePxStrict(asset_);
-            uint256 szDec = uint256(PrecompileLib.perpAssetInfoStrict(asset_).szDecimals);
-            uint256 oracleNorm = uint256(oraclePxRaw) * (10 ** (szDec + 2));
-            uint256 limitPxU = uint256(limitPx);
-            uint256 diff = limitPxU > oracleNorm ? limitPxU - oracleNorm : oracleNorm - limitPxU;
-            uint256 maxDiff = (oracleNorm * slippageBandBps) / Constants.BPS;
-            if (diff > maxDiff) revert SlippageBandExceeded(limitPx, oraclePxRaw, slippageBandBps);
-        } else if (AssetId.isSpot(asset_)) {
-            // Audit H-3 + M6: per-spot-asset slippage band. Off by default; admin
-            // opts in per asset. The previous code compared `limitPx` (10^8 action
-            // scale) DIRECTLY against `spotPx` (precompile scale) with NO
-            // normalization — a different scale gives FALSE protection. The spot
-            // `spotPx -> limitPx` factor is HL-defined and asset-specific, so M6
-            // requires the admin to set a CALIBRATED `spotPxScaleFactor[asset]`
-            // (verified on a live test order; see {suggestedSpotPxScaleFactor})
-            // alongside the band. Normalizing makes the band sound when enabled.
-            uint16 spotBand = spotSlippageBandBps[asset_];
-            if (spotBand > 0) {
-                uint64 spotPxRaw = PrecompileLib.spotPxStrict(AssetId.indexOf(asset_));
-                uint256 spotPxNorm = uint256(spotPxRaw) * uint256(spotPxScaleFactor[asset_]);
-                uint256 limitPxU = uint256(limitPx);
-                uint256 diff = limitPxU > spotPxNorm ? limitPxU - spotPxNorm : spotPxNorm - limitPxU;
-                uint256 maxDiff = (spotPxNorm * spotBand) / Constants.BPS;
-                if (diff > maxDiff) revert SlippageBandExceeded(limitPx, spotPxRaw, spotBand);
-            }
-        }
-
-        // 3. Leverage cap — incremental new-order notional + sum of open perp notionals
-        if (!reduceOnly && AssetId.isPerp(asset_) && leverageCapBps > 0) {
-            uint256 navNow = totalAssets();
-            uint256 gross = _grossOpenPerpNotional6dp() + _orderNotional6dp(sz, limitPx);
-            uint256 capUsd = (navNow * leverageCapBps) / Constants.BPS;
-            if (gross > capUsd) revert LeverageCapExceeded(gross, navNow, leverageCapBps);
-        }
-
-        // 4. Assign cloid, dispatch
+        // Assign the cloid, then delegate the whole trade gate (whitelist,
+        // slippage band H-3/H-4, leverage cap) + CoreWriter dispatch to
+        // VaultTradeLib (audit G2 — EIP-170 split). The whitelist sets are passed
+        // by storage reference so the gate + open-notional loop live in the
+        // library, not in the vault's bytecode. `nav` is read once and reused for
+        // the cap check and the event snapshot (a submit does not settle
+        // synchronously, so it equals the value the inlined code emitted).
         cloid = _cloidCounter++;
-        CoreWriterLib.placeLimitOrder(asset_, isBuy, limitPx, sz, reduceOnly, tif, cloid);
-        emit LimitOrderSubmitted(asset_, isBuy, limitPx, sz, reduceOnly, tif, cloid, totalAssets());
+        VaultTradeLib.placeOrderChecked(
+            VaultTradeLib.OrderParams({
+                asset: asset_,
+                isBuy: isBuy,
+                limitPx: limitPx,
+                sz: sz,
+                reduceOnly: reduceOnly,
+                tif: tif,
+                cloid: cloid,
+                slippageBandBps: slippageBandBps,
+                spotBand: spotSlippageBandBps[asset_],
+                spotScale: spotPxScaleFactor[asset_],
+                leverageCapBps: leverageCapBps,
+                nav: totalAssets()
+            }),
+            _whitelistedPerps,
+            _whitelistedSpots
+        );
     }
 
     function cancelOrderByCloid(uint32 asset_, uint128 cloid) external onlyRole(OPERATOR_ROLE) nonReentrant {
@@ -777,8 +750,20 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///      on Circle's side — a paused wallet stalls the refill until unpaused
     ///      (contingency: {operatorRecoverSpot} / {emergencyRepatriate}).
     function pullFromCore(uint64 amountWei) external onlyRole(OPERATOR_ROLE) nonReentrant {
-        // spot_send to USDC system address — the system tx then credits this vault's EVM balance
-        CoreWriterLib.spotSend(SystemAddress.usdc(), coreUsdcIndex, amountWei);
+        // Audit G2 (proven live 2026-06-15): unified HyperCore accounts SILENTLY
+        // DROP the legacy spot_send (action 6) — withdrawals must use send_asset
+        // (action 13). Send Core USDC (spot -> spot) to the token system address;
+        // HyperCore debits this vault's Core spot and the linked CoreDepositWallet
+        // pays native USDC to the CALLER (this vault) on the EVM side at
+        // amountWei/100 (8dp Core -> 6dp EVM). For a legacy direct-linked asset
+        // the system minter credits the caller instead — same action either way.
+        CoreWriterLib.sendAsset(
+            SystemAddress.forToken(coreUsdcIndex),
+            Constants.CORE_SPOT_DEX_ID,
+            Constants.CORE_SPOT_DEX_ID,
+            coreUsdcIndex,
+            amountWei
+        );
         emit BridgeWithdraw(amountWei);
     }
 
@@ -809,7 +794,8 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     {
         if (to == address(0)) revert ZeroAddress();
         if (!spotRecoverDest[to]) revert SpotRecoverDestinationNotAllowed(to);
-        CoreWriterLib.spotSend(to, token, amountWei);
+        // Audit G2: send_asset (action 13), not the dropped spot_send — see {pullFromCore}.
+        CoreWriterLib.sendAsset(to, Constants.CORE_SPOT_DEX_ID, Constants.CORE_SPOT_DEX_ID, token, amountWei);
         emit OperatorSpotRecovered(to, token, amountWei);
     }
 
@@ -891,7 +877,9 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         onlyRole(EMERGENCY_ROLE)
         nonReentrant
     {
-        _emergencyClose(perpAssets, limitPxs, true);
+        _cloidCounter = VaultTradeLib.emergencyClose(
+            perpAssets, limitPxs, true, emergencyCloseBandBps, _cloidCounter, totalAssets()
+        );
     }
 
     /// @notice Audit M4: emergency close that SKIPS the {emergencyCloseBandBps}
@@ -903,48 +891,9 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         onlyRole(EMERGENCY_ROLE)
         nonReentrant
     {
-        _emergencyClose(perpAssets, limitPxs, false);
-    }
-
-    function _emergencyClose(uint32[] calldata perpAssets, uint64[] calldata limitPxs, bool enforceBand) internal {
-        require(perpAssets.length == limitPxs.length, "len");
-        uint16 band = emergencyCloseBandBps;
-        for (uint256 i; i < perpAssets.length; ++i) {
-            uint32 a = perpAssets[i];
-            int64 szi = PrecompileLib.position(address(this), a).szi;
-            if (szi == 0) continue;
-            // Audit L3: widen through int256 so `-szi` cannot overflow at int64.min
-            // (where `-szi` on an int64 would revert).
-            uint64 absSz = uint64(szi < 0 ? uint256(-int256(szi)) : uint256(int256(szi)));
-            // Ultrareview bug_009: `position().szi` is in szDecimals lots
-            // (human_sz * 10^szDecimals), but the limit_order action `sz` is the
-            // uniform human_sz * 10^8 scale (see CoreWriterLib.placeLimitOrder and
-            // _orderNotional6dp). Without converting, the emergency close fires at
-            // ~1/10^(8 - szDecimals) of the real size (1000x too small for BTC),
-            // leaving the position essentially open. szDecimals is read strictly so
-            // a failed asset-info read fails the close closed (consistent with H-4).
-            uint8 szDec = PrecompileLib.perpAssetInfoStrict(a).szDecimals;
-
-            // Audit M4: sanity-bound the supplied price against the strict markPx,
-            // normalized to the 10^8 action scale (markPx = human * 10^(6-szDec),
-            // limitPx = human * 10^8 -> factor 10^(2+szDec); same derivation as the
-            // perp trade band). Strict read => a zero/missing markPx fails closed.
-            if (enforceBand && band > 0) {
-                uint64 markRaw = PrecompileLib.markPxStrict(a);
-                uint256 markNorm = uint256(markRaw) * (10 ** (uint256(szDec) + 2));
-                uint256 lpx = uint256(limitPxs[i]);
-                uint256 diff = lpx > markNorm ? lpx - markNorm : markNorm - lpx;
-                if (diff > (markNorm * band) / Constants.BPS) {
-                    revert EmergencyCloseBandExceeded(limitPxs[i], markRaw, band);
-                }
-            }
-
-            uint64 sz = uint64(uint256(absSz) * (10 ** (8 - szDec)));
-            bool isBuy = szi < 0; // close: sell if currently long, buy if currently short
-            uint128 cloid = _cloidCounter++;
-            CoreWriterLib.placeLimitOrder(a, isBuy, limitPxs[i], sz, true, Constants.TIF_IOC, cloid);
-            emit LimitOrderSubmitted(a, isBuy, limitPxs[i], sz, true, Constants.TIF_IOC, cloid, totalAssets());
-        }
+        _cloidCounter = VaultTradeLib.emergencyClose(
+            perpAssets, limitPxs, false, emergencyCloseBandBps, _cloidCounter, totalAssets()
+        );
     }
 
     /// @notice One-way switch. Blocks deposits forever; redeems remain open
@@ -984,7 +933,10 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
             if (to != SystemAddress.usdc() && !spotRecoverDest[to]) {
                 revert SpotRecoverDestinationNotAllowed(to);
             }
-            CoreWriterLib.spotSend(to, coreUsdcIndex, spotSendWei);
+            // Audit G2: send_asset (action 13), not the dropped spot_send. `to` =
+            // the USDC system address repatriates to this vault's EVM idle (the
+            // wallet pays the caller); an allowlisted treasury is a peer Core move.
+            CoreWriterLib.sendAsset(to, Constants.CORE_SPOT_DEX_ID, Constants.CORE_SPOT_DEX_ID, coreUsdcIndex, spotSendWei);
             emit OperatorSpotRecovered(to, coreUsdcIndex, spotSendWei);
         }
         emit EmergencyRepatriated(to, perpToSpotNtl, spotSendWei);
@@ -1318,53 +1270,11 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Internal — leverage cap helpers
-    // -------------------------------------------------------------------------
-
-    /// @dev   Sum of |size * markPx| over all whitelisted perps, in 6dp USD.
-    ///        Scale derivation:
-    ///          sz raw         = human_sz * 10^szDec
-    ///          markPx precomp = human_px * 10^(6 - szDec)
-    ///          product        = human_sz * human_px * 10^6 = direct 6dp USD
-    ///        (no divisor needed). Different scale than `_orderNotional6dp`,
-    ///        which takes `sz` and `limitPx` in the limit-order-action 10^8 scale.
-    ///
-    ///        Audit H-2: markPx read is strict — a position with a missing /
-    ///        zero markPx reverts the trade rather than silently dropping that
-    ///        position from the gross-notional sum (which previously allowed
-    ///        the leverage cap to be bypassed).
-    function _grossOpenPerpNotional6dp() internal view returns (uint256 total) {
-        uint256[] memory perps = _whitelistedPerps.values();
-        for (uint256 i; i < perps.length; ++i) {
-            uint32 a = uint32(perps[i]);
-            // Ultrareview bug_007: `position` is read leniently ON PURPOSE. This
-            // loop spans ALL whitelisted perps, and HyperCore reverts / returns
-            // empty for a perp the vault holds no position in — a strict read
-            // would then revert EVERY trade whenever any whitelisted perp is flat.
-            // Residual: a POSITION-precompile failure for a HELD position would
-            // under-count its notional (cap under-enforced), but that is not
-            // operator-triggerable and the cap is documented best-effort with
-            // off-chain monitoring (docs/SECURITY.md). Switch to a strict read
-            // only if HyperCore is confirmed to return a populated (non-empty)
-            // zero-struct for no-position accounts.
-            int64 szi = PrecompileLib.position(address(this), a).szi;
-            if (szi == 0) continue;
-            uint64 markPx = PrecompileLib.markPxStrict(a);
-            // Audit L3: widen through int256 so `-szi` cannot overflow at int64.min
-            // (where `-szi` on an int64 would revert).
-            uint64 absSz = uint64(szi < 0 ? uint256(-int256(szi)) : uint256(int256(szi)));
-            total += uint256(absSz) * uint256(markPx);
-        }
-    }
-
-    /// @dev   Order notional in 6dp USD. Both `sz` and `limitPx` are in the
-    ///        limit-order-action 10^8 scale (human * 10^8), so
-    ///          sz * limitPx = human_sz * human_px * 10^16,
-    ///        and dividing by 1e10 yields human_sz * human_px * 10^6 = 6dp USD.
-    function _orderNotional6dp(uint64 sz, uint64 limitPx) internal pure returns (uint256) {
-        return (uint256(sz) * uint256(limitPx)) / 1e10;
-    }
+    // Audit G2 (EIP-170): the leverage-cap helpers — the open-perp-notional sum
+    // (`|sz| * markPx` over the whitelisted perps -> 6dp USD) and the order
+    // notional (`sz * limitPx / 1e10`) — moved into {VaultTradeLib}, which now
+    // owns the whole trade gate (whitelist + slippage band + leverage cap) so the
+    // loop and EnumerableSet machinery stay out of the vault's bytecode.
 
     // -------------------------------------------------------------------------
     // Internal — decimal normalization for USDC

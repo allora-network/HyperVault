@@ -194,17 +194,65 @@ legacy mode (`address(0)`) preserved.
 | wallet emits its Core-credit logs during deposit | `test_G2_pushEmitsWalletLogs` | 🟢 PASS | fork |
 | zero-amount push reverts inside the wallet | `test_G2_pushZeroAmountReverts` | 🟢 PASS | fork |
 | H2 available-idle guard fires before any wallet interaction | `test_G2_pushExceedingAvailableIdleReverts` | 🟢 PASS | fork |
-| `pullFromCore` action bytes byte-identical to v1.4 | `test_G2_pullEncodingUnchanged` | 🟢 PASS | fork |
+| `pullFromCore` emits CoreWriter `send_asset` (action 13), NOT the dropped `spot_send` (action 6) | `test_G2_pullUsesSendAssetNotSpotSend` | 🟢 PASS | fork |
 | wallet-mode deploy validation (token / system address / linkage, `CoreLinkVerified`) | `test_G2_walletTokenMismatchRevertsDeploy`, `test_G2_walletSystemAddressMismatchRevertsDeploy`, `test_G2_realWalletDeploysClean`, `test_G2_coreLinkMismatchRevertsDeploy`, `test_G2_coreLinkVerifiedEmitsWhenResolved` | 🟢 PASS | fork |
 | legacy route preserved + still dead for mainnet USDC | `test_G2_legacyPushStillTransfersToSystemAddress` (unit), `test_G_legacyPushRevertsOnBlacklistedBridge` (fork) | 🟢 PASS | unit + fork |
 | residual-allowance zeroing vs a misbehaving wallet | `test_G2_pushClearsResidualAllowance` | 🟢 PASS | unit |
-| Core spot credit appears after a wallet push | `test_G2_coreSpotCreditAppears_provenInLiveSpike` | ⏳ live-only | **Scenario C** |
-| wallet pays native USDC to vault idle on a Core-side send | `test_G2_walletPayoutOnPull_provenInLiveSpike` | ⏳ live-only | **Scenario C** |
+| Core spot credit appears after a wallet push | `test_G2_coreSpotCreditAppears_provenInLiveSpike` | 🟢 PROVEN LIVE | **spike 2026-06-15** |
+| wallet pays native USDC to vault idle on a Core-side `send_asset` | `test_G2_walletPayoutOnPull_provenInLiveSpike` | 🟢 PROVEN LIVE | **spike 2026-06-15/16** |
 
 Post-G2 fork suite: **54 passed, 0 failed, 4 skipped** (F, Q4, and the two Scenario-C
 stubs above). Linkage read (`resolve_usdc_linkage.py`, v1.5 three-verdict version):
 **WALLET-LINKED** — wallet `token() == 0xb883…630f`, `tokenSystemAddress() ==
 0x2000…0000`, `paused() == false`, reserve ≈ $4.87B (2026-06-12).
 
-**Scenario C tx-hash table:** _pending — to be recorded here when the funded round trip
-runs (the merge gate for `fix/G2-coredepositwallet-bridge`)._
+## v1.5 G2 — live spike EXECUTED 2026-06-15/16 (real funds, HyperEVM mainnet)
+
+The funded round trip ran and **closed the full trustless loop in both directions.** It also
+surfaced two blockers the fork suite structurally cannot catch — both fixed and re-proven.
+
+**Finding 1 — EIP-170.** The G2 vault compiled to **26411 bytes runtime, 1835 over the
+24576 limit**, which HyperEVM enforces (proven: a raw `cast --create` of a 25000-byte
+contract → status 0, all gas burned, no code, tx `0x10842e5b…`). No optimizer/`via_ir`
+setting fits (best `runs=1` = 25382). `forge script` hard-aborts before broadcast; the
+fork suite never caught it because the test EVM doesn't enforce EIP-170. **Fix:** the trade
+gate (whitelist + slippage band + leverage cap) and emergency-close loop were extracted into
+an external delegatecall library **`VaultTradeLib`** (events/errors re-declared so log topics
+and revert selectors are byte-identical). Vault → **24237 bytes**; fork 54/0/4 and unit 10/10
+unchanged.
+
+**Finding 2 — the pull used the wrong CoreWriter action.** The original `pullFromCore`
+emitted **`spot_send` (action 6)**, which **unified HyperCore accounts silently drop** (the
+EVM tx succeeds — CoreWriter is fire-and-forget — but Core never debits and nothing appears
+in `userNonFundingLedgerUpdates`). Proven on the first throwaway (`0xf6069C…5722`): two pulls
+emitted `BridgeWithdraw`, Core stayed at 7.0 indefinitely. **Fix:** `CoreWriterLib.sendAsset`
+(**action 13 / `0x00000D`**) — payload `abi.encode(recipient, address(0), sourceDex,
+destinationDex, token, amount)`, 8dp; for a Core→EVM withdrawal `recipient` = the token
+system address `0x2000…0000`, `sourceDex == destinationDex ==` Core Spot (`uint32.max`), and
+the wallet pays the **caller** (the vault) native USDC = `amount/100`. `pullFromCore`,
+`operatorRecoverSpot`, `emergencyRepatriate` all rewired.
+
+**Operational nuances (now encoded / documented):**
+- **Withdrawal fee ≈ 0.00134 USDC** is deducted from the Core account *on top of* the
+  requested amount, so requesting the **exact full Core balance is dropped** (nothing left to
+  cover the fee). The keeper must pull strictly under the balance — `e2e_runner.step_pull`
+  now pulls `balance × 0.998`.
+- **First push per vault costs 1.0 USDC** account-activation gas (one-time, ledger:
+  `accountActivationGas`).
+
+**Round-trip tx hashes — fresh vault `0xDE6A0c9371aCBC95fd3AC6B8A3598780013ec777`,
+`VaultTradeLib 0xAc0a0048Ed26fDA42461281876d6D7899dF320ec` (HyperEVM mainnet, chainid 999):**
+
+| Step | Result | Tx |
+|---|---|---|
+| Vault deploy (linked) | `CoreLinkVerified(asset, wallet)` fired in ctor vs real precompiles | `0x4d6427b786d95c24ab46f90138329447acff2f3a8f790946601b01dea9cb022e` |
+| Push EVM→Core (`deposit(4.8e6, SPOT)`) | Core credited 3.8 (1.0 activation gas); `coreSpotUsdc()` == HL API | ledger `spotTransfer 4.8 from 0x2000`, nonce 1785895 |
+| Pull FULL balance (`send_asset 3.8e8`) | **DROPPED** (fee uncovered) — Core stayed 3.8, no ledger entry | `0xb65397a05dbdf6ab4268989afc3454a2060a5584e3a7e8e35ba442dc6a43d220` |
+| Pull partial (`send_asset 1.0e8`) | **SETTLED** — Core 3.8→2.799 (`send`, fee 0.00134), `idleUsdc()` 0→1.0 | `0xc47db60e24d339b480df155cc874a7b81911b12f064c7f7118497c88c1b9c103` |
+| Pull recover (`send_asset 2.79e8`) | **SETTLED** — `idleUsdc()` 1.0→3.79 | `0xa44b4fbf78897ebf33bb5e40ccbcd2614984110238aba8ba753414550468e706` |
+| Redeem (alice) | paid 3.79 from idle; shares burned | `0xfb916af9f3e06c2303c9270bda0c63ab1ef7de2b18dd1f367c1ad66e89dd21a2` |
+
+Funds: $10.08 of the original $19.09 recovered to EOAs; ~$2 spent on the two vaults'
+one-time activation gas; **$7 permanently stranded on the first throwaway `0xf6069C…5722`**
+(deployed with the `spot_send` code before the fix, immutable — the cost of the discovery).
+Linkage read on the day: **WALLET-LINKED**, `paused()==false`, reserve ≈ $496M.

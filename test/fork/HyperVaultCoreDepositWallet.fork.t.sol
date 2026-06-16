@@ -128,19 +128,30 @@ contract HyperVaultCoreDepositWalletForkTest is HyperVaultBaseForkTest {
     }
 
     // ───────────────────────────────────────────────────────────────────────
-    // G2 (5) — pullFromCore is byte-identical to v1.4: spot_send(coreUsdcIndex)
-    //   to the USDC system address. The Core-side action is route-invariant;
-    //   only the EVM-side payout source changed (wallet reserve instead of the
-    //   linked-token transfer). Encoding asserted against a CoreWriter echo stub.
+    // G2 (5) — pullFromCore emits a CoreWriter `send_asset` (action 13), NOT the
+    //   legacy `spot_send` (action 6). Proven live 2026-06-15: unified HyperCore
+    //   accounts silently drop spot_send (Core never debits), so the withdrawal
+    //   MUST use send_asset. Payload mirrors Circle's CoreDepositWallet exactly:
+    //   (recipient=token system address, subAccount=0, sourceDex=destDex=Core
+    //   Spot, token=index, amount=8dp wei). The system then pays the CALLER (this
+    //   vault) native USDC at amount/100. Encoding asserted against a CoreWriter
+    //   echo stub (the fork cannot serve the Core side — see the live stubs below).
     // ───────────────────────────────────────────────────────────────────────
-    function test_G2_pullEncodingUnchanged() public {
+    function test_G2_pullUsesSendAssetNotSpotSend() public {
         _skipIfNoFork();
         vm.etch(Constants.CORE_WRITER, type(CoreWriterEcho).runtimeCode);
 
         bytes memory expected = abi.encodePacked(
             Constants.CORE_WRITER_VERSION,
-            uint24(Constants.ACTION_SPOT_SEND),
-            abi.encode(USDC_BRIDGE, uint64(0), uint64(777))
+            uint24(Constants.ACTION_SEND_ASSET),
+            abi.encode(
+                USDC_BRIDGE, // recipient = token system address (triggers the withdrawal)
+                address(0), // subAccount unused
+                Constants.CORE_SPOT_DEX_ID, // sourceDex = Core Spot
+                Constants.CORE_SPOT_DEX_ID, // destinationDex = Core Spot
+                uint64(0), // token index (USDC = 0)
+                uint64(777) // amount in 8dp Core wei
+            )
         );
         vm.expectEmit(false, false, false, true, Constants.CORE_WRITER);
         emit RawAction(expected);

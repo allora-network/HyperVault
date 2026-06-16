@@ -518,7 +518,14 @@ def step_perp_to_spot(ctx: Ctx) -> bool:
 def step_pull(ctx: Ctx) -> bool:
     ctx.console.rule("[bold]pull from Core (Core spot → EVM USDC)")
     spot_balance_core_wei = int(hl.spot_balance(ctx.info, ctx.vault_addr, 0) * 1e8)
-    pull_amount_wei = spot_balance_core_wei
+    # Audit G2 (proven live 2026-06-15): the pull is a CoreWriter `send_asset`
+    # (action 13) to the token system address — unified HyperCore accounts SILENTLY
+    # DROP the legacy `spot_send` (action 6). HyperCore charges a small withdrawal
+    # fee (~0.00134 USDC observed) deducted from the Core account ON TOP of the
+    # requested amount, so requesting the EXACT full balance leaves nothing to
+    # cover the fee and the action is dropped (Core never debits). Pull slightly
+    # under the balance so the fee is always covered.
+    pull_amount_wei = int(spot_balance_core_wei * 0.998)
     if pull_amount_wei == 0:
         ctx.console.print("[yellow]nothing to pull[/yellow]")
         return True
