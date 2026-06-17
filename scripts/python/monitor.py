@@ -115,6 +115,13 @@ class MonitorCtx:
     console: Console
     sink: AlertSink
     leverage_cap_bps: int = 0       # resolved from chain in build (SOLU-3377)
+    # SOLU-3377 order-reconciliation state (carried across passes).
+    order_stale_s: int = 120
+    lev_tolerance_bps: int = 100
+    lookback_blocks: int = 5_000
+    log_chunk: int = 2_000
+    last_scanned_block: int = 0
+    order_state: dict = field(default_factory=dict)
 
 
 def build_monitor_ctx(args: argparse.Namespace) -> MonitorCtx:
@@ -149,6 +156,8 @@ def build_monitor_ctx(args: argparse.Namespace) -> MonitorCtx:
         w3=w3, info=hl.make_info(args.network), vault=vault, vault_addr=vault_addr,
         wallet=wallet, asset_idx=args.asset, network=args.network,
         console=console, sink=sink, leverage_cap_bps=lev_cap,
+        order_stale_s=args.order_stale_s, lev_tolerance_bps=args.lev_tolerance_bps,
+        lookback_blocks=args.lookback_blocks, log_chunk=args.log_chunk,
     )
 
 
@@ -234,10 +243,117 @@ def check_posture(ctx: MonitorCtx) -> None:
         ctx.sink.fire("escape.active", "info", "escape latch cleared.", force=True)
 
 
-# Registry of checks. SOLU-3377 appends order-reconciliation + leverage here.
+# -----------------------------------------------------------------------------
+# Checks (SOLU-3377: order reconciliation + leverage)
+# -----------------------------------------------------------------------------
+
+def _cloid_hex(cloid: int) -> str:
+    return "0x" + int(cloid).to_bytes(16, "big").hex()
+
+
+def _scan_events(ctx: MonitorCtx, event, from_block: int, to_block: int) -> list:
+    """Chunked get_logs over [from_block, to_block], resilient to web3 arg naming."""
+    out: list = []
+    b = from_block
+    while b <= to_block:
+        end = min(b + ctx.log_chunk - 1, to_block)
+        try:
+            try:
+                out.extend(event.get_logs(from_block=b, to_block=end))
+            except TypeError:
+                out.extend(event.get_logs(fromBlock=b, toBlock=end))
+        except Exception as exc:  # noqa: BLE001 — log + continue; a bad chunk isn't fatal
+            ctx.sink.fire("scan.error", "warn", f"get_logs {b}-{end} failed: {exc}")
+        b = end + 1
+    return out
+
+
+def check_order_reconciliation(ctx: MonitorCtx) -> None:
+    """SOLU-3377: index LimitOrderSubmitted, map cloid->oid via HL info, and flag
+    orders that were submitted on-chain but never rested or filled — the
+    fire-and-forget CoreWriter silent-drop signal (wrong px/sz 1e8 scale,
+    sub-$10 notional, tif not in {1,2,3}, etc.)."""
+    latest = ctx.w3.eth.block_number
+    start = (ctx.last_scanned_block + 1) if ctx.last_scanned_block else max(0, latest - ctx.lookback_blocks)
+
+    # 1) New submissions -> track as UNCONFIRMED.
+    for log in _scan_events(ctx, ctx.vault.events.LimitOrderSubmitted(), start, latest):
+        a = log["args"]
+        cloid = int(a["cloid"])
+        rec = ctx.order_state.setdefault(cloid, {
+            "first_seen": time.time(), "block": log["blockNumber"],
+            "status": "UNCONFIRMED", "oid": None,
+            "px": a.get("limitPx"), "sz": a.get("sz"), "tif": a.get("tif"),
+        })
+        rec["block"] = log["blockNumber"]
+
+    # 2) On-chain cancels -> terminal CANCELLED (don't flag as a drop).
+    for log in _scan_events(ctx, ctx.vault.events.OrderCancelByCloidSubmitted(), start, latest):
+        cloid = int(log["args"]["cloid"])
+        if cloid in ctx.order_state:
+            ctx.order_state[cloid]["status"] = "CANCELLED"
+
+    ctx.last_scanned_block = latest
+
+    # 3) Reconcile non-terminal cloids against the HL book + recent fills.
+    resting = {o.get("cloid", "").lower(): o for o in hl.open_orders(ctx.info, ctx.vault_addr)}
+    fills = hl.user_fills(ctx.info, ctx.vault_addr)
+    fills_by_cloid = {f.get("cloid", "").lower(): f for f in fills if f.get("cloid")}
+
+    for cloid, rec in ctx.order_state.items():
+        if rec["status"] in ("CANCELLED", "FILLED"):
+            continue
+        ch = _cloid_hex(cloid).lower()
+        if ch in resting:
+            rec["status"], rec["oid"] = "RESTING", resting[ch].get("oid")
+            ctx.sink.fire(f"order.{cloid}", "info", f"cloid {ch} RESTING oid={rec['oid']}", force=True)
+        elif ch in fills_by_cloid:
+            rec["status"], rec["oid"] = "FILLED", fills_by_cloid[ch].get("oid")
+            ctx.sink.fire(f"order.{cloid}", "info", f"cloid {ch} FILLED oid={rec['oid']}", force=True)
+        elif (time.time() - rec["first_seen"]) > ctx.order_stale_s:
+            ctx.sink.fire(
+                f"order.{cloid}", "alert",
+                f"cloid {ch} submitted on-chain (block {rec['block']}, px={rec['px']} "
+                f"sz={rec['sz']} tif={rec['tif']}) but NOT resting and NOT filled after "
+                f"{ctx.order_stale_s}s — likely SILENT DROP (check 1e8 px/sz scale, $10 min "
+                "notional, tif in {1,2,3}).",
+            )
+
+
+def check_leverage(ctx: MonitorCtx) -> None:
+    """SOLU-3377: cross-check realized on-Core leverage vs leverageCapBps. The vault
+    gates leverage at order time against NAV; this flags residual leverage that
+    drifted past the cap on Core (mark moves, partial flattens)."""
+    if ctx.leverage_cap_bps <= 0:
+        return
+    state = _safe_call(lambda: hl.user_state(ctx.info, ctx.vault_addr), {})
+    ms = (state or {}).get("marginSummary", {})
+    try:
+        account_value = float(ms.get("accountValue", 0) or 0)
+        total_ntl = float(ms.get("totalNtlPos", 0) or 0)
+    except (TypeError, ValueError):
+        return
+    if account_value <= 0:
+        return
+    lev_bps = total_ntl / account_value * 10_000
+    if lev_bps > ctx.leverage_cap_bps + ctx.lev_tolerance_bps:
+        ctx.sink.fire(
+            "leverage", "alert",
+            f"on-Core leverage {lev_bps:,.0f} bps ({lev_bps / 10_000:.2f}x) exceeds cap "
+            f"{ctx.leverage_cap_bps} bps (+{ctx.lev_tolerance_bps} tol) — "
+            f"notional={total_ntl:,.2f} accountValue={account_value:,.2f}.",
+        )
+    elif "leverage" in ctx.sink._last:
+        ctx.sink.fire("leverage", "info",
+                      f"on-Core leverage {lev_bps:,.0f} bps back within cap.", force=True)
+
+
+# Registry of checks — run in order each pass.
 CHECKS: list[Callable[[MonitorCtx], None]] = [
     check_posture,
     check_wallet_paused,
+    check_order_reconciliation,
+    check_leverage,
 ]
 
 
@@ -267,11 +383,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--webhook-url", default=None, help="alert webhook (default $ALERT_WEBHOOK_URL)")
     p.add_argument("--re-alert-s", type=int, default=900,
                    help="seconds before an identical alert re-fires (default 900)")
-    # SOLU-3377 knobs (consumed once that PR lands; harmless here).
+    # SOLU-3377 order-reconciliation + leverage knobs.
     p.add_argument("--lookback-blocks", type=int, default=5_000,
-                   help="block lookback for LimitOrderSubmitted scan (SOLU-3377)")
-    p.add_argument("--log-chunk", type=int, default=2_000,
-                   help="getLogs chunk size in blocks (SOLU-3377)")
+                   help="block lookback for the first LimitOrderSubmitted scan")
+    p.add_argument("--log-chunk", type=int, default=1_000,
+                   help="getLogs chunk size in blocks (HyperEVM public RPC caps the span at 1000)")
+    p.add_argument("--order-stale-s", type=int, default=120,
+                   help="seconds before a submitted-but-unconfirmed order is flagged as a silent drop")
+    p.add_argument("--lev-tolerance-bps", type=int, default=100,
+                   help="leverage-cap tolerance in bps before alerting (default 100)")
     return p
 
 
