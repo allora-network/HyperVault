@@ -27,6 +27,9 @@ import {VaultEscapeLib} from "./libraries/VaultEscapeLib.sol";
 // (M5's latch pushed the vault back over 24576; externalizing the emergency
 // surface — the established VaultTradeLib pattern — reclaims the headroom.)
 import {VaultEmergencyLib} from "./libraries/VaultEmergencyLib.sol";
+// M4 (SOLU-3366): the soft-redemption-barrier state + logic live in an external
+// delegatecall library for the SAME EIP-170 reason — see {VaultBarrierLib}.
+import {VaultBarrierLib} from "./libraries/VaultBarrierLib.sol";
 
 /// @title  HyperCoreVault — EIP-4626 vault that trades on HyperCore via CoreWriter
 /// @notice One vault per strategy. Operator runs trades; depositors hold tokenized shares.
@@ -398,6 +401,10 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         uint256 received = idleUsdc() - idleBefore;
         if (received < assets) revert DepositAmountNotReceived(assets, received);
         _absorbCostBasis(receiver, shares, assets);
+        // M4 (SOLU-3366): (re)start the receiver's lockup clock (most-recent deposit
+        // governs; no-op effect at the default lockupPeriod==0). Inline asm write to
+        // the {VaultBarrierLib} namespaced slot — cheaper than a delegatecall here.
+        _stampDeposit(receiver);
     }
 
     function mint(uint256 shares, address receiver)
@@ -418,6 +425,8 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         uint256 received = idleUsdc() - idleBefore;
         if (received < assets) revert DepositAmountNotReceived(assets, received);
         _absorbCostBasis(receiver, shares, assets);
+        // M4 (SOLU-3366): (re)start the receiver's lockup clock — see {deposit}.
+        _stampDeposit(receiver);
     }
 
     /// @dev Bypasses `super.withdraw` to avoid OZ's `maxWithdraw` check, which
@@ -448,6 +457,12 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         returns (uint256 shares)
     {
         _accrueMgmtFee();
+
+        // M4 (SOLU-3366): soft barriers (lockup / cooldown / per-tx gate) gate the
+        // INSTANT path only. `assets` is the gross requested amount; the gate uses
+        // {totalAssets} as its denominator. Default 0/OFF makes this a no-op. The
+        // queue + emergency paths are NEVER gated (Findings A/B liveness).
+        _enforceBarriers(owner, assets);
 
         // Audit H2: idle reserved for overdue prioritized requests is off-limits to
         // direct withdraws (Finding F — racing redeems can't drain a queued LP's reserve).
@@ -488,6 +503,12 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         _accrueMgmtFee();
 
         uint256 grossAssets = previewRedeem(shares);
+        // M4 (SOLU-3366): soft barriers gate the INSTANT path only. The gate bounds
+        // the REQUESTED gross (pre-partial-fill), so it can't be dodged via a partial
+        // fill; lockup/cooldown are keyed on `owner`. Default 0/OFF = no-op. The queue
+        // + emergency paths are never gated (Findings A/B liveness).
+        _enforceBarriers(owner, grossAssets);
+
         // Audit H2: only un-reserved idle is available to a direct redeem.
         uint256 idle = _availableIdle();
         if (grossAssets > idle) {
@@ -1266,11 +1287,14 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///         szDecimals)` family; because that is not guaranteed for every spot
     ///         market, this is guidance only — the admin MUST confirm it against a
     ///         live test order before calling {setSpotSlippageBand}.
+    /// @dev    EIP-170 (M4 / SOLU-3366): the body is in {VaultTradeLib} — its `10 ** x`
+    ///         pulled the full runtime-exponentiation routine (~1.2 KB) into the vault,
+    ///         which the vault otherwise never needs; the library already has that
+    ///         routine, so hoisting this (the established VaultTradeLib split) frees the
+    ///         headroom the soft redemption barriers require. Behaviour-identical: a
+    ///         pure-read view, delegated so `address(this)` stays the vault.
     function suggestedSpotPxScaleFactor(uint32 asset_) external view returns (uint64) {
-        uint32 idx = AssetId.indexOf(asset_);
-        uint64 baseToken = PrecompileLib.spotInfo(idx).tokens[0];
-        uint256 szDec = uint256(PrecompileLib.tokenInfo(uint32(baseToken)).szDecimals);
-        return uint64(10 ** (szDec + 2));
+        return VaultTradeLib.suggestedSpotPxScaleFactor(asset_);
     }
 
     /// @notice Audit M4: set the emergency-close sanity band in bps (vs strict
@@ -1280,6 +1304,80 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     function setEmergencyCloseBand(uint16 bps) external onlyRole(DEFAULT_ADMIN_ROLE) {
         emit EmergencyCloseBandUpdated(emergencyCloseBandBps, bps);
         emergencyCloseBandBps = bps;
+    }
+
+    // -------------------------------------------------------------------------
+    // Soft redemption barriers (M4 — TODO-7 / SOLU-3366)
+    //
+    // Admin-configured FRICTION on the SYNCHRONOUS exit paths only ({withdraw},
+    // {redeem}) + a per-receiver lockup stamped on deposit/mint. They are
+    // require-checks, NOT a freeze: redeems are never pausable (Findings A/B) and
+    // the always-available escape is the {requestWithdraw} queue — the queue,
+    // emergency surface, and every Core->EVM repatriation mover are DELIBERATELY
+    // NOT barrier-gated. All knobs default to 0/OFF, so a vault that never opts in
+    // behaves exactly as before. EIP-170: the state + logic live in the external
+    // delegatecall {VaultBarrierLib} (the vault had only ~339 B of headroom);
+    // {block.timestamp}/{msg.sender}/the ERC-7201 namespaced slot all resolve
+    // against the vault under delegatecall. Documented as explicit ERC-4626
+    // deviations in docs/INTEGRATION.md ("Soft redemption barriers").
+    // -------------------------------------------------------------------------
+
+    /// @notice M4 (SOLU-3366): set all three soft redemption barriers at once — the
+    ///         `lockup` (seconds after the most recent deposit before a synchronous
+    ///         exit is allowed; re-deposits refresh it), the `cooldown` (minimum
+    ///         seconds between an LP's synchronous redemptions), and the `gateBps`
+    ///         (max fraction of {nav} one direct exit may move, in bps). Each
+    ///         defaults to 0 (OFF) and a 0 disables that barrier. These gate the
+    ///         INSTANT path only; the {requestWithdraw} queue + the emergency /
+    ///         repatriation surface are never barrier-gated, so redemption liveness
+    ///         (Findings A/B) is preserved — see docs/INTEGRATION.md. `gateBps` above
+    ///         {Constants.BPS} reverts {RedeemGateBpsTooHigh}.
+    function setRedemptionBarriers(uint64 lockup, uint64 cooldown, uint16 gateBps)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        // Delegatecall — validation (`gateBps <= BPS`), the namespaced write, and the
+        // {RedemptionBarriersUpdated} emit (vault-mirrored) all live in the library, so
+        // none of that branchy/event code sits in the vault's runtime (EIP-170).
+        VaultBarrierLib.setBarriers(lockup, cooldown, gateBps);
+    }
+
+    // M4 (SOLU-3366) / EIP-170: the on-chain barrier-state VIEW GETTERS
+    // (`redemptionBarriers` / `lastDepositAt` / `lastRedeemAt`) were DROPPED from the
+    // vault to stay under the 24576-byte runtime limit — they cost ~309 B the vault
+    // does not have once stacked on the M5 emergency-extraction split. The state is
+    // unchanged (it lives in the {VaultBarrierLib} ERC-7201 namespaced slot, written
+    // by {setRedemptionBarriers} and {_stampDeposit}); integrators read it OFF-CHAIN
+    // instead. The config is recoverable from the {RedemptionBarriersUpdated} event,
+    // and any slot can be read directly via `eth_getStorageAt` at {VaultBarrierLib.SLOT}
+    // (config: word at SLOT — lockup = bits[0:64], cooldown = [64:128], gateBps =
+    // [128:144]; lastDepositAt[lp] = keccak256(lp, SLOT+1); lastRedeemAt[lp] =
+    // keccak256(lp, SLOT+2)). See docs/INTEGRATION.md "Soft redemption barriers".
+
+    /// @dev M4 (SOLU-3366): stamp `receiver`'s lockup clock ({VaultBarrierLib}
+    ///      `lastDepositAt`, struct member 1 of the namespaced slot) on deposit/mint.
+    ///      Written inline (one `sstore`) rather than via a {VaultBarrierLib}
+    ///      delegatecall — measurably cheaper (the asm body is ~38 B smaller than a
+    ///      1-arg delegatecall's ABI-encode + DELEGATECALL overhead), and the slot is
+    ///      the same one the library reads. Harmless no-op effect at lockupPeriod==0.
+    function _stampDeposit(address receiver) private {
+        bytes32 base = bytes32(uint256(VaultBarrierLib.SLOT) + 1);
+        uint256 ts = block.timestamp;
+        assembly {
+            mstore(0x00, receiver)
+            mstore(0x20, base)
+            sstore(keccak256(0x00, 0x40), ts)
+        }
+    }
+
+    /// @dev M4 (SOLU-3366): the shared {VaultBarrierLib.enforce} entry for the two
+    ///      sync exit paths. EIP-170: collapsing both call sites into one private
+    ///      helper emits the {totalAssets} call + the DELEGATECALL stub ONCE (the
+    ///      {withdraw}/{redeem} sites become cheap internal jumps). `grossAssets` is the
+    ///      pre-partial-fill requested amount; the gate's NAV denominator is
+    ///      {totalAssets}. All-OFF is a no-op inside the library's fast path.
+    function _enforceBarriers(address owner, uint256 grossAssets) private {
+        VaultBarrierLib.enforce(owner, grossAssets, totalAssets());
     }
 
     // -------------------------------------------------------------------------

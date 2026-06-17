@@ -95,6 +95,25 @@ interface IHyperCoreVault is IERC4626 {
     ///         permissionless brake (set it absurdly long) nor make it hair-trigger
     ///         (set it ~0) — fail-closed, matching the repo's posture.
     error EscapeGraceOutOfRange(uint64 lo, uint64 hi);
+    /// @notice The trigger condition for {triggerEscape} (the permissionless
+    ///         staleness gate — `escapeGraceSeconds` + overdue-AND-claim>idle) is
+    ///         completed in SOLU-3371; in this issue entry is admin-gated (M5 §1).
+    error EscapeTriggerNotWired();
+    /// @notice Soft lockup barrier (M4 / SOLU-3366): a SYNCHRONOUS {withdraw}/{redeem}
+    ///         was attempted before `unlockAt` (the owner's last deposit + the
+    ///         configured lockup). The {requestWithdraw} queue is NOT lockup-gated.
+    error LockupNotElapsed(uint64 unlockAt);
+    /// @notice Soft cooldown barrier (M4 / SOLU-3366): a SYNCHRONOUS {withdraw}/{redeem}
+    ///         was attempted before `readyAt` (the owner's last sync redemption + the
+    ///         configured cooldown). The {requestWithdraw} queue is NOT cooldown-gated.
+    error RedeemCooldownActive(uint64 readyAt);
+    /// @notice Soft gate barrier (M4 / SOLU-3366): a single SYNCHRONOUS exit requested
+    ///         `requested` assets, exceeding `cap` (the configured gate bps of {nav}).
+    ///         Route the remainder through the (ungated) {requestWithdraw} queue.
+    error RedeemGateExceeded(uint256 requested, uint256 cap);
+    /// @notice {setRedemptionBarriers} called with a gate above 100% of NAV (M4) —
+    ///         a gate bps over `BPS` (10000) is meaningless.
+    error RedeemGateBpsTooHigh(uint16 gateBps);
 
     // -------------------------------------------------------------------------
     // Shared structs
@@ -229,6 +248,10 @@ interface IHyperCoreVault is IERC4626 {
     event SpotSlippageBandUpdated(uint32 indexed asset, uint16 bps, uint64 scaleFactor);
     /// @notice Admin updated the emergency-close sanity band (audit M4).
     event EmergencyCloseBandUpdated(uint16 oldBps, uint16 newBps);
+    /// @notice Admin updated the soft redemption barriers (M4 / SOLU-3366): the
+    ///         per-receiver `lockup` (seconds), the per-LP `cooldown` (seconds), and
+    ///         the per-tx `gateBps` (fraction of NAV). All 0 = OFF (the default).
+    event RedemptionBarriersUpdated(uint64 lockup, uint64 cooldown, uint16 gateBps);
     /// @notice LEGACY MODE ONLY (no CoreDepositWallet configured): emitted at
     ///         deploy when the Core-USDC token's linked EVM contract
     ///         (`tokenInfo(coreUsdcIndex).evmContract`) is NOT the vault's
@@ -303,6 +326,20 @@ interface IHyperCoreVault is IERC4626 {
     ///         [`ESCAPE_GRACE_MIN`, `ESCAPE_GRACE_MAX`] (fail-closed — the timelock
     ///         cannot disable the brake). Emits {EscapeGraceSecondsUpdated}.
     function setEscapeGraceSeconds(uint64 newGrace) external;
+    /// @notice Soft redemption barriers (M4 / SOLU-3366) — admin-configured FRICTION
+    ///         on the SYNCHRONOUS {withdraw}/{redeem} paths only (lockup after the
+    ///         most-recent deposit, cooldown between sync redemptions, and a per-tx
+    ///         gate as a fraction of NAV). Each defaults to 0 (OFF). The
+    ///         {requestWithdraw} queue + the emergency/repatriation surface are never
+    ///         barrier-gated, so redemption liveness (Findings A/B) holds. Documented
+    ///         as explicit ERC-4626 deviations in docs/INTEGRATION.md.
+    function setRedemptionBarriers(uint64 lockup, uint64 cooldown, uint16 gateBps) external;
+    // M4 (SOLU-3366) / EIP-170: the on-chain barrier-state view getters
+    // (`redemptionBarriers` / `lastDepositAt` / `lastRedeemAt`) were DROPPED to keep
+    // the vault under the 24576-byte runtime limit. The state lives in the
+    // {VaultBarrierLib} ERC-7201 namespaced slot; read it off-chain from the
+    // {RedemptionBarriersUpdated} event or via `eth_getStorageAt` (see the vault's
+    // {setRedemptionBarriers} NatSpec + docs/INTEGRATION.md for the slot layout).
 
     // -------------------------------------------------------------------------
     // Emergency surface
