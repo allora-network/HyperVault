@@ -183,6 +183,73 @@ python scripts/python/e2e_runner.py --steps reconcile_after_recover \
   --reconcile-live --reconcile-dest <allowlisted spotRecoverDest address>
 ```
 
+## Redemption fairness policy (direct redeem vs the queue)
+
+The vault runs **two exit paths against one scarce resource — idle EVM USDC**: the
+synchronous ERC-4626 path (`withdraw` / `redeem`) and the escrow queue
+(`requestWithdraw` → `fulfillWithdraw`). The policy below is the resolution of
+assessment TODO-6 (Finding F). It is a **minimal-deviation** choice: direct
+redemption keeps strict synchronous ERC-4626 semantics on the liquid path, and a
+single, bounded backstop protects requests that the operator neglects past their SLA.
+Exits are **not** routed through one ordered mechanism and there is **no pro-rata
+socialisation** of idle.
+
+**1. Direct redeem/withdraw is first-come-first-served and CAN jump the queue.**
+A direct `redeem` / `withdraw` draws from the *currently available* idle pool the
+moment it is called and **can be served ahead of an earlier, still-pending
+withdrawal request**. There is no ordering, reservation, or queue position for a
+request until it is overdue (see below). This is intentional: it preserves
+synchronous 4626 behaviour for the liquid path (a caller redeeming within available
+idle gets paid in the same transaction, with no queue dependency). A faster direct
+redeemer, or a faster keeper, can therefore consume idle that a waiting requester
+might otherwise have drawn.
+
+**2. The fairness backstop: overdue requests reserve their claim on idle.**
+Each request carries an on-chain `fulfillmentDeadline` (= request time +
+`requestFulfillmentWindow`; the window is the SLA, `0` disables it). Once
+`block.timestamp` passes that deadline the request is **overdue**, and **anyone**
+(permissionless, keeper-friendly) may call `prioritizeOverdue(lp)`. That reserves the
+request's current `previewRedeem` claim on idle into `_reservedIdle`, capped at the
+idle available at that instant. After prioritization, direct redeems **can no longer
+drain that reserved idle** — the reserve is enforced at execution in every path that
+spends idle, not merely advertised in the view functions:
+
+- `withdraw` reverts if `assets > _availableIdle()` (`HyperCoreVault.sol:411-412`).
+- `redeem` partial-fills bounded by `_availableIdle()` (`HyperCoreVault.sol:448-455`).
+- `pushToCore` cannot deploy reserved idle to Core (`HyperCoreVault.sol:726-727`).
+- A **non-prioritized** `fulfillWithdraw` draws only `_availableIdle()`, leaving other
+  LPs' reserves intact; the matching prioritized request draws its own reserve plus
+  free idle (`HyperCoreVault.sol:1150`).
+
+where `_availableIdle() = idleUsdc() − _reservedIdle`, floored at zero
+(`HyperCoreVault.sol:565-568`). The `maxWithdraw` / `maxRedeem` views report the same
+bound (`HyperCoreVault.sol:319,332`), so an integrator reading the views and a caller
+hitting the state-changing function see the identical limit. So the stall-and-front-run
+attack on a *neglected* request is bounded by the SLA window length plus the latency of
+permissionless prioritization, **not** by trusting the operator or any single keeper.
+
+**3. The residual deviation, stated plainly.** A **non-overdue** request enjoys no
+reservation by design. While a request is within its SLA window, a large direct
+redeemer can reduce idle that the waiting requester might otherwise have drawn, and
+the requester has no recourse until the deadline lapses. The mitigations are
+operational, not architectural: **(a)** set `requestFulfillmentWindow` tight enough
+that the unprotected interval is short, and **(b)** run the keeper so it calls
+`prioritizeOverdue(lp)` promptly at each request's deadline (and re-calls it on the
+remainder after a partial fill — see the SECURITY.md note below). The economic loss to
+the requester is bounded by what direct redeemers can drain inside that window; it is
+never a loss of *shares* (an unfulfilled requester can always `cancelWithdrawRequest()`
+to recover the escrowed shares and redeem directly).
+
+> **Note (durability across a partial fill).** A partial `fulfillWithdraw` releases the
+> whole reserve and zeroes the remainder's reservation, so a keeper must
+> `prioritizeOverdue` the remainder again to re-protect it. This is intentional (it
+> avoids stranding idle in `_reservedIdle` if NAV fell after prioritization) and carries
+> no fund loss. See `docs/SECURITY.md` integrator note 3.
+
+> **Note (NAV exposure while queued).** A queued request stays fully exposed to strategy
+> PnL until fulfilled — there is no epoch NAV lock. The payout uses `previewRedeem` at
+> *fulfillment* time, not at request time.
+
 ## Emergency runbook
 
 If the strategy must be shut down (operator key suspected compromised, market dislocation, contract bug suspected):
