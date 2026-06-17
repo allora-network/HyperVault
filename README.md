@@ -8,7 +8,7 @@ Validated end-to-end on **HyperEVM mainnet** (chain 999) — see [the mainnet fi
 
 ## What this gives you
 
-- **Audit-ready ERC-4626 vault** (`src/HyperCoreVault.sol`) — operator/emergency/admin roles, asset whitelist, leverage cap, slippage band, management + performance fees, withdrawal queue, cost-basis tracking
+- **Audit-ready ERC-4626 vault** (`src/HyperCoreVault.sol`) — operator/emergency/admin roles, asset whitelist, leverage cap, slippage band, management + performance fees, cost-basis tracking, a **liquidity-gated redemption queue** (keeper + on-chain SLA), **soft barriers** (lockup/cooldown/gate, off by default), and a **permissionless escape brake** that unwinds Core positions and returns funds to LPs if requests go unhonored
 - **Per-strategy deploy pipeline** — JSON config in, on-chain vault + per-vault `TimelockController` + auto-registered entry out
 - **Discovery frontend** — Vite + React + viem; auto-discovers every vault from `deployments/<chain>/*.json` artifacts at build time
 - **Live mainnet test harness** (`scripts/python/e2e_runner.py`) — exercises the full lifecycle against real HyperCore (`deposit → spot↔perp → limit order place / cancel / fill-confirm → withdraw / redeem`) with HL-API assertions at each step. Mock-based forge tests were retired in favour of live verification — see [the mainnet findings](#real-mainnet-findings).
@@ -76,11 +76,15 @@ src/                          Solidity sources
     Constants.sol             Precompile addresses, CoreWriter action IDs, TIF enum, USDC indices
     CoreWriterLib.sol         Typed wrappers for limit_order / send_asset / spot_send / usd_class_transfer / cancel
     VaultTradeLib.sol         External delegatecall lib: trade gate + emergency close (EIP-170 size split)
+    VaultEmergencyLib.sol     External delegatecall lib: escape latch + legs 1-3 cranks (M5)
+    VaultEscapeLib.sol        External delegatecall lib: escape staleness trigger + spot->EVM pull (M5)
+    VaultBarrierLib.sol       External delegatecall lib: soft redemption barriers, ERC-7201 storage (M4)
     PrecompileLib.sol         Typed reads of all L1 precompiles (position, spotBalance, oraclePx, etc.)
     AssetId.sol               Perp/spot ID encoding (spot = 10_000 + spotIdx)
     SystemAddress.sol         Token bridge-address derivation (0x20 || zero-pad || tokenIdx)
   interfaces/
     ICoreWriter.sol
+    ICoreDepositWallet.sol    Circle CoreDepositWallet (the v1.5 G2 USDC EVM<->Core bridge)
     IHyperCoreVault.sol       Full public ABI + events for indexers / frontend
 
 script/                       Foundry deploy scripts
@@ -90,6 +94,9 @@ script/                       Foundry deploy scripts
 
 scripts/python/               Python orchestration + live mainnet test harness (HL SDK + web3.py)
   e2e_runner.py               Full-lifecycle live mainnet test harness; HL API cross-checks per step
+  keeper.py                   Redemption-fulfillment keeper loop (watch -> repatriate -> fulfillWithdraw; dry-run default)
+  reconcile.py                Reconciles fire-and-forget Core sends (operatorRecoverSpot / pullFromCore)
+  resolve_usdc_linkage.py     Live eth_call linkage resolver (tokenInfo / CoreDepositWallet, G2)
   live_contract_path.py       Focused live test: whitelist → fund → place (rests) → cancel → recover
   hl_helpers.py               HL reads + px/sz (×10^8) / tif encoding used by the harness
   optin_big_blocks.py         Toggles HyperEVM big-blocks via HL API (needed for vault deploy)
@@ -104,6 +111,10 @@ docs/                         Architecture, integration, security
   ARCHITECTURE.md             Design rationale + diagrams
   INTEGRATION.md              Live runner integration guide (event → SDK field mapping, runbook)
   SECURITY.md                 Threat model, role/permission matrix, audit checklist, mainnet findings
+  REDEMPTION_ASSESSMENT.md    Redemption e2e review + findings register (sync-4626 + hardened queue)
+  FORK_PROOFS.md              Findings reproduced on real HyperEVM bytecode + live-spike tx hashes
+  ESCAPE_HATCH_SCOPE.md       Permissionless escape-brake design (legs 1-4)
+  REDEMPTION_LIVE_RUNBOOK.md  Staged live battle-test runbook
 
 frontend/                     Vite + React + viem discovery UI
   src/
@@ -124,6 +135,9 @@ frontend/                     Vite + React + viem discovery UI
 
 **`HyperCoreVault.sol`** — the main contract. Per-strategy, EIP-4626-compliant. Notable surface:
 - `deposit / mint / withdraw / redeem` — standard ERC-4626 with `maxWithdraw` correctly bounded by idle USDC (no silent reverts)
+- `requestWithdraw / fulfillWithdraw / cancelWithdrawRequest` (+ `prioritizeOverdue` / `setRequestFulfillmentWindow`) — the liquidity-gated redemption **queue**: `fulfillWithdraw` is **permissionless** (keeper-friendly), partial-fills, one open request per LP, with an on-chain SLA so overdue requests reserve idle ahead of racing direct redeems
+- `setRedemptionBarriers` — admin **soft barriers** (lockup / cooldown / per-tx gate) on the synchronous paths only, all default 0 = OFF (state in `VaultBarrierLib`)
+- **Permissionless emergency brake** (M5): `triggerEscape` arms it once a request is overdue past `setEscapeGraceSeconds` and unfillable from idle; permissionless cranks then cancel resting orders, flatten perps (reduce-only IOC + price band), consolidate to spot, and `escapePullToEvm` returns funds to LP-redeemable idle; `exitEscape` clears it once the backlog is gone (logic in `VaultEscapeLib` / `VaultEmergencyLib`)
 - `placeLimitOrder / cancelOrderByCloid` — operator-only, gated by asset whitelist + slippage band vs `oraclePx` + post-trade leverage cap
 - `pushToCore / pullFromCore` — operator-only EVM↔Core USDC bridging. **v1.5 (G2), proven live:** push goes through **Circle's CoreDepositWallet** (`approve + deposit`, the official route for natively-minted USDC; `coreDepositWallet` is a validated per-vault immutable, `address(0)` = legacy direct-linked-asset mode); pull is a CoreWriter **`send_asset` (action 13)** to the token system address (NOT the legacy `spot_send`, which unified HyperCore accounts silently drop) — the wallet then pays native USDC to the vault. A small ~0.00134 USDC withdrawal fee means the keeper must pull **under** the full Core balance; a vault's first push costs 1.0 USDC one-time activation gas
 - `operatorRecoverSpot(to, token, amountWei)` — operator-only generic Core spot send; **contingency** (e.g. Circle pauses the wallet) — no longer the primary realisation path
@@ -268,7 +282,7 @@ The repo ships three strategy configs — `tier1`, `tier2`, `tier2b` (`deploymen
 
 ### Deployed instances (pre-v1.3 — superseded, pending redeploy)
 
-Deployed before the v1.3 px/sz-scale + TIF fixes, so they **cannot place orders** (wrong action scale + TIF inlined in bytecode). Redeploy with the current code via `Deploy.s.sol`, then refresh these addresses.
+Deployed before the v1.3 px/sz-scale + TIF fixes, so they **cannot place orders** (wrong action scale + TIF inlined in bytecode) — and they predate v1.5 G2 and the M4/M5 redemption-hardening + escape-brake work. Redeploy from current `main` via `Deploy.s.sol` (which now validates the **CoreDepositWallet** linkage for Core-USDC and enforces a >=24h timelock + distinct operator/emergency/admin roles on mainnet), then refresh these addresses.
 
 | | Vault (pre-v1.3) | Timelock |
 |---|---|---|
@@ -282,9 +296,10 @@ The v1.3 fixes were confirmed on a throwaway test vault that placed a **resting 
 
 ---
 
-## Known limitations and v1.1 follow-ups
+## Known limitations and follow-ups
 
-- **EIP-1167 minimal-proxy refactor** to restore the CREATE2 factory and keep the per-vault deploy under EIP-170
+- **Production hardening (M6, pre-LP-launch):** raise the $100 test deposit caps (SOLU-3373), split operator/emergency/admin keys + hand the timelock to a multisig (SOLU-3374), and stand up off-chain order-reconciliation + wallet-`paused()` monitoring
+- **EIP-1167 minimal-proxy refactor** to restore the CREATE2 factory under EIP-170 — deferred (SOLU-3378); the factory is bypassed today (`Deploy.s.sol` deploys the vault directly), so this does not block deploys
 - **Multi-quote vault support** (current: USDC-only)
 - **Subaccount support** (current: one Core account per vault, derived from EVM address)
 - **Sweep stranded asset** is operator-gated; consider moving to `EMERGENCY_ROLE` for production
@@ -297,6 +312,9 @@ The v1.3 fixes were confirmed on a throwaway test vault that placed a **resting 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — design rationale, NAV math, fee accounting
 - [`docs/INTEGRATION.md`](docs/INTEGRATION.md) — live-runner integration, event-to-SDK-field mapping, runbook
 - [`docs/SECURITY.md`](docs/SECURITY.md) — threat model, role matrix, audit checklist, mainnet findings
+- [`docs/REDEMPTION_ASSESSMENT.md`](docs/REDEMPTION_ASSESSMENT.md) — redemption e2e review + findings register
+- [`docs/FORK_PROOFS.md`](docs/FORK_PROOFS.md) — findings proven on real HyperEVM bytecode + live-spike tx hashes
+- [`docs/ESCAPE_HATCH_SCOPE.md`](docs/ESCAPE_HATCH_SCOPE.md) — permissionless escape-brake design
 - [`scripts/python/README.md`](scripts/python/README.md) — Python helpers + live mainnet test harness
 
 ## License
