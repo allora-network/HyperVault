@@ -8,6 +8,8 @@ Evidence that the findings in [`REDEMPTION_ASSESSMENT.md`](REDEMPTION_ASSESSMENT
 
 **Run substrate of record:** public RPC `https://rpc.hyperliquid.xyz/evm`, chainId 999. First green run of the original finding suite was fork block **36760512** (2026-06-02, 25 passed / 2 skipped); re-confirmed 2026-06-03 against the `.env` RPC at fork block **36763664** (the Finding-G linkage read returns the same values at both blocks). After the v1.4 audit remediation (bottom section) the full fork suite is **44 passed, 0 failed, 2 skipped** (the 2 skips remain the intentional live-only stubs F and Q4). Per-finding remediation proofs, plus the renamed/flipped tests, are tabulated in the **v1.4 Audit Remediation** section at the end of this file.
 
+**M6/M7 battle-matrix additions (2026-06-18):** `test/fork/HyperVaultBattleMatrix.fork.t.sol` adds four `test_BM_*` tests closing the two coverage gaps the assessment flagged, on real bytecode — multi-LP concurrent requests (per-LP escrow independence + the one-open-request guard), overlapping deadlines with a true partial-fill remainder that stays re-prioritizable, the Finding-F fairness reserve generalized to two racing redeemers, and the **full permissionless escape state machine** (governance SLA + 4h grace → unprivileged `triggerEscape` → 4 legs 60s-spaced → `fulfillWithdraw` → `exitEscape`, asserting the latch + `EscapeModeActive()` deposit-gating). The journal invariant `idle == available + reserved` is asserted throughout. Full `forge test` is now **117 passed / 0 failed / 7 live-only skips**.
+
 ```bash
 # fork suite (skips cleanly with no RPC; set HYPEREVM_FORK_BLOCK to pin)
 HYPEREVM_RPC_MAINNET=https://rpc.hyperliquid.xyz/evm \
