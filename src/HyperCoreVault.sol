@@ -229,6 +229,7 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///         The first crank after arming runs immediately (`lastCrankTs == 0`).
     uint64 public constant escapeCrankInterval = 60;
 
+
     // -------------------------------------------------------------------------
     // Constructor
     // -------------------------------------------------------------------------
@@ -305,6 +306,10 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         maxDepositPerAddress = cfg.maxDepositPerAddress;
         _lastAccrualTs = uint64(block.timestamp);
         _cloidCounter = 1; // start at 1 — cloid 0 means "no cloid" in HL conventions
+        // M5 §1 (SOLU-3371): permissionless-trigger grace default = 8h. Set HERE (not
+        // in {Config}) so existing deploy configs need no change; within [4h, 30d].
+        // Held inside the escape struct (see {IHyperCoreVault.EscapeState.graceSeconds}).
+        _escape.graceSeconds = 8 hours; // 28_800s
 
         _grantRole(DEFAULT_ADMIN_ROLE, cfg.admin);
         _grantRole(OPERATOR_ROLE, cfg.operator);
@@ -1001,22 +1006,45 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         return _escape.active;
     }
 
+    /// @notice Permissionless-trigger grace window in seconds (M5 §1, SOLU-3371) — how
+    ///         long a request must stay overdue BEYOND its SLA deadline before
+    ///         {triggerEscape} can arm the brake. Held inside {_escape} (so the library
+    ///         reads/writes it by the same storage reference); manual getter rather than
+    ///         a public auto-getter to keep the vault inside the EIP-170 budget.
+    function escapeGraceSeconds() external view returns (uint64) {
+        return _escape.graceSeconds;
+    }
+
     /// @notice Arm the escape brake — the vault enters ESCAPE mode (M5 §1/§4).
-    /// @dev    INTERIM ENTRY (this issue, SOLU-3369): admin-gated. The PERMISSIONLESS
-    ///         staleness trigger — a request overdue by `escapeGraceSeconds` beyond
-    ///         its SLA deadline AND with a remaining claim exceeding
-    ///         {availableIdleUsdc} (§1) — is implemented in SOLU-3371, which replaces
-    ///         this admin guard with that condition. The admin gate here is STRICTLY
-    ///         MORE RESTRICTIVE than the final permissionless trigger, so wiring 3371
-    ///         only WIDENS access (no security regression in the interim); meanwhile
-    ///         the latch, the mode gates, and the cranks are fully exercisable. `lp`
-    ///         is the request that armed the brake (recorded in {EscapeActivated}) —
-    ///         informational in this issue, the trigger subject in 3371. Latch-set is
-    ///         idempotent and lives in {VaultEscapeLib.activate} (the same primitive
-    ///         3371's permissionless trigger will call). The {EscapeTriggerNotWired}
-    ///         error documents the deferred permissionless path.
-    function triggerEscape(address lp) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
-        VaultEscapeLib.activate(_escape, lp);
+    /// @dev    PERMISSIONLESS (SOLU-3371): the `onlyRole(DEFAULT_ADMIN_ROLE)` guard
+    ///         that gated the interim SOLU-3369 entry is REMOVED — the security is in
+    ///         the CONDITION, not the caller (§1 anti-grief: restricting to "an LP with
+    ///         an overdue request" adds nothing, since anyone can deposit dust and
+    ///         wait). Arms iff `lp`'s request is OVERDUE-UNFILLABLE by the grace-stacked
+    ///         gate: (a) overdue by AT LEAST {escapeGraceSeconds} BEYOND its SLA
+    ///         deadline (so escape composes with — never preempts — the normal H2
+    ///         priority flow; the grace STACKS on top of the SLA deadline) AND (b) its
+    ///         remaining claim exceeds {availableIdleUsdc} (an honored/honorable request
+    ///         can never arm the brake). This is the EXACT SYMMETRIC condition that
+    ///         {exitEscape} uses to HOLD the brake. Unmet (including a request with no
+    ///         SLA deadline — see below) reverts {EscapeConditionNotMet}.
+    ///
+    ///         EDGE CASE (§8 Q1) — DEADLINE == 0: if {requestFulfillmentWindow} is unset
+    ///         the request carries `fulfillmentDeadline == 0` and can NEVER be overdue,
+    ///         so it can never arm the brake. A vault with no SLA window therefore has
+    ///         NO permissionless brake — the admin MUST set a window for the brake to be
+    ///         armable. We deliberately do NOT add a request-age-only path (the
+    ///         simplest correct behavior is deadline==0 ⇒ not armable ⇒ revert; a
+    ///         window-less age path would be a second, untested arming surface).
+    ///
+    ///         Keeps `nonReentrant` (the previewRedeem self-call inside the library
+    ///         re-enters the vault for a view). The condition evaluation lives in
+    ///         {VaultEscapeLib.triggerIfStale} (delegatecall: reads this vault's
+    ///         `_pendingWithdrawal` by storage reference + `previewRedeem` via
+    ///         self-call, exactly like {exitEscape}) to keep the vault inside its
+    ///         24576-byte EIP-170 budget. `lp` is recorded in {EscapeActivated}.
+    function triggerEscape(address lp) external nonReentrant {
+        VaultEscapeLib.triggerIfStale(_escape, lp, _pendingWithdrawal, _availableIdle());
     }
 
     /// @notice Permissionlessly clear the escape brake (M5 §1) — lifts ESCAPE mode.
@@ -1166,6 +1194,22 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     function setRequestFulfillmentWindow(uint64 window) external onlyRole(DEFAULT_ADMIN_ROLE) {
         requestFulfillmentWindow = window;
         emit RequestFulfillmentWindowUpdated(window);
+    }
+
+    /// @notice M5 §1 (SOLU-3371): set the permissionless-trigger grace window — how
+    ///         long a request must stay overdue BEYOND its SLA deadline before
+    ///         {triggerEscape} can arm the brake. REVERTS {EscapeGraceOutOfRange}
+    ///         outside the compile-time hard bounds [ESCAPE_GRACE_MIN, ESCAPE_GRACE_MAX]
+    ///         = [4h, 30d]: we REVERT rather than silently clamp so governance cannot
+    ///         quietly set a bad value (fail-closed, matching the repo's posture), and
+    ///         the bounds being constants means the timelock can neither disable the
+    ///         brake (grace too long) nor make it hair-trigger (grace ~0). Emits
+    ///         {EscapeGraceSecondsUpdated}.
+    /// @dev    The bounds-check + store + emit live in {VaultEscapeLib.setGrace}
+    ///         (delegatecall: writes `escapeGraceSeconds` by storage reference) to keep
+    ///         the vault inside its 24576-byte EIP-170 budget; the access gate stays here.
+    function setEscapeGraceSeconds(uint64 newGrace) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        VaultEscapeLib.setGrace(_escape, newGrace);
     }
 
     /// @notice Audit H-3 + M6: set per-spot-asset slippage band in bps together with
