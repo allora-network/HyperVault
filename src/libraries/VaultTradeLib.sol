@@ -211,4 +211,26 @@ library VaultTradeLib {
         emit LimitOrderSubmitted(a, isBuy, limitPx, sz, true, Constants.TIF_IOC, cloid, nav);
         return true;
     }
+
+    /// @notice Audit M6: the factor the admin should START from when calibrating
+    ///         {HyperCoreVault.setSpotSlippageBand} — derived by mirroring the perp
+    ///         band, i.e. 10^(2 + baseTokenSzDecimals) where the base token is
+    ///         `spotInfo(idx).tokens[0]`. This ASSUMES spotPx follows the perp
+    ///         `human * 10^(6 - szDecimals)` family; because that is not guaranteed
+    ///         for every spot market, this is guidance only — the admin MUST confirm
+    ///         it against a live test order before calling {setSpotSlippageBand}.
+    /// @dev    EIP-170 (M4 / SOLU-3366): hoisted out of the vault into this library
+    ///         (the established VaultTradeLib split). In the vault the `10 ** x` here
+    ///         dragged in the full runtime-exponentiation routine (~1.2 KB) that the
+    ///         vault otherwise never needs; this library already uses `10 ** x` for
+    ///         its price scaling, so the routine is SHARED here at ~no incremental
+    ///         cost, freeing the headroom the soft redemption barriers need. Same
+    ///         signature, pure-read (no storage), so the vault wrapper is behaviour-
+    ///         identical under delegatecall (`address(this)` == the vault).
+    function suggestedSpotPxScaleFactor(uint32 asset_) external view returns (uint64) {
+        uint32 idx = AssetId.indexOf(asset_);
+        uint64 baseToken = PrecompileLib.spotInfo(idx).tokens[0];
+        uint256 szDec = uint256(PrecompileLib.tokenInfo(uint32(baseToken)).szDecimals);
+        return uint64(10 ** (szDec + 2));
+    }
 }
