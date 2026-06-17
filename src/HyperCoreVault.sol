@@ -20,6 +20,14 @@ import {Constants} from "./libraries/Constants.sol";
 // Audit G2 (EIP-170): trade-gate + emergency-close logic lives in an external
 // delegatecall library so the vault's runtime bytecode fits the 24576-byte limit.
 import {VaultTradeLib} from "./libraries/VaultTradeLib.sol";
+// M5 (EIP-170): the permissionless escape-hatch crank bodies live in an external
+// delegatecall library for the same reason — see {VaultEscapeLib}.
+import {VaultEscapeLib} from "./libraries/VaultEscapeLib.sol";
+// Audit G2 (EIP-170): the EMERGENCY_ROLE cancel + repatriate bodies live in an
+// external delegatecall library for the same reason — see {VaultEmergencyLib}.
+// (M5's latch pushed the vault back over 24576; externalizing the emergency
+// surface — the established VaultTradeLib pattern — reclaims the headroom.)
+import {VaultEmergencyLib} from "./libraries/VaultEmergencyLib.sol";
 
 /// @title  HyperCoreVault — EIP-4626 vault that trades on HyperCore via CoreWriter
 /// @notice One vault per strategy. Operator runs trades; depositors hold tokenized shares.
@@ -35,7 +43,7 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     // Roles
     // -------------------------------------------------------------------------
 
-    bytes32 public constant OPERATOR_ROLE  = keccak256("OPERATOR_ROLE");
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
     bytes32 public constant EMERGENCY_ROLE = keccak256("EMERGENCY_ROLE");
 
     // -------------------------------------------------------------------------
@@ -43,13 +51,13 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     // -------------------------------------------------------------------------
 
     struct Config {
-        IERC20 asset;            // USDC ERC20 on HyperEVM
-        uint64 coreUsdcIndex;    // Core spot token index for USDC (canonical mainnet = 0)
-        uint8 coreUsdcDecimals;  // Core wei decimals for that token (validated vs live tokenInfo at deploy)
+        IERC20 asset; // USDC ERC20 on HyperEVM
+        uint64 coreUsdcIndex; // Core spot token index for USDC (canonical mainnet = 0)
+        uint8 coreUsdcDecimals; // Core wei decimals for that token (validated vs live tokenInfo at deploy)
         address coreDepositWallet; // Circle CoreDepositWallet for EVM->Core deposits (audit G2); 0 = legacy HIP-1 route
         string name;
         string symbol;
-        address admin;           // DEFAULT_ADMIN_ROLE — should be a TimelockController
+        address admin; // DEFAULT_ADMIN_ROLE — should be a TimelockController
         address operator;
         address emergencyAdmin;
         address feeRecipient;
@@ -111,24 +119,20 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     // Runtime state
     // -------------------------------------------------------------------------
 
-    uint128 private _cloidCounter;          // monotonically increasing client order id
-    uint64  private _lastAccrualTs;          // last management-fee accrual timestamp
-    bool    public emergencyShutdownActive;  // one-way switch
+    uint128 private _cloidCounter; // monotonically increasing client order id
+    uint64 private _lastAccrualTs; // last management-fee accrual timestamp
+    bool public emergencyShutdownActive; // one-way switch
 
     /// @notice Per-LP cost basis per share, 1e18-fixed (price-per-share at entry).
     /// @dev    Updated on mint and on transfer between non-vault parties. Used
     ///         for crystallize-on-redeem perf fee.
     mapping(address => uint256) private _costBasisPerShare;
 
-    struct WithdrawalRequest {
-        uint256 shares;             // shares escrowed at the vault
-        uint256 costBasisAtRequest; // 1e18-fixed snapshot of LP's cb at request time
-        uint64 fulfillmentDeadline; // 0 = no SLA; else unix ts after which the request is overdue (H2)
-        uint256 reservedAssets;     // idle assets reserved for this overdue request (H2 priority over redeem)
-    }
-
     /// @notice One pending withdrawal request per LP. Issue a new one only after
-    ///         cancelling the existing one.
+    ///         cancelling the existing one. The {IHyperCoreVault.WithdrawalRequest}
+    ///         struct is declared on the interface (inherited here) so {VaultEscapeLib}
+    ///         can read this mapping by storage reference across the M5 delegatecall
+    ///         boundary (single source of truth — see the interface NatSpec).
     mapping(address => WithdrawalRequest) private _pendingWithdrawal;
 
     /// @notice On-chain fulfillment SLA window for withdrawal requests (audit H2 /
@@ -191,28 +195,58 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     uint16 public emergencyCloseBandBps;
 
     // -------------------------------------------------------------------------
+    // Escape-hatch state (M5 — permissionless "dead man's brake", Phase 1)
+    //
+    // docs/ESCAPE_HATCH_SCOPE.md §1/§4. Mirrors the {emergencyShutdownActive}
+    // pattern: a latch the gates read. Unlike emergency shutdown the latch is NOT
+    // one-way — it clears via {exitEscape} once the overdue backlog that armed it
+    // is gone (§1: "until no overdue-unfillable request remains").
+    // -------------------------------------------------------------------------
+
+    /// @notice Escape-hatch latch + cooldown (M5 §1/§4). `_escape.active` is the
+    ///         ESCAPE-mode latch: while true, deposits/mints and market-deploying
+    ///         movers (`placeLimitOrder`, `pushToCore`, `usdSpotToPerp`) are blocked
+    ///         and the three permissionless risk-reducing cranks ({escapeCancelOrders},
+    ///         {escapeFlattenPerps}, {escapeConsolidateToSpot}) become callable;
+    ///         redemption, the `pullFromCore`-family, `usdPerpToSpot`, and the
+    ///         emergency surface are UNAFFECTED. `_escape.lastCrankTs` backs the
+    ///         per-interval cooldown. The struct is threaded into {VaultEscapeLib} by
+    ///         storage reference so the latch/cooldown bookkeeping lives in the
+    ///         library (vault EIP-170 budget). Read {escapeActive} for the bool.
+    /// @dev    Pause-immune by design (the brake cannot be vetoed by the
+    ///         operator/emergency/admin keys — only clearing the overdue backlog via
+    ///         {exitEscape} lifts it). NOT one-way (unlike {emergencyShutdownActive}).
+    IHyperCoreVault.EscapeState private _escape;
+
+    /// @notice Minimum seconds between escape cranks (M5 §4) — bounds HyperCore
+    ///         action-rate exposure and forced-unwind griefing while the brake is
+    ///         armed. A COMPILE-TIME CONSTANT (not admin-tunable): the cranks are
+    ///         permissionless and pause-immune, so the cooldown is part of the brake's
+    ///         fixed safety envelope — a mutable interval would hand a compromised
+    ///         timelock a lever to throttle (or, at 0, un-throttle) a permissionless
+    ///         safety mechanism. 60s is comfortably under any plausible HyperCore
+    ///         action-rate limit (§5, live-verify) while keeping the unwind prompt.
+    ///         The first crank after arming runs immediately (`lastCrankTs == 0`).
+    uint64 public constant escapeCrankInterval = 60;
+
+    // -------------------------------------------------------------------------
     // Constructor
     // -------------------------------------------------------------------------
 
-    constructor(Config memory cfg)
-        ERC4626(cfg.asset)
-        ERC20(cfg.name, cfg.symbol)
-    {
+    constructor(Config memory cfg) ERC4626(cfg.asset) ERC20(cfg.name, cfg.symbol) {
         if (
-            cfg.admin == address(0) ||
-            cfg.operator == address(0) ||
-            cfg.emergencyAdmin == address(0) ||
-            cfg.feeRecipient == address(0)
+            cfg.admin == address(0) || cfg.operator == address(0) || cfg.emergencyAdmin == address(0)
+                || cfg.feeRecipient == address(0)
         ) revert ZeroAddress();
         if (cfg.mgmtFeeAnnualBps > 2_000 || cfg.perfFeeBps > 5_000) {
             // hard caps: 20% mgmt/yr and 50% perf — sanity, not a marketing limit
             revert InvalidFeeConfig(cfg.mgmtFeeAnnualBps, cfg.perfFeeBps);
         }
 
-        feeRecipient         = cfg.feeRecipient;
-        coreUsdcIndex        = cfg.coreUsdcIndex;
-        coreUsdcDecimals     = cfg.coreUsdcDecimals;
-        coreDepositWallet    = cfg.coreDepositWallet;
+        feeRecipient = cfg.feeRecipient;
+        coreUsdcIndex = cfg.coreUsdcIndex;
+        coreUsdcDecimals = cfg.coreUsdcDecimals;
+        coreDepositWallet = cfg.coreDepositWallet;
         // Audit C1/M5/G2: validate the Core-USDC linkage at deploy.
         //
         // WALLET MODE (cfg.coreDepositWallet != 0 — the official route for
@@ -263,18 +297,18 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
                 }
             }
         }
-        leverageCapBps       = cfg.leverageCapBps;
-        slippageBandBps      = cfg.slippageBandBps;
-        mgmtFeeAnnualBps     = cfg.mgmtFeeAnnualBps;
-        perfFeeBps           = cfg.perfFeeBps;
-        depositCap           = cfg.depositCap;
+        leverageCapBps = cfg.leverageCapBps;
+        slippageBandBps = cfg.slippageBandBps;
+        mgmtFeeAnnualBps = cfg.mgmtFeeAnnualBps;
+        perfFeeBps = cfg.perfFeeBps;
+        depositCap = cfg.depositCap;
         maxDepositPerAddress = cfg.maxDepositPerAddress;
-        _lastAccrualTs       = uint64(block.timestamp);
-        _cloidCounter        = 1; // start at 1 — cloid 0 means "no cloid" in HL conventions
+        _lastAccrualTs = uint64(block.timestamp);
+        _cloidCounter = 1; // start at 1 — cloid 0 means "no cloid" in HL conventions
 
         _grantRole(DEFAULT_ADMIN_ROLE, cfg.admin);
-        _grantRole(OPERATOR_ROLE,      cfg.operator);
-        _grantRole(EMERGENCY_ROLE,     cfg.emergencyAdmin);
+        _grantRole(OPERATOR_ROLE, cfg.operator);
+        _grantRole(EMERGENCY_ROLE, cfg.emergencyAdmin);
     }
 
     // -------------------------------------------------------------------------
@@ -295,7 +329,10 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     }
 
     function maxDeposit(address receiver) public view override(ERC4626, IERC4626) returns (uint256) {
-        if (paused() || emergencyShutdownActive) return 0;
+        // M5 §4: ESCAPE mode blocks deposits — entering a forced unwind is wrong-way
+        // risk for a depositor (idle inflow would help exits, but simplicity +
+        // wrong-way-risk argue for blocking; ESCAPE_HATCH_SCOPE §8 Q3).
+        if (paused() || emergencyShutdownActive || _escape.active) return 0;
         uint256 capRemaining = depositCap > totalAssets() ? depositCap - totalAssets() : 0;
         uint256 perAddrRemaining;
         if (maxDepositPerAddress == 0) {
@@ -340,6 +377,7 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         returns (uint256 shares)
     {
         if (emergencyShutdownActive) revert EmergencyShutdownActive();
+        if (_escape.active) revert EscapeModeActive(); // M5 §4
         // Audit M2: a deposit into an LP with an open withdrawal request would
         // weighted-average the new basis against shares escrowed at the vault. The
         // bug_010 fix makes that correct for the CANCEL path, but on the FULFILL
@@ -366,6 +404,7 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         returns (uint256 assets)
     {
         if (emergencyShutdownActive) revert EmergencyShutdownActive();
+        if (_escape.active) revert EscapeModeActive(); // M5 §4
         // Audit M2: see {deposit} — block mints into an LP with an open request.
         if (_pendingWithdrawal[receiver].shares != 0) revert PendingRequestBlocksDeposit(receiver);
         _accrueMgmtFee();
@@ -538,7 +577,8 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         if (balBefore == 0) {
             _costBasisPerShare[acct] = cbForAdded;
         } else {
-            _costBasisPerShare[acct] = (balBefore * _costBasisPerShare[acct] + addedShares * cbForAdded) / (balBefore + addedShares);
+            _costBasisPerShare[acct] =
+                (balBefore * _costBasisPerShare[acct] + addedShares * cbForAdded) / (balBefore + addedShares);
         }
     }
 
@@ -666,14 +706,17 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     // Operator surface
     // -------------------------------------------------------------------------
 
-    function placeLimitOrder(
-        uint32 asset_,
-        bool isBuy,
-        uint64 limitPx,
-        uint64 sz,
-        bool reduceOnly,
-        uint8 tif
-    ) external onlyRole(OPERATOR_ROLE) whenNotPaused nonReentrant returns (uint128 cloid) {
+    function placeLimitOrder(uint32 asset_, bool isBuy, uint64 limitPx, uint64 sz, bool reduceOnly, uint8 tif)
+        external
+        onlyRole(OPERATOR_ROLE)
+        whenNotPaused
+        nonReentrant
+        returns (uint128 cloid)
+    {
+        // M5 §4: ESCAPE mode blocks the operator's order surface — the only orders
+        // permitted while latched are the reduce-only flatten crank ({escapeFlattenPerps},
+        // a distinct permissionless surface), which can never add exposure.
+        if (_escape.active) revert EscapeModeActive();
         _accrueMgmtFee();
 
         // Assign the cloid, then delegate the whole trade gate (whitelist,
@@ -721,21 +764,16 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///      defensive: today's wallet consumes the exact allowance, but it is an
     ///      upgradeable third-party proxy — never leave an allowance standing.
     function pushToCore(uint64 amount) external onlyRole(OPERATOR_ROLE) whenNotPaused nonReentrant {
-        // Audit H2: cannot deploy idle that is reserved for an overdue prioritized
-        // request (Finding F) — the reserve is LP-claimable idle, not operator capital.
-        uint256 avail = _availableIdle();
-        if (amount > avail) revert WithdrawExceedsIdleBalance(amount, avail);
-        address wallet = coreDepositWallet;
-        if (wallet == address(0)) {
-            // Legacy HIP-1 route (direct-linked assets only): ERC20 transfer to the
-            // token system address — Core credits 8dp wei after evmExtraWeiDecimals.
-            IERC20(asset()).safeTransfer(SystemAddress.usdc(), amount);
-        } else {
-            IERC20(asset()).forceApprove(wallet, amount);
-            ICoreDepositWallet(wallet).deposit(amount, Constants.CORE_SPOT_DEX_ID);
-            IERC20(asset()).forceApprove(wallet, 0);
-        }
-        emit BridgeDeposit(amount);
+        // M5 §4: ESCAPE mode blocks pushing idle to Core — the brake is unwinding
+        // Core toward idle, so deploying idle outward is exactly wrong-way.
+        if (_escape.active) revert EscapeModeActive();
+        // Audit G2 (EIP-170): the audit-H2 reserved-idle guard + the wallet-vs-legacy
+        // route body live in {VaultEmergencyLib.pushToCoreRoute} (delegatecall). The
+        // vault passes `_availableIdle()` by value (so the H2 floor is enforced
+        // without exposing the private `_reservedIdle`); the
+        // {WithdrawExceedsIdleBalance} revert + the {BridgeDeposit} log are
+        // byte-identical across the boundary. `coreDepositWallet` is the immutable.
+        VaultEmergencyLib.pushToCoreRoute(coreDepositWallet, amount, _availableIdle());
     }
 
     /// @dev Audit H2: NOT `whenNotPaused`. This only moves funds Core->EVM idle
@@ -749,22 +787,22 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///      transfers the ERC20 back. Note the wallet payout is `whenNotPaused`
     ///      on Circle's side — a paused wallet stalls the refill until unpaused
     ///      (contingency: {operatorRecoverSpot} / {emergencyRepatriate}).
+    /// @dev Audit G2 (EIP-170): the `send_asset` (action 13) body lives in
+    ///      {VaultEmergencyLib.pullFromCore} (delegatecall) to reclaim the vault's
+    ///      24576-byte budget after M5's escape latch. The `OPERATOR_ROLE` gate +
+    ///      `nonReentrant` stay here (deliberately NOT `whenNotPaused` — H2). The
+    ///      {BridgeWithdraw} log is byte-identical; `coreUsdcIndex` is threaded in by
+    ///      value (an immutable, unreachable from a delegatecall library).
+    ///
+    ///      Background (the live-verified action): unified HyperCore accounts
+    ///      SILENTLY DROP the legacy spot_send (action 6) — withdrawals must use
+    ///      send_asset (action 13). The send (spot -> spot) targets the token system
+    ///      address; HyperCore debits this vault's Core spot and the linked
+    ///      CoreDepositWallet pays native USDC to the caller (this vault) at
+    ///      amountWei/100 (8dp Core -> 6dp EVM); a legacy direct-linked asset's
+    ///      system minter credits the caller instead — same action either way.
     function pullFromCore(uint64 amountWei) external onlyRole(OPERATOR_ROLE) nonReentrant {
-        // Audit G2 (proven live 2026-06-15): unified HyperCore accounts SILENTLY
-        // DROP the legacy spot_send (action 6) — withdrawals must use send_asset
-        // (action 13). Send Core USDC (spot -> spot) to the token system address;
-        // HyperCore debits this vault's Core spot and the linked CoreDepositWallet
-        // pays native USDC to the CALLER (this vault) on the EVM side at
-        // amountWei/100 (8dp Core -> 6dp EVM). For a legacy direct-linked asset
-        // the system minter credits the caller instead — same action either way.
-        CoreWriterLib.sendAsset(
-            SystemAddress.forToken(coreUsdcIndex),
-            Constants.CORE_SPOT_DEX_ID,
-            Constants.CORE_SPOT_DEX_ID,
-            coreUsdcIndex,
-            amountWei
-        );
-        emit BridgeWithdraw(amountWei);
+        VaultEmergencyLib.pullFromCore(coreUsdcIndex, amountWei);
     }
 
     /// @notice Send a Core spot token from the vault's Core account to an
@@ -787,16 +825,19 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     /// @dev Audit H2: NOT `whenNotPaused` — it only moves Core spot to an
     ///      allowlisted (C-2) treasury for the Path-B refill, never deploys new
     ///      market risk; freezing it on pause would strand LPs (Finding A).
+    /// @dev Audit G2 (EIP-170): the C-2-gated send_asset body lives in
+    ///      {VaultEmergencyLib.operatorRecoverSpot} (delegatecall) to reclaim the
+    ///      vault's 24576-byte budget after M5's escape latch. The `OPERATOR_ROLE`
+    ///      gate + `nonReentrant` stay here; the `spotRecoverDest` allowlist is
+    ///      threaded in by storage reference, and the C-2 check, the action-13
+    ///      route, the {OperatorSpotRecovered} log, and the {ZeroAddress} /
+    ///      {SpotRecoverDestinationNotAllowed} reverts are byte-identical.
     function operatorRecoverSpot(address to, uint64 token, uint64 amountWei)
         external
         onlyRole(OPERATOR_ROLE)
         nonReentrant
     {
-        if (to == address(0)) revert ZeroAddress();
-        if (!spotRecoverDest[to]) revert SpotRecoverDestinationNotAllowed(to);
-        // Audit G2: send_asset (action 13), not the dropped spot_send — see {pullFromCore}.
-        CoreWriterLib.sendAsset(to, Constants.CORE_SPOT_DEX_ID, Constants.CORE_SPOT_DEX_ID, token, amountWei);
-        emit OperatorSpotRecovered(to, token, amountWei);
+        VaultEmergencyLib.operatorRecoverSpot(spotRecoverDest, to, token, amountWei);
     }
 
     /// @notice Sweep EVM-side `asset()` balance when there are no LPs.
@@ -805,17 +846,19 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///         someone bridges/transfers asset before the first real deposit.
     ///         Once `totalSupply == 0`, no LP has any claim on the asset
     ///         balance — it's safe to sweep. Reverts if shares exist.
+    /// @dev Audit G2 (EIP-170): body in {VaultEmergencyLib.operatorSweepStranded}
+    ///      (delegatecall); the `totalSupply == 0` precondition, the {StrandedSwept}
+    ///      log, and the {ZeroAddress} / {StrandedSweepRequiresZeroSupply} reverts
+    ///      are unchanged across the boundary.
     function operatorSweepStranded(address to) external onlyRole(OPERATOR_ROLE) nonReentrant {
-        if (to == address(0)) revert ZeroAddress();
-        if (totalSupply() != 0) revert StrandedSweepRequiresZeroSupply();
-        uint256 bal = IERC20(asset()).balanceOf(address(this));
-        if (bal > 0) {
-            IERC20(asset()).safeTransfer(to, bal);
-            emit StrandedSwept(to, bal);
-        }
+        VaultEmergencyLib.operatorSweepStranded(to);
     }
 
     function usdSpotToPerp(uint64 ntl) external onlyRole(OPERATOR_ROLE) whenNotPaused nonReentrant {
+        // M5 §4: ESCAPE mode blocks spot->perp — it ADDS market exposure, the
+        // opposite of an unwind. (perp->spot, {usdPerpToSpot}, stays open — it's
+        // risk-reducing and is leg 3's own primitive.)
+        if (_escape.active) revert EscapeModeActive();
         CoreWriterLib.usdClassTransfer(ntl, true);
         emit UsdClassTransferSubmitted(ntl, true);
     }
@@ -840,25 +883,24 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         _unpause();
     }
 
+    /// @dev Audit G2 (EIP-170): the nested cancel loop body lives in
+    ///      {VaultEmergencyLib.emergencyCancelByCloid} (an external delegatecall
+    ///      library, like {VaultTradeLib}) so it stays out of the vault's
+    ///      24576-byte budget after M5's escape latch. The role gate +
+    ///      `nonReentrant` stay here, and the emitted {OrderCancelByCloidSubmitted}
+    ///      logs + the `"len"` revert are byte-identical across the boundary.
     function emergencyCancelByCloid(uint32[] calldata assets, uint128[][] calldata cloids)
         external
         onlyRole(EMERGENCY_ROLE)
         nonReentrant
     {
-        require(assets.length == cloids.length, "len");
-        for (uint256 i; i < assets.length; ++i) {
-            uint32 a = assets[i];
-            uint128[] calldata cs = cloids[i];
-            for (uint256 j; j < cs.length; ++j) {
-                CoreWriterLib.cancelOrderByCloid(a, cs[j]);
-                emit OrderCancelByCloidSubmitted(a, cs[j]);
-            }
-        }
+        VaultEmergencyLib.emergencyCancelByCloid(assets, cloids);
     }
 
+    /// @dev Audit G2 (EIP-170): body in {VaultEmergencyLib.emergencyCancelByOid}
+    ///      (delegatecall); the {OrderCancelByOidSubmitted} log is unchanged.
     function emergencyCancelByOid(uint32 asset_, uint64 oid) external onlyRole(EMERGENCY_ROLE) nonReentrant {
-        CoreWriterLib.cancelOrderByOid(asset_, oid);
-        emit OrderCancelByOidSubmitted(asset_, oid);
+        VaultEmergencyLib.emergencyCancelByOid(asset_, oid);
     }
 
     /// @notice Close open perp positions via opposite-side IOC orders at the
@@ -920,26 +962,121 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///                        `spotSendWei == 0`.
     /// @param  perpToSpotNtl  6dp USD to move perp→spot first (0 = skip).
     /// @param  spotSendWei    Core-wei USDC to spot-send to `to` (0 = skip).
+    /// @dev Audit G2 (EIP-170): the perp->spot + C-2-gated send_asset body lives in
+    ///      {VaultEmergencyLib.emergencyRepatriate} (an external delegatecall
+    ///      library, like {VaultTradeLib}) so it stays out of the vault's
+    ///      24576-byte budget after M5's escape latch. The role gate +
+    ///      `nonReentrant` stay here. The `spotRecoverDest` allowlist is threaded
+    ///      in by storage reference and `coreUsdcIndex` (an immutable, unreachable
+    ///      from a delegatecall library) by value; the C-2 check, the action-13
+    ///      route, the {UsdClassTransferSubmitted}/{OperatorSpotRecovered}/
+    ///      {EmergencyRepatriated} logs, and the {SpotRecoverDestinationNotAllowed}
+    ///      revert are all byte-identical across the boundary.
     function emergencyRepatriate(address to, uint64 perpToSpotNtl, uint64 spotSendWei)
         external
         onlyRole(EMERGENCY_ROLE)
         nonReentrant
     {
-        if (perpToSpotNtl > 0) {
-            CoreWriterLib.usdClassTransfer(perpToSpotNtl, false); // perp -> spot
-            emit UsdClassTransferSubmitted(perpToSpotNtl, false);
-        }
-        if (spotSendWei > 0) {
-            if (to != SystemAddress.usdc() && !spotRecoverDest[to]) {
-                revert SpotRecoverDestinationNotAllowed(to);
-            }
-            // Audit G2: send_asset (action 13), not the dropped spot_send. `to` =
-            // the USDC system address repatriates to this vault's EVM idle (the
-            // wallet pays the caller); an allowlisted treasury is a peer Core move.
-            CoreWriterLib.sendAsset(to, Constants.CORE_SPOT_DEX_ID, Constants.CORE_SPOT_DEX_ID, coreUsdcIndex, spotSendWei);
-            emit OperatorSpotRecovered(to, coreUsdcIndex, spotSendWei);
-        }
-        emit EmergencyRepatriated(to, perpToSpotNtl, spotSendWei);
+        VaultEmergencyLib.emergencyRepatriate(spotRecoverDest, coreUsdcIndex, to, perpToSpotNtl, spotSendWei);
+    }
+
+    // -------------------------------------------------------------------------
+    // Escape hatch — permissionless "dead man's brake", Phase 1 (M5)
+    //
+    // docs/ESCAPE_HATCH_SCOPE.md §2/§4/§7. The latch + ESCAPE-mode gates + the
+    // three risk-reducing cranks (cancel / flatten / consolidate). The crank
+    // BODIES live in {VaultEscapeLib} (an external delegatecall library, like
+    // {VaultTradeLib}) so the loop machinery stays out of the vault's EIP-170
+    // budget; the wrappers below thread storage + persist the returned cloid.
+    //
+    // The cranks are PERMISSIONLESS (no role gate) and PAUSE-IMMUNE (no
+    // `whenNotPaused`, mirroring the H2 refill movers) — the security is the
+    // `escapeActive` latch + the reduce-only/risk-reducing nature of each leg, not
+    // the caller (§1 anti-grief: anyone can deposit dust and wait). They carry
+    // `nonReentrant` + a per-interval cooldown (§4).
+    // -------------------------------------------------------------------------
+
+    /// @notice True while the escape brake is armed and the vault is in ESCAPE mode (M5).
+    function escapeActive() external view returns (bool) {
+        return _escape.active;
+    }
+
+    /// @notice Arm the escape brake — the vault enters ESCAPE mode (M5 §1/§4).
+    /// @dev    INTERIM ENTRY (this issue, SOLU-3369): admin-gated. The PERMISSIONLESS
+    ///         staleness trigger — a request overdue by `escapeGraceSeconds` beyond
+    ///         its SLA deadline AND with a remaining claim exceeding
+    ///         {availableIdleUsdc} (§1) — is implemented in SOLU-3371, which replaces
+    ///         this admin guard with that condition. The admin gate here is STRICTLY
+    ///         MORE RESTRICTIVE than the final permissionless trigger, so wiring 3371
+    ///         only WIDENS access (no security regression in the interim); meanwhile
+    ///         the latch, the mode gates, and the cranks are fully exercisable. `lp`
+    ///         is the request that armed the brake (recorded in {EscapeActivated}) —
+    ///         informational in this issue, the trigger subject in 3371. Latch-set is
+    ///         idempotent and lives in {VaultEscapeLib.activate} (the same primitive
+    ///         3371's permissionless trigger will call). The {EscapeTriggerNotWired}
+    ///         error documents the deferred permissionless path.
+    function triggerEscape(address lp) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
+        VaultEscapeLib.activate(_escape, lp);
+    }
+
+    /// @notice Permissionlessly clear the escape brake (M5 §1) — lifts ESCAPE mode.
+    /// @dev    Succeeds ONLY when NONE of the supplied `lps` still has an
+    ///         overdue-unfillable request (§1: "until no overdue-unfillable request
+    ///         remains"). "Overdue-unfillable" = an overdue request (lapsed deadline)
+    ///         whose remaining claim still exceeds {availableIdleUsdc} — the exact
+    ///         condition that arms the brake in SOLU-3371; a request that has become
+    ///         honorable (claim <= available idle) no longer holds the brake. The
+    ///         caller supplies the candidate set (the brake is armed by a specific
+    ///         stale request; keepers/LPs know which); any remaining offender reverts
+    ///         with {EscapeBacklogRemains}. Permissionless + pause-immune like the
+    ///         cranks. NB: this issue's interim admin {triggerEscape} can arm the
+    ///         brake with no overdue request at all — then `exitEscape(<empty/any>)`
+    ///         clears it immediately (no backlog to clear), which is correct. The
+    ///         backlog loop lives in {VaultEscapeLib.exit} (delegatecall: reads this
+    ///         vault's `_pendingWithdrawal` by storage reference + `previewRedeem` via
+    ///         self-call) — out of the vault's EIP-170 budget.
+    function exitEscape(address[] calldata lps) external nonReentrant {
+        VaultEscapeLib.exit(_escape, lps, _pendingWithdrawal, _availableIdle());
+    }
+
+    /// @notice Leg 1 (M5 §2) — permissionlessly cancel the vault's resting orders on
+    ///         `asset_` by cloid while latched. Strictly risk-reducing.
+    /// @dev    PERMISSIONLESS + nonReentrant + PAUSE-IMMUNE (no `whenNotPaused`,
+    ///         mirroring the H2 refill movers). The latch+cooldown gate, cloid
+    ///         validation (`cloid < _cloidCounter`), and the CoreWriter dispatch all
+    ///         live in {VaultEscapeLib.escapeCancelOrders} (vault EIP-170 budget). No
+    ///         fee accrual: a cancel changes no value.
+    function escapeCancelOrders(uint32 asset_, uint128[] calldata cloids) external nonReentrant {
+        VaultEscapeLib.escapeCancelOrders(_escape, asset_, cloids, _cloidCounter);
+    }
+
+    /// @notice Leg 2 (M5 §2) — permissionlessly flatten open perp positions via
+    ///         opposite-side reduce-only IOC orders while latched, with the M4 markPx
+    ///         band MANDATORY (the band value is read from {emergencyCloseBandBps}).
+    /// @dev    PERMISSIONLESS + nonReentrant + PAUSE-IMMUNE. The latch+cooldown gate,
+    ///         reduce-only IOC + bug_009 size scaling + M4 band loop live in
+    ///         {VaultEscapeLib.escapeFlattenPerps}, which FORCES the band on (there is
+    ///         no band-free escape variant — a force close stays EMERGENCY_ROLE, §5).
+    ///         Reduce-only means this can never add exposure. Persists the returned
+    ///         cloid, exactly as {emergencyClosePositions} does. Accrues the mgmt fee
+    ///         (a fill changes value).
+    function escapeFlattenPerps(uint32[] calldata perpAssets, uint64[] calldata limitPxs) external nonReentrant {
+        _accrueMgmtFee();
+        _cloidCounter =
+            VaultEscapeLib.escapeFlattenPerps(_escape, perpAssets, limitPxs, emergencyCloseBandBps, _cloidCounter);
+    }
+
+    /// @notice Leg 3 (M5 §2) — permissionlessly move all perp `withdrawable` equity
+    ///         to Core spot while latched. The amount is read ON-CHAIN from the
+    ///         conservative `withdrawable` figure (caller supplies nothing).
+    /// @dev    PERMISSIONLESS + nonReentrant + PAUSE-IMMUNE. The latch+cooldown gate
+    ///         and the lenient/strict `withdrawable` read (per {navBootstrap},
+    ///         matching {perpWithdrawable}) live in
+    ///         {VaultEscapeLib.escapeConsolidateToSpot}. Accrues the mgmt fee (moving
+    ///         equity converges the conservative NAV).
+    function escapeConsolidateToSpot() external nonReentrant {
+        _accrueMgmtFee();
+        VaultEscapeLib.escapeConsolidateToSpot(_escape, navBootstrap);
     }
 
     // -------------------------------------------------------------------------
@@ -1265,8 +1402,7 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         if (oldShares == 0) {
             _costBasisPerShare[lp] = entryPps;
         } else {
-            _costBasisPerShare[lp] =
-                (oldShares * _costBasisPerShare[lp] + newShares * entryPps) / totalShares;
+            _costBasisPerShare[lp] = (oldShares * _costBasisPerShare[lp] + newShares * entryPps) / totalShares;
         }
     }
 
