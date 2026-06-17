@@ -28,6 +28,31 @@ python scripts/python/e2e_runner.py --steps preflight,core_status    # read-only
 python scripts/python/e2e_runner.py --steps place,cancel --skip-bridge
 ```
 
+### `keeper` step — automated redemption fulfillment (Assessment TODO-4)
+`keeper.py`, driven via the `keeper` step. Watches `WithdrawalRequested`, sizes
+each LP's claim (`previewRedeem(pendingWithdrawalShares)`) against free idle
+(`idleUsdc() − reservedIdleUsdc()`), repatriates the shortfall from Core when
+material (`usdPerpToSpot` if perp equity exists, then `pullFromCore` with the
+mandatory **`× 0.998` fee guard** — never the exact full Core balance, which
+HyperCore silently drops), then calls `fulfillWithdraw(lp)`. It records fulfilled
+LPs + residuals (partial fills stay pending for the next pass) and monitors the
+CoreDepositWallet `paused()` state every pass — if paused, it WARNS, skips the
+dead pull route, and fulfills against idle only.
+
+**Dry-run is the default**: it reads live on-chain state and logs the actions it
+*would* take without sending any tx. The tx-sending mode is an explicit opt-in
+(`--keeper-execute`) and the funded run is a **human gate**.
+
+```bash
+# dry-run (default) — reads + logs intended actions, sends nothing:
+ARTIFACT=deployments/mainnet/<strategy>.json OPERATOR_PRIVATE_KEY=0x... ALICE_PRIVATE_KEY=0x... \
+python scripts/python/e2e_runner.py --steps keeper
+
+# tx-sending (funded, human-gated) — actually repatriates + fulfills:
+python scripts/python/e2e_runner.py --steps keeper --keeper-execute \
+  --keeper-poll 5 --keeper-max-iter 12 --keeper-timeout 600 --keeper-start-block <block>
+```
+
 ## `live_contract_path.py` — focused order-lifecycle live test
 Whitelist BTC → fund perp (`send_asset`) → place a `tif=1` / `10^8`-scale order
 through the vault → confirm it rests on the HL book → cancel → recover funds.

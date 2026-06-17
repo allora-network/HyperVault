@@ -80,6 +80,43 @@ Severity is relative to the goals "write a strategy, users deposit, users secure
 
 **Working-as-designed (verified, not flags):** C-3 no-dilution perf fee; the `bug_010` cost-basis escrow fix; `merged_bug_002` gross-`assets` withdraw; `bug_009` emergency-close scaling; C-1 self-share sweep block; C-2 allowlist; redeems being non-pausable at the *distribution* layer.
 
+#### Finding F — resolution note (TODO-6 fairness policy, 2026-06-16)
+
+**Decision (minimal-deviation, no re-architecture).** Two exit paths stay; the
+synchronous ERC-4626 surface keeps strict 4626 semantics on the liquid path. A direct
+`redeem`/`withdraw` is **first-come-first-served against currently-available idle and
+may be served ahead of a pending, non-overdue withdrawal request** — this is an
+intentional 4626-compatibility choice, not an oversight. We explicitly did **not**
+route all deployed-capital exits through one ordered mechanism, and did **not** add
+pro-rata socialisation of idle. The fairness backstop is the existing
+`prioritizeOverdue` reservation (Finding E / TODO-5): once a request passes its
+on-chain `fulfillmentDeadline` it is overdue, and a permissionless
+`prioritizeOverdue(lp)` reserves its idle claim, after which racing direct redeems can
+no longer drain that reserve. The residual — a *non-overdue* request has no
+reservation — is bounded operationally (tight SLA window + prompt keeper
+prioritization), not architecturally.
+
+**Key code finding — the reserve is enforced at EXECUTION, not only in the `max*`
+views, so no new guard was required.** `withdraw` and `redeem` are full overrides
+(they deliberately bypass OZ's `_withdraw`, per the comment at
+`HyperCoreVault.sol:380`), and each re-derives and enforces `_availableIdle()` in the
+state-changing body — there is no view-only enforcement layer a direct caller could
+bypass:
+
+- `withdraw`: `uint256 idle = _availableIdle(); if (assets > idle) revert WithdrawExceedsIdleBalance(assets, idle);` (`HyperCoreVault.sol:411-412`).
+- `redeem`: `uint256 idle = _availableIdle(); if (grossAssets > idle) { grossAssets = idle; ... }` — partial-fills bounded by available idle (`HyperCoreVault.sol:448-455`).
+- `pushToCore`: `uint256 avail = _availableIdle(); if (amount > avail) revert ...` — the operator cannot deploy reserved idle to Core (`HyperCoreVault.sol:726-727`).
+- `fulfillWithdraw`: a non-prioritized request draws only `_availableIdle()`, leaving other LPs' reserves intact (`HyperCoreVault.sol:1150`).
+- `_availableIdle() = idleUsdc() − _reservedIdle`, floored at 0 (`HyperCoreVault.sol:565-568`); `maxWithdraw`/`maxRedeem` report the same bound (`:319,332`).
+
+Because the execution path already enforces the reserve, **TODO-6 is a documentation
+resolution with no Solidity change.** The reservation mechanics are proven on real
+HyperEVM bytecode (`test/fork/HyperVaultLiveness.fork.t.sol::test_F_*`, incl. the
+assertion that a racing redeemer's `maxWithdraw` routes through `availableIdle` and the
+reserve is released on fulfill) and the race itself was proven live 2026-06-03 (see the
+Finding F row above and `FORK_PROOFS.md`). Integrator-facing statement:
+`docs/INTEGRATION.md` §"Redemption fairness policy (direct redeem vs the queue)".
+
 ---
 
 ## 5. Prioritized TODOs
@@ -104,8 +141,12 @@ Each is framed per the de-risk rule — the proof is a **forked-mainnet harness 
 > - **TODO-9:** ✅ done — queue paths covered (Q1–Q7 + M2/M3 fork tests).
 > - **TODO-10 (I / H3):** ✅ partial — README "24h timelock" reconciled (now enforced);
 >   production deposit caps still to be raised from the $100 test values before LP launch.
-> - **TODO-4 (D, keeper) / TODO-6 (F policy) / TODO-7 (barriers):** still open (P1 product work);
->   F fairness is now *mitigated* on-chain by TODO-5's reservation.
+> - **TODO-6 (F policy):** ✅ DECIDED + DOCUMENTED (2026-06-16) — minimal-deviation:
+>   sync-4626 direct redeem stays first-come-first-served (may jump a non-overdue
+>   request); the `prioritizeOverdue` reservation (TODO-5) is the fairness backstop for
+>   overdue requests, enforced at execution via `_availableIdle()`. Statement in
+>   `docs/INTEGRATION.md` §"Redemption fairness policy"; resolution note in §4 below.
+> - **TODO-4 (D, keeper) / TODO-7 (barriers):** still open (P1 product work).
 > - **Plus M1/M2/M4/M6/L1–L5** (fee realization, deposit guard, emergency band, spot-band
 >   scale, hardening) — all code-complete + fork-proven; not original redemption TODOs.
 
@@ -117,7 +158,7 @@ Each is framed per the de-risk rule — the proof is a **forked-mainnet harness 
 ### P1 — make the redemption system real (the chosen sync-4626 + hardened queue)
 - **TODO-4 (Finding D):** Build and test the keeper: watch `WithdrawalRequested`, repatriate when aggregate pending is material, call `fulfillWithdraw`. Add it as an `e2e_runner.py` step (request → operator repatriates → fulfill → assert LP paid) on the live harness.
 - **TODO-5 (Finding E):** Add an on-chain `fulfillmentDeadline` per request + a permissionless forced action after it lapses, so "operator stalls" is bounded on-chain, not by trust.
-- **TODO-6 (Finding F):** Decide redemption fairness policy — at minimum document that direct `redeem` can jump the queue; ideally route all deployed-capital exits through one ordered/pro-rata mechanism.
+- **TODO-6 (Finding F) — ✅ RESOLVED (2026-06-16): minimal-deviation policy, documented + enforced.** Decision: **keep two exit paths and synchronous 4626 semantics on the liquid path** — direct `redeem`/`withdraw` is first-come-first-served against currently-available idle and **may be served ahead of a pending (non-overdue) request**. We deliberately did **not** route all exits through one ordered mechanism, and did **not** socialise idle pro-rata. The fairness backstop is TODO-5's reservation: once a request passes its on-chain `fulfillmentDeadline` it is overdue, and the permissionless `prioritizeOverdue(lp)` reserves its idle claim, after which direct redeems can no longer drain that reserve (enforced at execution in `withdraw`/`redeem`/`pushToCore`/`fulfillWithdraw` via `_availableIdle()`, not just in the `max*` views — see the resolution note below). The residual (a non-overdue request has no reservation) is bounded operationally by a tight SLA window + prompt keeper prioritization. Full integrator-facing statement: `docs/INTEGRATION.md` §"Redemption fairness policy (direct redeem vs the queue)".
 - **TODO-7 (barriers):** Implement the chosen soft barriers (per-LP cooldown, global gate %, optional notice) as `require`s, and **document each as a deviation from strict 4626** in the integrator notes (§3).
 
 ### P2 — operational hardening
