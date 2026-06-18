@@ -21,7 +21,7 @@ House rules carried from `docs/REDEMPTION_LIVE_RUNBOOK.md`:
 
 | Decision | Where | Default / placeholder | Owner |
 |---|---|---|---|
-| operator / emergencyAdmin / feeRecipient EOAs (3 DISTINCT, key-controlled) | `deployments/configs/spike.json` | sentinels `0x…a001/a002/a003` | you |
+| operator / emergencyAdmin / feeRecipient | generated throwaway by `gen_battle_keys.py`; paste addrs into `spike.json` | from the keyfile | you (or supply your own) |
 | The ONE strategy market (`whitelistPerps`) | `spike.json` | `[0]` = BTC perp | you + strategy |
 | `leverageCapBps` / `slippageBandBps` | `spike.json` | `30000` (3x) / `200` | you + strategy |
 | Spike caps (`depositCap` / `maxDepositPerAddress`) | `spike.json` | 500 / 100 USDC | you (confirm) |
@@ -41,23 +41,42 @@ pending Chief Scientist sign-off (interim 8h, hard bounds [4h, 30d]).
 # .env (gitignored) must provide:
 HYPEREVM_RPC_MAINNET=...          # a private/archive RPC (the public one rate-limits getLogs)
 REGISTRY_MAINNET=0x...            # the existing per-chain vault registry
-DEPLOYER_PRIVATE_KEY=0x...        # funded; big-blocks opted-in; = timelock proposer/executor
-OPERATOR_PRIVATE_KEY=0x...        # the operator EOA (trades + keeper)
-EMERGENCY_PRIVATE_KEY=0x...       # the emergencyAdmin EOA (pause/shutdown/repatriate)
-# feeRecipient must also be key-controlled (to recover fee shares/USDC at wind-down).
 ALERT_WEBHOOK_URL=...             # optional Slack-compatible alert sink for monitor.py
+```
+
+All wallet keys live in the throwaway keyfile (`gen_battle_keys.py`, Step 0):
+funder / operator / emergency / feeRecipient / lp1..lp10 / trigger. The **funder**
+is the one wallet you fund; it doubles as the deployer + timelock proposer/executor.
+`battle_test.py` / `journal.py` read operator+emergency straight from the keyfile.
+For the forge deploy, `admin_timelock.py`, and `e2e_runner` (keeper/seed), export
+the relevant keys from the keyfile:
+
+```bash
+export DEPLOYER_PRIVATE_KEY=$(jq -r '.accounts.funder.key'   scripts/python/.battle_keys.json)
+export OPERATOR_PRIVATE_KEY=$(jq -r '.accounts.operator.key' scripts/python/.battle_keys.json)
 ```
 
 `forge build` once so `out/` exists (the Python scripts read ABIs from it).
 
 ---
 
-## 1. Step 0 — Preflight (read-only, no funds)
+## 1. Step 0 — Preflight + generate wallets (read-only / offline, no funds)
 
 ```bash
 # Confirm the USDC<->CoreDepositWallet linkage resolves on mainnet:
 python3 scripts/python/resolve_usdc_linkage.py
 # Expect: USDC 0xb88339…630f linked to CoreDepositWallet 0x6B9E…0A24 (WALLET-LINKED).
+
+# Generate the FULL throwaway account set (offline; gitignored keyfile, 0600).
+# Prints the FUNDER address + the exact USDC + HYPE to send it.
+python3 scripts/python/gen_battle_keys.py
+
+# Put the generated role addresses into spike.json (operator/emergencyAdmin/feeRecipient):
+jq -r '.accounts | "operator       " + .operator.address,
+                   "emergencyAdmin " + .emergency.address,
+                   "feeRecipient   " + .feeRecipient.address' scripts/python/.battle_keys.json
+#   -> edit deployments/configs/spike.json: replace the 0x..a001/a002/a003 sentinels with
+#      these three addresses, and set whitelistPerps / leverageCapBps / slippageBandBps.
 
 # Dry-run the deploy (NO --broadcast) — validates roles + 24h floor + wallet linkage:
 STRATEGY_CONFIG=deployments/configs/spike.json \
@@ -65,22 +84,30 @@ STRATEGY_CONFIG=deployments/configs/spike.json \
 # Expect: "SIMULATION COMPLETE". (Remove the simulated deployments/mainnet/spike.json afterward.)
 ```
 
-## 2. Step 1 — Deploy the vault (FUNDED) + opt into big blocks
+## 2. Step 1 — Fund the funder, disperse, then deploy
 
 ```bash
-# 1a. Opt the DEPLOYER into HyperEVM big blocks (the vault is ~6-8M gas to deploy):
+# 1a. FUND THE FUNDER (the ONE wallet you fund). Send the amounts gen_battle_keys
+#     printed, to the funder address, on HyperEVM (chainId 999), from your own
+#     funded wallet / exchange withdrawal (your action):
+#        250 USDC  (ERC20 0xb88339CB7199b77E23DB6E890353E22632Ba630f, 6 decimals)
+#        3   HYPE  (native gas)
+
+# 1b. Fan funds out to every wallet (dry-run first, then broadcast + audit trail):
+python3 scripts/python/disperse.py                    # dry-run: plan + balance preflight
+python3 scripts/python/disperse.py --execute          # broadcast -> logs/disperse_audit.jsonl
+
+# 1c. Opt the funder/deployer into HyperEVM big blocks (the vault is ~6-8M gas):
 OPERATOR_PRIVATE_KEY=$DEPLOYER_PRIVATE_KEY python3 scripts/python/optin_big_blocks.py
 
-# 1b. Broadcast the deploy (writes deployments/mainnet/spike.json with real addresses):
+# 1d. Broadcast the deploy (funder = deployer; writes deployments/mainnet/spike.json):
 STRATEGY_CONFIG=deployments/configs/spike.json \
   forge script script/Deploy.s.sol --rpc-url "$HYPEREVM_RPC_MAINNET" --broadcast --slow
 # Record: VAULT, TIMELOCK addresses from the output -> Appendix.
-
 export ARTIFACT=deployments/mainnet/spike.json
 
-# 1c. Opt the VAULT into big blocks (needed before it can act on Core):
-OPERATOR_PRIVATE_KEY=$OPERATOR_PRIVATE_KEY VAULT_ADDRESS=$(jq -r .vault $ARTIFACT) \
-  python3 scripts/python/optin_big_blocks.py
+# 1e. Opt the VAULT into big blocks (needed before it can act on Core):
+VAULT_ADDRESS=$(jq -r .vault $ARTIFACT) python3 scripts/python/optin_big_blocks.py
 ```
 
 Because the timelock delay is 24h, the deploy does NOT auto-seed the whitelist —
@@ -122,23 +149,16 @@ python3 scripts/python/admin_timelock.py --actions "barriers=0:0:0" --execute   
 > `DEPLOYER_PRIVATE_KEY` present) ONLY if you want it to broadcast for you instead
 > of copy-pasting the `cast send` lines. Either way is a human gate.
 
-## 4. Step 3 — LP wallets + funding + seed
+## 4. Step 3 — Seed the vault
+
+Wallets were generated (Step 0) and funded via the funder (Step 1); `disperse.py`
+wrote the audit trail to `logs/disperse_audit.jsonl`. Confirm balances anytime with
+`python3 scripts/python/disperse.py --check` (or `plan_funding.py --check`).
 
 ```bash
-# 3a. Generate the 10 LP + 1 trigger throwaway keys (offline, gitignored, 0600):
-python3 scripts/python/gen_battle_keys.py            # prints addresses only
-
-# 3b. See what to fund, then broadcast the funding yourself:
-python3 scripts/python/plan_funding.py --keys scripts/python/.battle_keys.json --artifact $ARTIFACT
-#   -> emits `cast send <USDC> transfer ...` for each LP (220 USDC total) + HYPE gas drips.
-#   Fund the operator separately with the vault seed (~120 USDC) + 1.0 USDC activation reserve + gas.
-# 3c. Confirm funding landed:
-python3 scripts/python/plan_funding.py --keys scripts/python/.battle_keys.json --artifact $ARTIFACT --check
-#   -> every account should read OK.
-
-# 3d. Seed the vault (operator deposits the strategy capital + activates Core on first push):
-#   The first pushToCore costs 1.0 USDC account-activation gas (one-time). Use e2e_runner:
-ARTIFACT=$ARTIFACT python3 scripts/python/e2e_runner.py --steps deposit,push --deposit-usdc 120
+# Seed the vault from the operator (bootstrap NAV + activate Core on first push).
+# The first pushToCore costs 1.0 USDC account-activation gas (one-time).
+ARTIFACT=$ARTIFACT python3 scripts/python/e2e_runner.py --steps deposit,push --deposit-usdc 10
 ```
 
 ## 5. Step 4 — Keeper + monitor online (continuous, for the whole window)
