@@ -96,10 +96,16 @@ python scripts/python/seed_whitelist.py
 A 10-LP battle-test that exercises the full redemption/escape/fee matrix. Like the
 keeper, it is **DRY-RUN-first**: without `--execute` nothing is ever sent.
 
-- `gen_battle_keys.py` — generate the 10 LP + 1 trigger throwaway keys from one
-  mnemonic into the gitignored `scripts/python/.battle_keys.json` (offline; prints
-  addresses only). `plan_funding.py --check` then reports funding shortfalls and
-  emits the `cast send` funding commands for you to broadcast.
+- `gen_battle_keys.py` — generate the FULL throwaway account set (funder + operator
+  + emergency + feeRecipient + 10 LPs + trigger) from one mnemonic into the
+  gitignored `scripts/python/.battle_keys.json` (offline; prints addresses +
+  allocations only). The **funder** is the ONE wallet you fund; it prints how much
+  USDC + HYPE to send it.
+- `disperse.py` — fan the per-account allocations out from the funder to every
+  wallet (USDC + native HYPE), with a JSON-lines audit trail. DRY-RUN-first; runs
+  a balance preflight; `--execute` broadcasts. `--check` shows balances anytime.
+- `plan_funding.py --check` — alternative balance/shortfall report + `cast send`
+  funding commands if you'd rather move funds manually.
 - `monitor.py` — read-only watcher (CoreDepositWallet `paused()` alert + order
   reconciliation cloid→oid + leverage-cap monitor). Run alongside the keeper.
 - `admin_timelock.py` — build the 24h-timelock admin batch (SLA window, escape
@@ -111,7 +117,10 @@ keeper, it is **DRY-RUN-first**: without `--execute` nothing is ever sent.
 - `state_store.py` — resumable `.battle_state.json` checkpoint (gitignored).
 
 ```bash
-python3 scripts/python/gen_battle_keys.py                     # offline keygen
+python3 scripts/python/gen_battle_keys.py                     # offline keygen -> prints the funder addr + amounts
+# ... fund the funder with the printed USDC + HYPE on HyperEVM ...
+python3 scripts/python/disperse.py                            # dry-run: plan + balance preflight
+python3 scripts/python/disperse.py --execute                 # fan funds out (audit trail -> logs/)
 python3 scripts/python/battle_test.py --plan                  # coverage matrix
 ARTIFACT=deployments/mainnet/spike.json \
   python3 scripts/python/battle_test.py --phase A             # DRY-RUN (no funds)

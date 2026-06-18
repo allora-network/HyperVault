@@ -57,6 +57,28 @@ LP_NAMES: list[str] = [n for n in LP_TIERS if n.startswith("lp")]
 
 DEFAULT_KEYFILE = "scripts/python/.battle_keys.json"
 
+# --- Full self-contained throwaway account set (one funded master) ------------
+# The "funder" is the ONE wallet the human funds; disperse.py fans funds out to
+# everyone else. The funder doubles as the deployer + timelock proposer/executor
+# for the spike. For PRODUCTION these become distinct hardware/multisig keys
+# (deferred: SOLU-3374) — the all-throwaway-in-one-keyfile model is spike-only.
+ROLE_NAMES: list[str] = ["funder", "operator", "emergency", "feeRecipient"]
+ALL_NAMES: list[str] = ROLE_NAMES + LP_NAMES + ["trigger"]
+
+# HD derivation index per account — one mnemonic reproduces every key.
+DERIVATION_INDEX: dict[str, int] = {"funder": 0, "trigger": 11,
+                                    "operator": 20, "emergency": 21, "feeRecipient": 22}
+DERIVATION_INDEX.update({name: i + 1 for i, name in enumerate(LP_NAMES)})  # lp1..lp10 -> 1..10
+
+# Disperse allocations sent FROM the funder (human USDC 6dp / native HYPE).
+#   USDC: each LP's tier + a small operator bootstrap (10) + first-push activation (1) + buffer.
+#   HYPE: gas per role; the deploy + timelock txs are paid by the funder's own reserve.
+USDC_ALLOC: dict[str, float] = {**{n: LP_TIERS[n] for n in LP_NAMES}, "operator": 12.0}
+HYPE_ALLOC: dict[str, float] = {"operator": 1.0, "emergency": 0.1, "feeRecipient": 0.05,
+                                "trigger": 0.3, **{n: 0.05 for n in LP_NAMES}}
+# What the human sends to the funder = alloc sums + the funder's own deploy/send reserve.
+FUND_TOTALS: dict[str, float] = {"usdc": 250.0, "hype": 3.0}
+
 # Minimal ERC20 ABI for USDC (read + the moves the battle-test/wind-down need).
 ERC20_ABI = [
     {"type": "function", "name": "balanceOf", "stateMutability": "view",
@@ -199,13 +221,17 @@ def build_battle_ctx(args: argparse.Namespace) -> BattleCtx:
     except Exception:  # noqa: BLE001 — USDC is index 0 on HyperCore mainnet
         pass
 
+    # Prefer keyfile role accounts (self-contained spike); fall back to env keys.
+    operator = accounts.get("operator") or _env_account("OPERATOR_PRIVATE_KEY")
+    emergency = accounts.get("emergency") or _env_account("EMERGENCY_PRIVATE_KEY",
+                                                          "EMERGENCY_ADMIN_PRIVATE_KEY")
+
     return BattleCtx(
         w3=w3, info=info, vault=vault, usdc=usdc,
         vault_addr=vault_addr, usdc_addr=usdc_addr,
         asset_idx=args.asset, asset_meta=asset_meta,
         accounts=accounts, tiers=tiers,
-        operator=_env_account("OPERATOR_PRIVATE_KEY"),
-        emergency=_env_account("EMERGENCY_PRIVATE_KEY", "EMERGENCY_ADMIN_PRIVATE_KEY"),
+        operator=operator, emergency=emergency,
         network=args.network, execute=bool(getattr(args, "execute", False)),
         fee_recipient=fee_recipient, core_usdc_index=core_usdc_index,
     )
