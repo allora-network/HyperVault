@@ -149,6 +149,7 @@ abstract contract HyperVaultBaseForkTest is Test {
             feeRecipient: feeRecipient,
             leverageCapBps: 0,
             slippageBandBps: 0,
+            emergencyCloseBandBps: 0,
             mgmtFeeAnnualBps: mgmtBps,
             perfFeeBps: perfBps,
             depositCap: type(uint256).max,

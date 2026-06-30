@@ -131,6 +131,7 @@ struct Config {
     address emergencyAdmin;  // EMERGENCY_ROLE
     address feeRecipient;    // immutable; receives mgmt-fee shares + perf fee in USDC
     uint16 leverageCapBps; uint16 slippageBandBps;
+    uint16 emergencyCloseBandBps; // M4 escape/emergency-close markPx band; Deploy.s.sol requires (0, 5000]
     uint16 mgmtFeeAnnualBps;  // hard cap 2_000 (20%/yr)
     uint16 perfFeeBps;        // hard cap 5_000 (50%)
     uint256 depositCap; uint256 maxDepositPerAddress;
@@ -470,7 +471,7 @@ stay on fast blocks.
 { "name": "...", "symbol": "...",
   "operator": "0x…", "emergencyAdmin": "0x…", "feeRecipient": "0x…",
   "usdcAddress": "0x…", "timelockMinDelaySec": 86400,
-  "leverageCapBps": 30000, "slippageBandBps": 200,
+  "leverageCapBps": 30000, "slippageBandBps": 200, "emergencyCloseBandBps": 1000,
   "perfFeeBps": 1500, "mgmtFeeAnnualBps": 200,
   "depositCap": "…", "maxDepositPerAddress": "…",
   "whitelistPerps": [0], "whitelistSpots": [] }
@@ -478,7 +479,9 @@ stay on fast blocks.
 
 > **Production checklist (Finding C):** split `operator` / `emergencyAdmin` / `feeRecipient`; set a real
 > `timelockMinDelaySec` (24h+); hand timelock proposer/executor to a multisig; curate `spotRecoverDest`;
-> raise the `$100` demo caps; enable `strictNavReads` + factory `strictAssetValidation` after Core init.
+> raise the `$100` demo caps; enable `strictNavReads` + factory `strictAssetValidation` after Core init;
+> set a non-zero `emergencyCloseBandBps` — `Deploy.s.sol` now requires it in `(0, 5000]` bps so a vault
+> can never ship with the escape/emergency-close markPx band disabled (live-spike RUN-1 finding).
 
 **Big blocks** are also needed for the emergency fan-out functions (`emergencyCancelByCloid` over many
 assets); opt the relevant sender in via the HL API.
