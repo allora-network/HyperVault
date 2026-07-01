@@ -90,3 +90,39 @@ HYPEREVM_RPC_MAINNET=https://rpc.hyperliquid.xyz/evm \
 DEPLOYER_PRIVATE_KEY=0x... PERPS_TO_ADD=1,5,12 \
 python scripts/python/seed_whitelist.py
 ```
+
+## Battle-test kit (10-account live spike) — `docs/LIVE_SPIKE_RUNBOOK.md`
+
+A 10-LP battle-test that exercises the full redemption/escape/fee matrix. Like the
+keeper, it is **DRY-RUN-first**: without `--execute` nothing is ever sent.
+
+- `gen_battle_keys.py` — generate the FULL throwaway account set (funder + operator
+  + emergency + feeRecipient + 10 LPs + trigger) from one mnemonic into the
+  gitignored `scripts/python/.battle_keys.json` (offline; prints addresses +
+  allocations only). The **funder** is the ONE wallet you fund; it prints how much
+  USDC + HYPE to send it.
+- `disperse.py` — fan the per-account allocations out from the funder to every
+  wallet (USDC + native HYPE), with a JSON-lines audit trail. DRY-RUN-first; runs
+  a balance preflight; `--execute` broadcasts. `--check` shows balances anytime.
+- `plan_funding.py --check` — alternative balance/shortfall report + `cast send`
+  funding commands if you'd rather move funds manually.
+- `monitor.py` — read-only watcher (CoreDepositWallet `paused()` alert + order
+  reconciliation cloid→oid + leverage-cap monitor). Run alongside the keeper.
+- `admin_timelock.py` — build the 24h-timelock admin batch (SLA window, escape
+  grace, barriers, fees); dry-run prints the `scheduleBatch`/`executeBatch` cmds.
+- `battle_test.py` — the orchestrator. `--plan` prints the coverage matrix;
+  `--phase A..F,Z` / `--scenario <id>` run a slice (dry-run unless `--execute`);
+  `--resume` skips PASS scenarios; `--journal-out` appends a NAV snapshot.
+- `journal.py` — read-only daily NAV reconciliation + invariant checks.
+- `state_store.py` — resumable `.battle_state.json` checkpoint (gitignored).
+
+```bash
+python3 scripts/python/gen_battle_keys.py                     # offline keygen -> prints the funder addr + amounts
+# ... fund the funder with the printed USDC + HYPE on HyperEVM ...
+python3 scripts/python/disperse.py                            # dry-run: plan + balance preflight
+python3 scripts/python/disperse.py --execute                 # fan funds out (audit trail -> logs/)
+python3 scripts/python/battle_test.py --plan                  # coverage matrix
+ARTIFACT=deployments/mainnet/spike.json \
+  python3 scripts/python/battle_test.py --phase A             # DRY-RUN (no funds)
+python3 scripts/python/monitor.py --interval 30 --artifact deployments/mainnet/spike.json
+```

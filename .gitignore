@@ -5,6 +5,12 @@
 *.pem
 *.key
 
+# Battle-test throwaway keys + resumable run state (NEVER commit)
+.battle_keys*.json
+scripts/python/.battle_keys*.json
+.battle_state.json
+scripts/python/.battle_state.json
+
 # ─── Foundry build / state ─────────────────────────────────────────────────
 out/
 cache/
