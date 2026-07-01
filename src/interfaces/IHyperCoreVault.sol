@@ -86,8 +86,7 @@ interface IHyperCoreVault is IERC4626 {
     ///         == 0` — a vault with no {requestFulfillmentWindow} has no armable
     ///         brake), the request is not yet overdue by `escapeGraceSeconds` BEYOND
     ///         its deadline, or its remaining claim does not exceed {availableIdleUsdc}
-    ///         (an honored/honorable request can never arm the brake). Replaces the
-    ///         interim {EscapeTriggerNotWired} placeholder.
+    ///         (an honored/honorable request can never arm the brake).
     error EscapeConditionNotMet(address lp);
     /// @notice {setEscapeGraceSeconds} called with a value outside the compile-time
     ///         hard bounds [`ESCAPE_GRACE_MIN`, `ESCAPE_GRACE_MAX`] (M5 §1, SOLU-3371).
@@ -95,10 +94,6 @@ interface IHyperCoreVault is IERC4626 {
     ///         permissionless brake (set it absurdly long) nor make it hair-trigger
     ///         (set it ~0) — fail-closed, matching the repo's posture.
     error EscapeGraceOutOfRange(uint64 lo, uint64 hi);
-    /// @notice The trigger condition for {triggerEscape} (the permissionless
-    ///         staleness gate — `escapeGraceSeconds` + overdue-AND-claim>idle) is
-    ///         completed in SOLU-3371; in this issue entry is admin-gated (M5 §1).
-    error EscapeTriggerNotWired();
     /// @notice Soft lockup barrier (M4 / SOLU-3366): a SYNCHRONOUS {withdraw}/{redeem}
     ///         was attempted before `unlockAt` (the owner's last deposit + the
     ///         configured lockup). The {requestWithdraw} queue is NOT lockup-gated.
