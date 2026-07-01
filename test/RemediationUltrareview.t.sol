@@ -98,6 +98,7 @@ contract RemediationUltrareviewTest is Test {
                 feeRecipient: feeRecipient,
                 leverageCapBps: 0,
                 slippageBandBps: 0,
+                emergencyCloseBandBps: 0,
                 mgmtFeeAnnualBps: 0, // isolate perf fee from mgmt-fee dilution
                 perfFeeBps: PERF_FEE_BPS,
                 depositCap: type(uint256).max,
@@ -340,6 +341,7 @@ contract RemediationUltrareviewTest is Test {
                 feeRecipient: feeRecipient,
                 leverageCapBps: 0,
                 slippageBandBps: 0,
+                emergencyCloseBandBps: 0,
                 mgmtFeeAnnualBps: mgmtBps,
                 perfFeeBps: 0,
                 depositCap: type(uint256).max,
@@ -444,6 +446,7 @@ contract RemediationUltrareviewTest is Test {
                 feeRecipient: feeRecipient,
                 leverageCapBps: 0,
                 slippageBandBps: 0,
+                emergencyCloseBandBps: 0,
                 mgmtFeeAnnualBps: 0,
                 perfFeeBps: 0,
                 depositCap: type(uint256).max,

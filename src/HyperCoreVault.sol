@@ -65,6 +65,7 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         address feeRecipient;
         uint16 leverageCapBps;
         uint16 slippageBandBps;
+        uint16 emergencyCloseBandBps; // M4 escape/emergency-close markPx sanity band; deploy-required non-zero
         uint16 mgmtFeeAnnualBps;
         uint16 perfFeeBps;
         uint256 depositCap;
@@ -302,6 +303,7 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         }
         leverageCapBps = cfg.leverageCapBps;
         slippageBandBps = cfg.slippageBandBps;
+        emergencyCloseBandBps = cfg.emergencyCloseBandBps;
         mgmtFeeAnnualBps = cfg.mgmtFeeAnnualBps;
         perfFeeBps = cfg.perfFeeBps;
         depositCap = cfg.depositCap;

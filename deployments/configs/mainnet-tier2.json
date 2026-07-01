@@ -11,6 +11,7 @@
   "timelockMinDelaySec": 86400,
   "leverageCapBps": 30000,
   "slippageBandBps": 200,
+  "emergencyCloseBandBps": 1000,
   "perfFeeBps": 1500,
   "mgmtFeeAnnualBps": 200,
   "depositCap": "100000000",

@@ -31,6 +31,7 @@ contract DeployTifTestVault is Script {
             feeRecipient: op,
             leverageCapBps: 30_000, // 3x — exercises the corrected /1e10 notional
             slippageBandBps: 200,   // 2% — exercises the corrected x10^(2+szDec) band
+            emergencyCloseBandBps: 1000,
             mgmtFeeAnnualBps: 0,
             perfFeeBps: 0,
             depositCap: 1_000_000_000_000,

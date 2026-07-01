@@ -40,10 +40,21 @@ contract Deploy is Script {
         cfg.feeRecipient         = vm.parseJsonAddress(json, ".feeRecipient");
         cfg.leverageCapBps       = uint16(vm.parseJsonUint(json, ".leverageCapBps"));
         cfg.slippageBandBps      = uint16(vm.parseJsonUint(json, ".slippageBandBps"));
+        cfg.emergencyCloseBandBps = uint16(vm.parseJsonUint(json, ".emergencyCloseBandBps"));
         cfg.mgmtFeeAnnualBps     = uint16(vm.parseJsonUint(json, ".mgmtFeeAnnualBps"));
         cfg.perfFeeBps           = uint16(vm.parseJsonUint(json, ".perfFeeBps"));
         cfg.depositCap           = vm.parseJsonUint(json, ".depositCap");
         cfg.maxDepositPerAddress = vm.parseJsonUint(json, ".maxDepositPerAddress");
+
+        // Live-spike RUN-1 finding: the M4 escape/emergency-close markPx band must
+        // be set non-zero at deploy. When emergencyCloseBandBps == 0 the mandatory
+        // sanity band on escapeFlattenPerps + emergencyClosePositions is SKIPPED
+        // (the close px is then unbounded vs mark). Required on every chain; the
+        // band-free path is the explicit emergencyClosePositionsForce variant.
+        require(
+            cfg.emergencyCloseBandBps > 0 && cfg.emergencyCloseBandBps <= 5_000,
+            "emergencyCloseBandBps must be in (0, 5000] bps - the M4 escape/emergency-close band is mandatory"
+        );
 
         uint256 timelockDelay = vm.parseJsonUint(json, ".timelockMinDelaySec");
         uint256[] memory perpWhitelist = vm.parseJsonUintArray(json, ".whitelistPerps");
@@ -196,6 +207,7 @@ contract Deploy is Script {
         );
         string memory tail = string.concat(
             "  \"leverageCapBps\": ", vm.toString(cfg.leverageCapBps), ",\n",
+            "  \"emergencyCloseBandBps\": ", vm.toString(cfg.emergencyCloseBandBps), ",\n",
             "  \"perfFeeBps\": ", vm.toString(cfg.perfFeeBps), ",\n",
             "  \"mgmtFeeAnnualBps\": ", vm.toString(cfg.mgmtFeeAnnualBps), ",\n",
             "  \"whitelistPerps\": ", _uintArrayToJson(perpWhitelist), ",\n",

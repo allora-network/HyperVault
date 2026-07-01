@@ -82,9 +82,10 @@ changed and which claims below are now superseded:
 - **M2.** Deposits/mints into an LP with an open withdrawal request revert
   (`PendingRequestBlocksDeposit`) — closes the cost-basis double-count.
 - **M3.** `maxRedeem` is capped to idle-backed shares so `previewRedeem(maxRedeem)`
-  is honored (no silent partial). **M4.** `emergencyClosePositions` gains an optional
-  wide markPx sanity band (`emergencyCloseBandBps`); `emergencyClosePositionsForce`
-  is the explicit oracle-down override. **M6.** The spot slippage band now requires a
+  is honored (no silent partial). **M4.** `emergencyClosePositions` gains a
+  wide markPx sanity band (`emergencyCloseBandBps`), deploy-required non-zero in `(0, 5000]`
+  (live-spike RUN-1 finding — a vault can never ship with the band silently off);
+  `emergencyClosePositionsForce` is the explicit oracle-down / band-free override. **M6.** The spot slippage band now requires a
   calibrated `spotPxScaleFactor` (else it gave false protection). **L1–L4.** deposit
   balance-delta (FOT) guard; dormancy mgmt-fee cap (one annual period, not nav/2);
   `int64.min` abs guard; factory+registry `Ownable2Step`.
