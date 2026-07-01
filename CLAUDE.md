@@ -2,7 +2,7 @@
 
 Production-grade, audited **single-venue Hyperliquid strategy vault**: depositors hold tokenized ERC-4626 shares; an operator trades the pooled USDC on HyperCore (perps + spot) via CoreWriter; NAV is read on-chain from precompiles. One vault = one strategy.
 
-- **Branch:** `main` is current — v1.4 audit remediation, v1.5 G2 bridge, and the **M4/M5 redemption-hardening + permissionless escape-brake** work have all merged (commit `18c5859`; `forge test` 113 pass / 0 fail / 7 live-only skips). Work lands via per-issue draft PRs.
+- **Branch:** `main` is current — v1.4 audit remediation, v1.5 G2 bridge, and the **M4/M5 redemption-hardening + permissionless escape-brake** work have all merged (commit `18c5859`; `forge test` 117 pass / 0 fail / 7 live-only skips). Work lands via per-issue draft PRs.
 - **Stack:** Foundry, Solidity `0.8.27`, EVM `cancun`. Deploys to **HyperEVM mainnet**.
 - **Canonical HyperEVM lib:** `hyperliquid-dev/hyper-evm-lib` (PrecompileLib + CoreWriterLib + CoreSimulator). Remapped `@hyper-evm-lib/`.
 
@@ -66,6 +66,6 @@ Evolves this vault into an EVM/venue-agnostic system (Hyperliquid, Avantis, Ligh
 
 ## Conventions / don't-re-flag
 
-- The original Foundry suite (`test/audit/Mitigations.t.sol`, `test/unit|integration|mocks/*`) was **intentionally deleted** in `33b5149` (suite being rewritten) — don't treat its absence as a mistake. Current tests: `test/RemediationUltrareview.t.sol` (legacy mock suite — superseded for liveness/redemption proofs) + `test/fork/LighterCustody.fork.t.sol` (D2) + the **`test/fork/HyperVault*.fork.t.sol`** suite on real HyperEVM bytecode — `{Base, Liveness, QueueAccounting, Governance, Linkage, FeeTransfer, SpotBand, CoreDepositWallet, Escape, EscapeTrigger, EscapePull, Barriers, KeeperEdge}` (needs `HYPEREVM_RPC_MAINNET`, skips cleanly without). As of 2026-06-17 `forge test` is **113 pass / 0 fail / 7 live-only skips**. Originals of the deleted suite are on history if needed.
+- The original Foundry suite (`test/audit/Mitigations.t.sol`, `test/unit|integration|mocks/*`) was **intentionally deleted** in `33b5149` (suite being rewritten) — don't treat its absence as a mistake. Current tests: `test/RemediationUltrareview.t.sol` (legacy mock suite — superseded for liveness/redemption proofs) + `test/fork/LighterCustody.fork.t.sol` (D2) + the **`test/fork/HyperVault*.fork.t.sol`** suite on real HyperEVM bytecode — `{Base, Liveness, QueueAccounting, Governance, Linkage, FeeTransfer, SpotBand, CoreDepositWallet, Escape, EscapeTrigger, EscapePull, Barriers, KeeperEdge, BattleMatrix}` (needs `HYPEREVM_RPC_MAINNET`, skips cleanly without). As of 2026-06-18 `forge test` is **117 pass / 0 fail / 7 live-only skips** (the +4 over the M5 baseline are the M6/M7 `BattleMatrix` tests — multi-LP concurrency + full-escape e2e). Originals of the deleted suite are on history if needed.
 - `vaults.md` is refined via Ultraplan — acknowledge handoffs; don't auto-exit plan mode. Keep its 🟢🟡🔴 / ✅❌⏳ status markers; decorative emojis and story-point sizing were intentionally stripped.
 - Commit/push only when asked.
