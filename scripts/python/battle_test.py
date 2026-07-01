@@ -298,11 +298,15 @@ def sc_f_escape(ctx: BattleCtx, st: dict) -> None:
     # Leg 3: consolidate spot.
     send(ctx, "trigger", _v(ctx).escapeConsolidateToSpot(), gas=600_000, label="escape leg3: consolidate to spot")
     _escape_wait(ctx)
-    # Leg 4a: pull Core spot -> EVM (send_asset, chunked).
-    core = _read(ctx, "coreSpotUsdc") or 0
-    chunk = int(core * 0.998) if core else 0
-    send(ctx, "trigger", _v(ctx).escapePullToEvm(chunk), gas=700_000,
-         label=f"escape leg4a: escapePullToEvm({chunk}) [send_asset, balance*0.998]")
+    # Leg 4a: pull Core spot -> EVM (send_asset, chunked). escapePullToEvm(maxChunkWei)
+    # is a per-crank CAP in 8dp Core wei; the CONTRACT applies the 99.8% fee cushion
+    # internally (do NOT pre-discount, and do NOT pass the 6dp coreSpotUsdc() value as
+    # an 8dp cap). Live-spike RUN-1: the Core->EVM bridge silently DROPS a single
+    # withdrawal above a per-tx cap (~55-95 USDC observed), so bound the chunk under it
+    # and crank repeatedly for a larger balance. 45 USDC covers the per-LP scale here.
+    BRIDGE_CHUNK_WEI = 45 * 10**8  # 45 USDC in 8dp Core wei
+    send(ctx, "trigger", _v(ctx).escapePullToEvm(BRIDGE_CHUNK_WEI), gas=700_000,
+         label="escape leg4a: escapePullToEvm(45e8 cap=45 USDC; contract applies *0.998; repeat cranks for a larger Core balance)")
     _escape_wait(ctx)
     send(ctx, "trigger", _v(ctx).fulfillWithdraw(a10.address), gas=500_000, label="fulfillWithdraw(LP10)")
     send(ctx, "trigger", _v(ctx).exitEscape([a10.address]), gas=400_000,
