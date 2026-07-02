@@ -88,6 +88,10 @@ library VaultEscapeLib {
     /// @notice Mirrors {VaultTradeLib.EmergencyCloseBandExceeded}: a flatten
     ///         `limitPx` deviates from the strict markPx beyond the mandatory band.
     error EmergencyCloseBandExceeded(uint64 limitPx, uint64 markPx, uint16 bandBps);
+    /// @notice Audit M-1: a permissionless flatten tried to place a close order while
+    ///         `emergencyCloseBandBps == 0`. The band is MANDATORY on the escape path — a
+    ///         band-free close stays EMERGENCY_ROLE-only. Mirrors {IHyperCoreVault}.
+    error EmergencyCloseBandRequired();
     /// @notice A supplied cloid is not one the vault has issued (>= the live
     ///         `_cloidCounter`), so it cannot name a vault-placed resting order (§2 leg 1).
     error EscapeCloidOutOfRange(uint128 cloid, uint128 cloidCounter);
@@ -118,6 +122,27 @@ library VaultEscapeLib {
         emit EscapeActivated(msg.sender, lp);
     }
 
+    /// @dev Audit H-1: the SINGLE overdue-unfillable predicate used by BOTH
+    ///      {triggerIfStale} (to ARM) and {exit} (to HOLD) — making them exactly
+    ///      symmetric (the prior {exit} omitted the grace, an asymmetry vs the
+    ///      grace-stacked arm). True iff `req` has an SLA deadline, is overdue by AT
+    ///      LEAST `grace` beyond it, AND its remaining claim still exceeds `availableIdle`.
+    ///      `previewRedeem` is a view self-call (`address(this)` is the vault under
+    ///      delegatecall). A zero-share `req` (e.g. the `address(0)` anchor) returns false.
+    function _overdueUnfillable(
+        IHyperCoreVault.WithdrawalRequest storage req,
+        uint256 availableIdle,
+        uint64 grace
+    ) private view returns (bool) {
+        uint256 shares = req.shares;
+        if (shares == 0) return false;
+        uint64 deadline = req.fulfillmentDeadline;
+        // deadline==0 (no SLA) can never be overdue. Adding grace cannot overflow uint64
+        // (deadline is a unix ts, grace <= ESCAPE_GRACE_MAX == 30d) — widen to uint256.
+        if (deadline == 0 || block.timestamp <= uint256(deadline) + grace) return false;
+        return IERC4626(address(this)).previewRedeem(shares) > availableIdle;
+    }
+
     /// @notice PERMISSIONLESS staleness trigger (M5 §1, SOLU-3371) — arm the brake on
     ///         `lp` iff its request is OVERDUE-UNFILLABLE by the grace-stacked gate.
     ///         This is the EXACT SYMMETRIC counterpart to {exit}: the same
@@ -144,19 +169,17 @@ library VaultEscapeLib {
         mapping(address => IHyperCoreVault.WithdrawalRequest) storage pendingWithdrawal,
         uint256 availableIdle
     ) external {
-        IHyperCoreVault.WithdrawalRequest storage req = pendingWithdrawal[lp];
-        uint256 shares = req.shares;
-        uint64 deadline = req.fulfillmentDeadline;
-        // (a) overdue by AT LEAST `s.graceSeconds` beyond the SLA deadline. deadline==0
-        //     (no SLA) can never be overdue ⇒ not armable. Adding the grace cannot
-        //     overflow uint64 (deadline is a unix ts, grace <= ESCAPE_GRACE_MAX == 30d).
-        bool overdue = shares != 0 && deadline != 0 && block.timestamp > uint256(deadline) + s.graceSeconds;
-        // (b) the remaining claim still exceeds available idle (honorable ⇒ not armable).
-        if (!overdue || IERC4626(address(this)).previewRedeem(shares) <= availableIdle) {
+        // Fail-closed via the shared predicate: any unmet leg reverts, never a silent no-op.
+        if (!_overdueUnfillable(pendingWithdrawal[lp], availableIdle, s.graceSeconds)) {
             revert EscapeConditionNotMet(lp);
         }
-        if (s.active) return; // idempotent: already armed (no spurious second event)
+        // Idempotent re-arm: while already armed, DO NOT touch `armedFor`. Security-critical
+        // (audit H-1): during escape availableIdle≈0 so even a dust request is
+        // "overdue-unfillable", and re-pointing the anchor onto an attacker-controlled
+        // request would let them resolve it and clear a live brake.
+        if (s.active) return;
         s.active = true;
+        s.armedFor = lp; // audit H-1: anchor set ONLY on the inactive->active transition
         emit EscapeActivated(msg.sender, lp);
     }
 
@@ -178,32 +201,32 @@ library VaultEscapeLib {
         emit EscapeGraceSecondsUpdated(newGrace);
     }
 
-    /// @notice Permissionlessly clear the brake (M5 §1) — succeeds ONLY when NONE of
-    ///         `lps` still has an OVERDUE request whose remaining claim exceeds the
-    ///         vault's available idle ("overdue-unfillable", the exact arming
-    ///         condition in SOLU-3371). A non-overdue or now-honorable request does
-    ///         not hold the brake. The caller supplies the candidate set (the brake
-    ///         is armed by a specific stale request; keepers/LPs know which).
-    /// @dev    Reads the vault's `_pendingWithdrawal` by storage reference and its own
-    ///         `previewRedeem` via self-call (`address(this)` is the vault under
-    ///         delegatecall); `availableIdle` is the vault's `_availableIdle()`.
+    /// @notice Permissionlessly clear the brake (M5 §1) — succeeds ONLY when the request
+    ///         that ARMED the brake ({EscapeState.armedFor}) is no longer overdue-unfillable
+    ///         (funded to honorable, fulfilled, or cancelled). Permissionless + pause-immune.
+    /// @dev    Audit H-1: the hold decision is re-derived from the STORED `armedFor` anchor,
+    ///         NOT the caller-supplied `lps`. The `lps` array is retained in the ABI for
+    ///         backward compatibility but is IGNORED — otherwise `exitEscape([])` or
+    ///         `exitEscape([nonBlocker])` would clear a live brake (the caller could
+    ///         volunteer an empty/irrelevant set). Uses the same {_overdueUnfillable}
+    ///         predicate as {triggerIfStale} (reads `_pendingWithdrawal` by storage
+    ///         reference + `previewRedeem` self-call). `armedFor == address(0)` (armed with
+    ///         no anchor) ⇒ zero-share lookup ⇒ clears. If the anchor resolves while a
+    ///         DIFFERENT request still qualifies, the brake clears and anyone re-arms
+    ///         permissionlessly via {triggerIfStale} (cranks are cooldown-gated, so the
+    ///         one-tx gap is immaterial).
     function exit(
         IHyperCoreVault.EscapeState storage s,
-        address[] calldata lps,
+        address[] calldata, /* lps: ignored (audit H-1) — kept for ABI compatibility */
         mapping(address => IHyperCoreVault.WithdrawalRequest) storage pendingWithdrawal,
         uint256 availableIdle
     ) external {
         if (!s.active) return;
-        for (uint256 i; i < lps.length; ++i) {
-            address lp = lps[i];
-            IHyperCoreVault.WithdrawalRequest storage req = pendingWithdrawal[lp];
-            uint256 shares = req.shares;
-            if (shares == 0) continue;
-            uint64 deadline = req.fulfillmentDeadline;
-            if (deadline == 0 || block.timestamp <= deadline) continue; // not overdue
-            if (IERC4626(address(this)).previewRedeem(shares) > availableIdle) revert EscapeBacklogRemains(lp);
+        if (_overdueUnfillable(pendingWithdrawal[s.armedFor], availableIdle, s.graceSeconds)) {
+            revert EscapeBacklogRemains(s.armedFor);
         }
         s.active = false;
+        s.armedFor = address(0);
         emit EscapeDeactivated(msg.sender);
     }
 
@@ -309,9 +332,14 @@ library VaultEscapeLib {
         uint64 absSz = uint64(szi < 0 ? uint256(-int256(szi)) : uint256(int256(szi)));
         uint8 szDec = PrecompileLib.perpAssetInfoStrict(a).szDecimals;
 
-        // Audit M4: the band is MANDATORY on the escape path. markPxStrict reverting
+        // Audit M4 + M-1: the band is TRULY MANDATORY on the permissionless escape path.
+        // A HELD position (szi != 0, checked above) can only be flattened WITH a configured
+        // band — before, `band == 0` silently SKIPPED this check and let a permissionless
+        // caller push an off-market IOC (value bleed on a thin book). A band-free close now
+        // stays EMERGENCY_ROLE-only ({emergencyClosePositionsForce}). markPxStrict reverting
         // (oracle outage) fails the crank closed — retryable, never a band-free force.
-        if (band > 0) {
+        if (band == 0) revert EmergencyCloseBandRequired();
+        {
             uint64 markRaw = PrecompileLib.markPxStrict(a);
             uint256 markNorm = uint256(markRaw) * (10 ** (uint256(szDec) + 2));
             uint256 lpx = uint256(limitPx);
@@ -344,14 +372,17 @@ library VaultEscapeLib {
     ///         legs 1-3 the vault is flat with all value as Core spot USDC, fully
     ///         counted by {HyperCoreVault.coreSpotUsdc} (§2). No-ops the CoreWriter
     ///         call (but still runs the gate + crank event) when nothing is withdrawable.
-    function escapeConsolidateToSpot(IHyperCoreVault.EscapeState storage s, bool navBootstrap)
+    function escapeConsolidateToSpot(IHyperCoreVault.EscapeState storage s)
         external
         returns (uint64 movedNtl)
     {
         _gate(s);
-        movedNtl = navBootstrap
-            ? PrecompileLib.withdrawable(address(this)).withdrawable
-            : PrecompileLib.withdrawableStrict(address(this)).withdrawable;
+        // Audit M-2: read `withdrawable` LENIENTLY even in strict NAV mode. This crank only
+        // moves equity toward redeemable idle; a staticcall can never fabricate a LARGER
+        // value, so a precompile outage yields 0 and the `if (movedNtl != 0)` guard no-ops
+        // (still runs the gate + crank event) instead of reverting — keeping the escape
+        // backstop alive through an outage. Share pricing stays strict via {totalAssets}.
+        movedNtl = PrecompileLib.withdrawable(address(this)).withdrawable;
         if (movedNtl != 0) {
             CoreWriterLib.usdClassTransfer(movedNtl, false); // perp -> spot
             emit UsdClassTransferSubmitted(movedNtl, false);
@@ -438,20 +469,18 @@ library VaultEscapeLib {
     ///         accrual is needed.
     /// @param  s             The vault's escape latch/cooldown state (by reference).
     /// @param  coreUsdcIndex The vault's immutable Core USDC token index (by value).
-    /// @param  navBootstrap  The vault's NAV-read mode (lenient while bootstrapping).
     /// @param  maxChunkWei   Per-crank send cap in Core wei (8dp); bounds the chunk.
     function escapePullToEvm(
         IHyperCoreVault.EscapeState storage s,
         uint64 coreUsdcIndex,
-        bool navBootstrap,
         uint64 maxChunkWei
     ) external {
         _gate(s);
-        // Audit H-1: lenient/strict per navBootstrap, mirroring {coreSpotUsdc}. A strict
-        // read fails the crank closed on a precompile outage rather than pulling zero.
-        uint64 balance = navBootstrap
-            ? PrecompileLib.spotBalance(address(this), coreUsdcIndex).total
-            : PrecompileLib.spotBalanceStrict(address(this), coreUsdcIndex).total;
+        // Audit M-2: read the Core balance LENIENTLY even in strict NAV mode. This is the
+        // idle-refill backstop — a staticcall can never fabricate a LARGER balance, so an
+        // outage yields 0 and the `if (amount != 0)` guard no-ops instead of reverting,
+        // keeping the pull alive through a precompile outage. Share pricing stays strict.
+        uint64 balance = PrecompileLib.spotBalance(address(this), coreUsdcIndex).total;
         // Fee-aware (never the exact full balance) then chunk-capped. Widen to uint256
         // for the multiply (balance and PULL_FEE_NUM are uint64; the product can exceed
         // uint64); the quotient <= balance <= uint64.max, so the cast back is safe.

@@ -121,7 +121,16 @@ library VaultTradeLib {
         // order notional: sz, limitPx both in the 10^8 action scale, so
         // sz*limitPx = human*human*10^16; /1e10 -> 6dp USD.
         if (!p.reduceOnly && AssetId.isPerp(p.asset) && p.leverageCapBps > 0) {
-            uint256 gross = _grossOpenPerpNotional6dp(whitelistedPerps) + (uint256(p.sz) * uint256(p.limitPx)) / 1e10;
+            // Audit L-2: value the NEW order at max(markPx, limitPx). A low `limitPx` on a
+            // marketable order fills near mark yet would count near-zero notional under the
+            // cap — the bypass when `slippageBandBps == 0` leaves limitPx unconstrained.
+            // markPx precompile scale = human*10^(6-szDec); normalize UP to the 10^8 action
+            // scale (factor 10^(szDec+2)) to match limitPx, then take the conservative max.
+            uint64 markRaw = PrecompileLib.markPxStrict(p.asset);
+            uint256 szDec = uint256(PrecompileLib.perpAssetInfoStrict(p.asset).szDecimals);
+            uint256 markNorm = uint256(markRaw) * (10 ** (szDec + 2));
+            uint256 refPx = markNorm > uint256(p.limitPx) ? markNorm : uint256(p.limitPx);
+            uint256 gross = _grossOpenPerpNotional6dp(whitelistedPerps) + (uint256(p.sz) * refPx) / 1e10;
             uint256 capUsd = (p.nav * p.leverageCapBps) / Constants.BPS;
             if (gross > capUsd) revert LeverageCapExceeded(gross, p.nav, p.leverageCapBps);
         }

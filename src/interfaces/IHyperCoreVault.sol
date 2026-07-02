@@ -57,6 +57,11 @@ interface IHyperCoreVault is IERC4626 {
     ///         `emergencyCloseBandBps` (audit M4). Use {emergencyClosePositionsForce}
     ///         only if the oracle itself is unusable.
     error EmergencyCloseBandExceeded(uint64 limitPx, uint64 markPx, uint16 bandBps);
+    /// @notice Audit M-1: a permissionless escape flatten tried to place a close order, or
+    ///         {setEmergencyCloseBand} was called, with a zero band. The markPx band is
+    ///         MANDATORY on the permissionless escape path; a band-free close stays
+    ///         EMERGENCY_ROLE-only ({emergencyClosePositionsForce}).
+    error EmergencyCloseBandRequired();
     /// @notice A non-zero spot slippage band requires a calibrated, non-zero
     ///         `spotPxScaleFactor` (audit M6) — else the band gives false protection.
     error SpotBandRequiresScaleFactor(uint32 asset);
@@ -145,6 +150,15 @@ interface IHyperCoreVault is IERC4626 {
         ///      gate ({triggerIfStale}) both live in the library, out of the vault's
         ///      EIP-170 budget. Default 8h; bounded [4h, 30d] (the library constants).
         uint64 graceSeconds;
+        /// @dev Audit H-1: the LP whose overdue-unfillable request ARMED the brake, set
+        ///      ONLY on the inactive->active transition in {VaultEscapeLib.triggerIfStale}.
+        ///      {exit} re-derives the "still overdue-unfillable?" hold condition from THIS
+        ///      anchor rather than a caller-supplied list, so `exitEscape([])` /
+        ///      `exitEscape([nonBlocker])` can no longer clear a live brake — clearing now
+        ///      requires the arming request to be genuinely resolved. `address(0)` (armed
+        ///      with no anchor) ⇒ zero-share lookup ⇒ clears freely. Own storage slot
+        ///      (packs after the 17-byte {active}/{lastCrankTs}/{graceSeconds} word).
+        address armedFor;
     }
 
     // -------------------------------------------------------------------------

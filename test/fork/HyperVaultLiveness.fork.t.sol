@@ -264,7 +264,9 @@ contract HyperVaultLivenessForkTest is HyperVaultBaseForkTest {
         vm.expectRevert(abi.encodeWithSelector(IHyperCoreVault.NoPendingRequest.selector, alice));
         vault.prioritizeOverdue(alice);
 
-        // Request with the SLA window DISABLED (default 0) -> never overdue.
+        // Request with the SLA window explicitly DISABLED (window==0 opt-out; M-3 now
+        // defaults it non-zero) -> never overdue.
+        vault.setRequestFulfillmentWindow(0);
         uint256 shares = _deposit(alice, 100e6);
         vm.prank(alice);
         vault.requestWithdraw(shares);
