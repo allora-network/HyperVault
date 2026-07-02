@@ -145,6 +145,15 @@ interface IHyperCoreVault is IERC4626 {
         ///      gate ({triggerIfStale}) both live in the library, out of the vault's
         ///      EIP-170 budget. Default 8h; bounded [4h, 30d] (the library constants).
         uint64 graceSeconds;
+        /// @dev Audit H-1: the LP whose overdue-unfillable request ARMED the brake, set
+        ///      ONLY on the inactive->active transition in {VaultEscapeLib.triggerIfStale}.
+        ///      {exit} re-derives the "still overdue-unfillable?" hold condition from THIS
+        ///      anchor rather than a caller-supplied list, so `exitEscape([])` /
+        ///      `exitEscape([nonBlocker])` can no longer clear a live brake — clearing now
+        ///      requires the arming request to be genuinely resolved. `address(0)` (armed
+        ///      with no anchor) ⇒ zero-share lookup ⇒ clears freely. Own storage slot
+        ///      (packs after the 17-byte {active}/{lastCrankTs}/{graceSeconds} word).
+        address armedFor;
     }
 
     // -------------------------------------------------------------------------

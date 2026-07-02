@@ -1416,8 +1416,15 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         // Audit H2: release any idle reserved for this (now-cancelled) request.
         if (req.reservedAssets != 0) _reservedIdle -= req.reservedAssets;
         delete _pendingWithdrawal[msg.sender];
+        // Audit H-2 (perf-fee evasion): restore the escrow's TRUE snapshot cost basis
+        // BEFORE returning it. balanceOf(msg.sender) here EXCLUDES the still-escrowed
+        // shares (they sit at address(this)), so this weighted-averages them back at
+        // `costBasisAtRequest`; the following `_transfer` has from==address(this), so
+        // `_update` does NOT re-touch basis. Without this, an LP could escrow all shares
+        // (balance→0), receive a dust transfer that OVERWRITES basis to the current PPS,
+        // then cancel — merging the escrow at the inflated basis to evade the perf fee.
+        _absorbReceiveCostBasis(msg.sender, req.shares, req.costBasisAtRequest);
         _transfer(address(this), msg.sender, req.shares);
-        // cb is preserved on receive (from == address(this) skipped in _update)
     }
 
     /// @notice Audit H2 (Finding F) — permissionless. Once a request's
