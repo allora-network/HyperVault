@@ -347,7 +347,12 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         // M5 §4: ESCAPE mode blocks deposits — entering a forced unwind is wrong-way
         // risk for a depositor (idle inflow would help exits, but simplicity +
         // wrong-way-risk argue for blocking; ESCAPE_HATCH_SCOPE §8 Q3).
-        if (paused() || emergencyShutdownActive || _escape.active) return 0;
+        // ERC-4626 conformance: also 0 when the receiver has an open withdrawal request —
+        // deposit/mint hard-revert {PendingRequestBlocksDeposit} in that state (audit M2),
+        // so a non-zero maxDeposit would break the MUST-NOT-revert contract for that receiver.
+        if (paused() || emergencyShutdownActive || _escape.active || _pendingWithdrawal[receiver].shares != 0) {
+            return 0;
+        }
         uint256 capRemaining = depositCap > totalAssets() ? depositCap - totalAssets() : 0;
         uint256 perAddrRemaining;
         if (maxDepositPerAddress == 0) {
@@ -1133,14 +1138,16 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     /// @notice Leg 3 (M5 §2) — permissionlessly move all perp `withdrawable` equity
     ///         to Core spot while latched. The amount is read ON-CHAIN from the
     ///         conservative `withdrawable` figure (caller supplies nothing).
-    /// @dev    PERMISSIONLESS + nonReentrant + PAUSE-IMMUNE. The latch+cooldown gate
-    ///         and the lenient/strict `withdrawable` read (per {navBootstrap},
-    ///         matching {perpWithdrawable}) live in
-    ///         {VaultEscapeLib.escapeConsolidateToSpot}. Accrues the mgmt fee (moving
-    ///         equity converges the conservative NAV).
+    /// @dev    PERMISSIONLESS + nonReentrant + PAUSE-IMMUNE. The latch+cooldown gate and the
+    ///         `withdrawable` read live in {VaultEscapeLib.escapeConsolidateToSpot}. Audit
+    ///         M-2: the read is now LENIENT even in strict NAV mode (an outage yields 0 and
+    ///         no-ops, keeping the escape backstop alive), and NO mgmt-fee accrual runs —
+    ///         `_accrueMgmtFee` reads {totalAssets} STRICTLY and would revert under an outage
+    ///         before the lenient read. perp->spot is ~NAV-neutral and the fee is
+    ///         time-cumulative (captured by the next value-moving call), so deferring it is
+    ///         immaterial; matches {escapePullToEvm}, which already omits the accrual.
     function escapeConsolidateToSpot() external nonReentrant {
-        _accrueMgmtFee();
-        VaultEscapeLib.escapeConsolidateToSpot(_escape, navBootstrap);
+        VaultEscapeLib.escapeConsolidateToSpot(_escape);
     }
 
     /// @notice Leg 4a (M5 §2 leg 4 / §3 option 4a / §7 Phase 2, SOLU-3370) —
@@ -1152,8 +1159,9 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     /// @dev    PERMISSIONLESS + nonReentrant + PAUSE-IMMUNE (no `whenNotPaused`,
     ///         mirroring {pullFromCore} and the other H2 refill movers — freezing the
     ///         repatriation path on pause would strand LPs, Finding A). The
-    ///         latch+cooldown gate, the lenient/strict Core-balance read (per
-    ///         {navBootstrap}, matching {coreSpotUsdc}), the FEE-AWARE `balance*998/1000`
+    ///         latch+cooldown gate, the LENIENT Core-balance read (audit M-2: outage-
+    ///         resilient — a staticcall can't fabricate a larger balance, so an outage
+    ///         no-ops instead of reverting), the FEE-AWARE `balance*998/1000`
     ///         guard (never the exact full balance — the ~0.00134 USDC withdrawal fee
     ///         drops an exact-full send, proven in the G2 spike), the `maxChunkWei`
     ///         chunk cap, and the `send_asset` (action 13) dispatch all live in
@@ -1167,7 +1175,7 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///         Core->EVM is NAV-neutral (both legs count in {totalAssets}), matching
     ///         {pullFromCore} (and unlike leg 3's consolidate, which converges NAV).
     function escapePullToEvm(uint64 maxChunkWei) external nonReentrant {
-        VaultEscapeLib.escapePullToEvm(_escape, coreUsdcIndex, navBootstrap, maxChunkWei);
+        VaultEscapeLib.escapePullToEvm(_escape, coreUsdcIndex, maxChunkWei);
     }
 
     // -------------------------------------------------------------------------

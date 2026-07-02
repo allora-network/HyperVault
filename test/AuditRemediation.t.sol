@@ -155,6 +155,75 @@ contract M3_Window is Base {
     }
 }
 
+contract M2_OutageResilience is Base {
+    function setUp() public {_deploy(0);}
+
+    function test_M2_pull_survives_precompile_outage() public {
+        _armSole(alice);
+        vault.endNavBootstrap(); // strict NAV mode
+        vm.mockCallRevert(Constants.SPOT_BALANCE_PRECOMPILE, abi.encode(address(vault), uint64(0)), "outage");
+        // Share pricing still fails closed (strict)...
+        vm.expectRevert();
+        vault.totalAssets();
+        // ...but the idle-refill backstop survives (lenient read -> 0 -> no-op, no revert).
+        vault.escapePullToEvm(type(uint64).max);
+    }
+
+    function test_M2_consolidate_survives_precompile_outage() public {
+        _armSole(alice);
+        vault.endNavBootstrap();
+        vm.mockCallRevert(Constants.WITHDRAWABLE_PRECOMPILE, abi.encode(address(vault)), "outage");
+        vault.escapeConsolidateToSpot(); // no revert (lenient read + no strict mgmt-fee accrual)
+    }
+}
+
+contract L2_LeverageCap is Base {
+    uint32 constant PERP = 0;
+
+    function setUp() public {
+        usdc = new MockUSDC();
+        HyperCoreVault.Config memory cfg = HyperCoreVault.Config({
+            asset: IERC20(address(usdc)), coreUsdcIndex: 0, coreUsdcDecimals: 8, coreDepositWallet: address(0),
+            name: "L2", symbol: "l2", admin: admin, operator: operator, emergencyAdmin: emergency, feeRecipient: feeRecipient,
+            leverageCapBps: 10_000, slippageBandBps: 0, emergencyCloseBandBps: 0,
+            mgmtFeeAnnualBps: 0, perfFeeBps: 0, depositCap: type(uint256).max, maxDepositPerAddress: 0
+        });
+        vault = new HyperCoreVault(cfg);
+        vm.etch(Constants.CORE_WRITER, type(MockCoreWriter).runtimeCode);
+        vault.setWhitelistPerp(PERP, true);
+        vm.mockCall( // flat position -> gross-open notional 0
+            Constants.POSITION_PRECOMPILE, abi.encode(address(vault), PERP),
+            abi.encode(PrecompileLib.Position({szi: int64(0), entryNtl: 0, isolatedRawUsd: 0, leverage: 0, isIsolated: false}))
+        );
+        vm.mockCall(
+            Constants.PERP_ASSET_INFO_PRECOMPILE, abi.encode(PERP),
+            abi.encode(PrecompileLib.PerpAssetInfo({coin: "X", marginTableId: 0, szDecimals: 2, maxLeverage: 10, onlyIsolated: false}))
+        );
+        vm.mockCall(Constants.MARK_PX_PRECOMPILE, abi.encode(PERP), abi.encode(uint64(1e4))); // markNorm = 1e8
+    }
+
+    // nav=100 USDC, cap 100%. A sell sized 200 units: markPx-valued notional = 200 USDC > cap
+    // (reverts), but the OLD limitPx-valued notional at limitPx=1e4 was 0.02 USDC (would pass).
+    function test_L2_low_limitPx_sell_cannot_bypass_cap() public {
+        _dep(alice, 100e6);
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(IHyperCoreVault.LeverageCapExceeded.selector, uint256(200e6), uint256(100e6), uint16(10_000)));
+        vault.placeLimitOrder(PERP, false, 1e4, 200e8, false, Constants.TIF_GTC);
+    }
+}
+
+contract Conformance is Base {
+    function setUp() public {_deploy(0);}
+
+    function test_maxDeposit_zero_while_request_open() public {
+        uint256 s = _dep(alice, 100e6);
+        assertGt(vault.maxDeposit(alice), 0, "normally depositable");
+        vm.prank(alice);
+        vault.requestWithdraw(s);
+        assertEq(vault.maxDeposit(alice), 0, "0 while a request is open (deposit would revert)");
+    }
+}
+
 contract H1_EscapeBrake is Base {
     uint256 constant BIG = 100_000e6; // large phantom Core NAV so even small claims exceed idle
 

@@ -372,14 +372,17 @@ library VaultEscapeLib {
     ///         legs 1-3 the vault is flat with all value as Core spot USDC, fully
     ///         counted by {HyperCoreVault.coreSpotUsdc} (§2). No-ops the CoreWriter
     ///         call (but still runs the gate + crank event) when nothing is withdrawable.
-    function escapeConsolidateToSpot(IHyperCoreVault.EscapeState storage s, bool navBootstrap)
+    function escapeConsolidateToSpot(IHyperCoreVault.EscapeState storage s)
         external
         returns (uint64 movedNtl)
     {
         _gate(s);
-        movedNtl = navBootstrap
-            ? PrecompileLib.withdrawable(address(this)).withdrawable
-            : PrecompileLib.withdrawableStrict(address(this)).withdrawable;
+        // Audit M-2: read `withdrawable` LENIENTLY even in strict NAV mode. This crank only
+        // moves equity toward redeemable idle; a staticcall can never fabricate a LARGER
+        // value, so a precompile outage yields 0 and the `if (movedNtl != 0)` guard no-ops
+        // (still runs the gate + crank event) instead of reverting — keeping the escape
+        // backstop alive through an outage. Share pricing stays strict via {totalAssets}.
+        movedNtl = PrecompileLib.withdrawable(address(this)).withdrawable;
         if (movedNtl != 0) {
             CoreWriterLib.usdClassTransfer(movedNtl, false); // perp -> spot
             emit UsdClassTransferSubmitted(movedNtl, false);
@@ -466,20 +469,18 @@ library VaultEscapeLib {
     ///         accrual is needed.
     /// @param  s             The vault's escape latch/cooldown state (by reference).
     /// @param  coreUsdcIndex The vault's immutable Core USDC token index (by value).
-    /// @param  navBootstrap  The vault's NAV-read mode (lenient while bootstrapping).
     /// @param  maxChunkWei   Per-crank send cap in Core wei (8dp); bounds the chunk.
     function escapePullToEvm(
         IHyperCoreVault.EscapeState storage s,
         uint64 coreUsdcIndex,
-        bool navBootstrap,
         uint64 maxChunkWei
     ) external {
         _gate(s);
-        // Audit H-1: lenient/strict per navBootstrap, mirroring {coreSpotUsdc}. A strict
-        // read fails the crank closed on a precompile outage rather than pulling zero.
-        uint64 balance = navBootstrap
-            ? PrecompileLib.spotBalance(address(this), coreUsdcIndex).total
-            : PrecompileLib.spotBalanceStrict(address(this), coreUsdcIndex).total;
+        // Audit M-2: read the Core balance LENIENTLY even in strict NAV mode. This is the
+        // idle-refill backstop — a staticcall can never fabricate a LARGER balance, so an
+        // outage yields 0 and the `if (amount != 0)` guard no-ops instead of reverting,
+        // keeping the pull alive through a precompile outage. Share pricing stays strict.
+        uint64 balance = PrecompileLib.spotBalance(address(this), coreUsdcIndex).total;
         // Fee-aware (never the exact full balance) then chunk-capped. Widen to uint256
         // for the multiply (balance and PULL_FEE_NUM are uint64; the product can exceed
         // uint64); the quotient <= balance <= uint64.max, so the cast back is safe.
