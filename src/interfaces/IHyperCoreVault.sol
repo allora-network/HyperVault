@@ -57,6 +57,11 @@ interface IHyperCoreVault is IERC4626 {
     ///         `emergencyCloseBandBps` (audit M4). Use {emergencyClosePositionsForce}
     ///         only if the oracle itself is unusable.
     error EmergencyCloseBandExceeded(uint64 limitPx, uint64 markPx, uint16 bandBps);
+    /// @notice Audit M-1: a permissionless escape flatten tried to place a close order, or
+    ///         {setEmergencyCloseBand} was called, with a zero band. The markPx band is
+    ///         MANDATORY on the permissionless escape path; a band-free close stays
+    ///         EMERGENCY_ROLE-only ({emergencyClosePositionsForce}).
+    error EmergencyCloseBandRequired();
     /// @notice A non-zero spot slippage band requires a calibrated, non-zero
     ///         `spotPxScaleFactor` (audit M6) — else the band gives false protection.
     error SpotBandRequiresScaleFactor(uint32 asset);

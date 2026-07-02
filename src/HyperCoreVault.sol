@@ -314,6 +314,12 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
         // in {Config}) so existing deploy configs need no change; within [4h, 30d].
         // Held inside the escape struct (see {IHyperCoreVault.EscapeState.graceSeconds}).
         _escape.graceSeconds = 8 hours; // 28_800s
+        // Audit M-3: default the fulfillment SLA window to a sane non-zero value (mirrors
+        // the graceSeconds default above) so a FRESH deploy has an armable escape brake and
+        // an active FCFS priority reserve — it previously defaulted to 0, silently disabling
+        // both. Adjustable post-deploy via {setRequestFulfillmentWindow} (0 remains an
+        // explicit, documented no-SLA opt-out).
+        requestFulfillmentWindow = 24 hours;
 
         _grantRole(DEFAULT_ADMIN_ROLE, cfg.admin);
         _grantRole(OPERATOR_ROLE, cfg.operator);
@@ -1304,6 +1310,7 @@ contract HyperCoreVault is IHyperCoreVault, ERC4626, AccessControl, Pausable, Re
     ///         exit; the band only rejects absurd prices. {emergencyClosePositionsForce}
     ///         bypasses it when the oracle itself is unusable.
     function setEmergencyCloseBand(uint16 bps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (bps == 0) revert EmergencyCloseBandRequired(); // M-1: the mandatory band cannot be disabled
         emit EmergencyCloseBandUpdated(emergencyCloseBandBps, bps);
         emergencyCloseBandBps = bps;
     }

@@ -88,6 +88,10 @@ library VaultEscapeLib {
     /// @notice Mirrors {VaultTradeLib.EmergencyCloseBandExceeded}: a flatten
     ///         `limitPx` deviates from the strict markPx beyond the mandatory band.
     error EmergencyCloseBandExceeded(uint64 limitPx, uint64 markPx, uint16 bandBps);
+    /// @notice Audit M-1: a permissionless flatten tried to place a close order while
+    ///         `emergencyCloseBandBps == 0`. The band is MANDATORY on the escape path — a
+    ///         band-free close stays EMERGENCY_ROLE-only. Mirrors {IHyperCoreVault}.
+    error EmergencyCloseBandRequired();
     /// @notice A supplied cloid is not one the vault has issued (>= the live
     ///         `_cloidCounter`), so it cannot name a vault-placed resting order (§2 leg 1).
     error EscapeCloidOutOfRange(uint128 cloid, uint128 cloidCounter);
@@ -328,9 +332,14 @@ library VaultEscapeLib {
         uint64 absSz = uint64(szi < 0 ? uint256(-int256(szi)) : uint256(int256(szi)));
         uint8 szDec = PrecompileLib.perpAssetInfoStrict(a).szDecimals;
 
-        // Audit M4: the band is MANDATORY on the escape path. markPxStrict reverting
+        // Audit M4 + M-1: the band is TRULY MANDATORY on the permissionless escape path.
+        // A HELD position (szi != 0, checked above) can only be flattened WITH a configured
+        // band — before, `band == 0` silently SKIPPED this check and let a permissionless
+        // caller push an off-market IOC (value bleed on a thin book). A band-free close now
+        // stays EMERGENCY_ROLE-only ({emergencyClosePositionsForce}). markPxStrict reverting
         // (oracle outage) fails the crank closed — retryable, never a band-free force.
-        if (band > 0) {
+        if (band == 0) revert EmergencyCloseBandRequired();
+        {
             uint64 markRaw = PrecompileLib.markPxStrict(a);
             uint256 markNorm = uint256(markRaw) * (10 ** (uint256(szDec) + 2));
             uint256 lpx = uint256(limitPx);

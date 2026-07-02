@@ -230,8 +230,10 @@ contract HyperVaultEscapeTriggerForkTest is HyperVaultBaseForkTest {
     ///      drained to zero. A vault with no SLA window has NO permissionless brake.
     function test_trigger_deadlineZeroNotArmable() public {
         _skipIfNoFork();
-        // requestFulfillmentWindow defaults to 0 (unset) — do NOT set it.
-        assertEq(vault.requestFulfillmentWindow(), 0, "no SLA window configured");
+        // Opt into no-SLA (window == 0 disables deadlines) — the documented escape-brake
+        // opt-out. M-3 now DEFAULTS the window non-zero, so no-SLA is an explicit choice.
+        vault.setRequestFulfillmentWindow(0);
+        assertEq(vault.requestFulfillmentWindow(), 0, "no SLA window configured (explicit opt-out)");
         uint256 shares = _deposit(alice, 100e6);
         vm.prank(alice);
         vault.requestWithdraw(shares);
